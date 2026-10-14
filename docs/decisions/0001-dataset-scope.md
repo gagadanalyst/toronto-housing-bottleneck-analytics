@@ -1,6 +1,7 @@
 # Dataset Selection: Start with Active and Cleared Permits
 
-**Decision date:** October 14, 2026  
+**Decision date:** October 14, 2026
+
 **Record type:** Retrospective decision record reconstructed from project discovery notes. The five datasets were not all selected at the beginning.
 
 ## Goal and discovery path
