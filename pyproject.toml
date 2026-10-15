@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toronto-housing-ingestion"
+version = "0.5.4"
+description = "Simple, configuration-driven ingestion for Toronto Open Data with optional dlt SCD2 loading."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "dlt[duckdb]==1.30.0",
+    "ijson>=3.3,<4",
+    "pandas>=2.2,<3",
+    "pyarrow==25.0.1",
+    "PyYAML>=6,<7",
+    "requests>=2.32,<3",
+    "psutil>=7.2,<8",
+]
+
+[project.optional-dependencies]
+snowflake = ["dlt[snowflake]==1.30.0"]
+dev = [
+    "build>=1.6,<2",
+    "pip-audit>=2.9,<3",
+    "pytest>=9,<10",
+    "pytest-cov>=7,<8",
+    "ruff>=0.16,<0.17",
+]
+
+[project.scripts]
+toronto-ingest = "toronto_housing_ingestion.ingestion:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["toronto_housing_ingestion"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if __name__ == .__main__.:",
+]
