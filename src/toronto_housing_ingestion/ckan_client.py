@@ -250,6 +250,8 @@ class TorontoCKANClient:
                 logging.INFO,
                 "pagination_resume",
                 source_name=source_name,
+                resource_id=resource_id,
+                extraction_route="datastore",
                 page=page_number,
                 offset=offset,
             )
@@ -311,6 +313,8 @@ class TorontoCKANClient:
                 logging.INFO,
                 "page_fetched",
                 source_name=source_name,
+                resource_id=resource_id,
+                extraction_route="datastore",
                 page=page_number,
                 rows=len(records),
                 offset=offset,
