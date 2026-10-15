@@ -72,3 +72,165 @@ def test_probe_datastore_does_not_send_date_filter(monkeypatch) -> None:
     c.probe_datastore("resource")
     assert "filters" not in captured
     c.close()
+
+
+def test_configures_retries_for_transient_http_errors() -> None:
+    with TorontoCKANClient(
+        "https://example.com/api",
+        timeout_seconds=7,
+        retries=3,
+    ) as c:
+        retry = c.session.adapters["https://"].max_retries
+
+        assert c.timeout_seconds == 7
+        assert retry.total == 3
+        assert retry.connect == 3
+        assert retry.read == 3
+        assert retry.status == 3
+        assert set(retry.status_forcelist) == {429, 500, 502, 503, 504}
+        assert retry.respect_retry_after_header
+        assert retry.allowed_methods == frozenset({"GET", "HEAD"})
+
+
+def test_action_passes_configured_timeout(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"success": True, "result": {"id": "active"}}
+
+    with TorontoCKANClient(
+        "https://example.com/api",
+        timeout_seconds=13,
+        retries=0,
+    ) as c:
+
+        def fake_get(url, *, params, timeout):
+            captured.update(url=url, params=params, timeout=timeout)
+            return FakeResponse()
+
+        monkeypatch.setattr(c.session, "get", fake_get)
+
+        result = c.action("package_show", id="active-permits")
+
+    assert result == {"id": "active"}
+    assert captured["timeout"] == 13
+    assert captured["params"] == {"id": "active-permits"}
+    assert captured["url"].endswith("/package_show")
+
+
+def test_fetch_datastore_paginates_with_sort_and_keeps_all_rows(
+    monkeypatch, tmp_path
+) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    calls = []
+
+    def fake_action(action_name, **params):
+        assert action_name == "datastore_search"
+        calls.append(params.copy())
+
+        if params["offset"] == 0:
+            return {
+                "records": [{"id": 1}, {"id": 2}],
+                "total": 3,
+            }
+
+        return {
+            "records": [{"id": 3}],
+            "total": 3,
+        }
+
+    output = tmp_path / "data.parquet"
+
+    with client() as c:
+        monkeypatch.setattr(c, "action", fake_action)
+
+        count = c.fetch_datastore(
+            resource_id="active-resource",
+            page_size=2,
+            checkpoint_dir=tmp_path / "checkpoints",
+            fingerprint={"resource_hash": "test"},
+            source_name="active_permits",
+            output_path=output,
+            pagination_sort="_id asc",
+            required_columns=("id",),
+            date_columns=(),
+        )
+
+    assert count == 3
+    assert [call["offset"] for call in calls] == [0, 2]
+    assert all(call["limit"] == 2 for call in calls)
+    assert all(call["sort"] == "_id asc" for call in calls)
+    assert all(call["resource_id"] == "active-resource" for call in calls)
+    assert pq.read_table(output).column("id").to_pylist() == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("fmt", "payload"),
+    [
+        (
+            "csv",
+            b"id,APPLICATION_DATE\n1,2019-12-31\n2,2020-01-01\n",
+        ),
+        (
+            "json",
+            b'{"result":{"records":['
+            b'{"id":1,"APPLICATION_DATE":"2019-12-31"},'
+            b'{"id":2,"APPLICATION_DATE":"2020-01-01"}'
+            b"]}}",
+        ),
+    ],
+)
+def test_download_fallback_materializes_csv_and_json_offline(
+    fmt, payload, monkeypatch, tmp_path
+) -> None:
+    pytest.importorskip("pyarrow")
+    if fmt == "json":
+        pytest.importorskip("ijson")
+
+    import pyarrow.parquet as pq
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield payload
+
+    output = tmp_path / f"fallback.{fmt}.parquet"
+
+    with client() as c:
+
+        def fake_get(url, **kwargs):
+            assert kwargs["stream"] is True
+            assert kwargs["timeout"] == c.timeout_seconds
+            return FakeResponse()
+
+        monkeypatch.setattr(c.session, "get", fake_get)
+
+        count = c.download_fallback(
+            resource={
+                "id": f"{fmt}-resource",
+                "format": fmt,
+                "url": f"https://example.com/data.{fmt}",
+            },
+            output_path=output,
+            source_name="active_permits",
+            required_columns=("id", "APPLICATION_DATE"),
+            date_columns=("APPLICATION_DATE",),
+        )
+
+    assert output.is_file()
+    assert count == 2
+    assert pq.read_table(output).column("id").to_pylist() == [1, 2]

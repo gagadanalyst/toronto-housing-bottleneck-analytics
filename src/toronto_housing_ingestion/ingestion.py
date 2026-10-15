@@ -173,11 +173,18 @@ def _run_fallbacks(
             )
             return resource, row_count, fingerprint
         except Exception as exc:
-            errors.append(f"{resource.get('format')}: {exc}")
+            errors.append(
+                f"{resource.get('format')} "
+                f"(resource_id={resource.get('id')!r}, "
+                f"name={resource.get('name')!r}): {exc}"
+            )
             utils.log_event(
                 logging.WARNING,
                 "fallback_failed",
                 source_name=source.name,
+                resource_id=resource.get("id"),
+                resource_name=resource.get("name"),
+                extraction_route="file_fallback",
                 format=str(resource.get("format")),
                 error=str(exc),
             )
@@ -216,6 +223,9 @@ def ingest_source(
                 logging.WARNING,
                 "datastore_unavailable",
                 source_name=source.name,
+                resource_id=resource.get("id"),
+                resource_name=resource.get("name"),
+                extraction_route="datastore_probe",
                 error=str(exc),
             )
             fallbacks = client.fallback_resources(package)
@@ -303,6 +313,9 @@ def ingest_source(
                 logging.WARNING,
                 "datastore_extraction_failed_fallback",
                 source_name=source.name,
+                resource_id=resource.get("id"),
+                resource_name=resource.get("name"),
+                extraction_route="datastore",
                 error=str(exc),
             )
             resource, row_count, fingerprint = _run_fallbacks(
