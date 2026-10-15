@@ -1,5 +1,10 @@
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from toronto_housing_ingestion import ingestion
 from toronto_housing_ingestion.config import SourceConfig
@@ -48,6 +53,7 @@ def test_unknown_source_selection_is_reported_in_cli() -> None:
     selected = ["a", "c"]
     assert sorted(set(selected) - names) == ["c"]
 
+
 def test_default_cli_processes_only_configured_sources(monkeypatch) -> None:
     import sys
     from contextlib import nullcontext
@@ -65,9 +71,7 @@ def test_default_cli_processes_only_configured_sources(monkeypatch) -> None:
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr(
-        ingestion.utils, "exclusive_lock", lambda path: nullcontext()
-    )
+    monkeypatch.setattr(ingestion.utils, "exclusive_lock", lambda path: nullcontext())
     monkeypatch.setattr(
         ingestion, "ensure_duckdb_database", lambda *args, **kwargs: None
     )
@@ -127,6 +131,69 @@ def test_stale_source_is_warning_only() -> None:
     assert (
         ingestion.check_freshness("2026-10-01T12:00:00+00:00", "daily", now) == "stale"
     )
+
+
+def test_warehouse_failure_is_recorded_and_retried(monkeypatch, tmp_path) -> None:
+    configured_source = replace(source(), warehouse_load=True)
+    resource = {
+        "id": "csv-resource",
+        "format": "CSV",
+        "url": "https://example.com/active.csv",
+    }
+    fingerprint = {"resource_id": "csv-resource", "resource_hash": "stable"}
+
+    class FakeClient:
+        def package_show(self, dataset_slug):
+            return {"metadata_modified": "2026-10-14T00:00:00+00:00"}
+
+        def select_resource(self, package):
+            return resource
+
+        def file_fingerprint(self, resource, package_metadata_modified):
+            return fingerprint.copy()
+
+    def fake_fallbacks(client, package, source_config, output_path, first=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"synthetic full-source snapshot")
+        return resource, 1, fingerprint.copy()
+
+    def fail_load(**kwargs):
+        raise RuntimeError("simulated warehouse failure")
+
+    monkeypatch.setattr(ingestion, "_run_fallbacks", fake_fallbacks)
+    monkeypatch.setattr(ingestion.utils, "actual_columns", lambda path: ["PERMIT_NUM"])
+    monkeypatch.setattr(ingestion.utils, "key_quality_warnings", lambda *args: [])
+    monkeypatch.setattr(ingestion.utils, "sha256_file", lambda path: "a" * 64)
+    monkeypatch.setattr(ingestion, "load_scd2", fail_load)
+
+    app = SimpleNamespace(
+        warehouse_credentials="duckdb:///tmp/test.duckdb",
+        dataset_name="toronto",
+        warehouse_kind="duckdb",
+    )
+    manifest_root = tmp_path / "manifests"
+
+    with pytest.raises(RuntimeError, match="simulated warehouse failure"):
+        ingestion.ingest_source(
+            client=FakeClient(),
+            source=configured_source,
+            raw_root=tmp_path / "raw",
+            manifest_root=manifest_root,
+            checkpoint_root=tmp_path / "checkpoints",
+            page_size=100,
+            probe_only=False,
+            full_refresh=False,
+            extract_only=False,
+            app=app,
+        )
+
+    manifest_files = list((manifest_root / "active_permits").glob("*.json"))
+    assert len(manifest_files) == 1
+    manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
+    assert manifest["status"] == "load_failed"
+    assert manifest["warehouse_status"] == "failed"
+    assert manifest["warehouse_error"] == "simulated warehouse failure"
+    assert ingestion.source_has_changed(manifest, fingerprint)
 
 
 def test_stale_flag_is_not_a_cli_option() -> None:
