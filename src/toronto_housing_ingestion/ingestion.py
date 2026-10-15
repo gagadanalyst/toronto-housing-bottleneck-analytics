@@ -87,6 +87,10 @@ def source_has_changed(
     if not previous:
         return True
 
+    # A failed warehouse load must not be treated as an unchanged successful run.
+    if previous.get("status") == "load_failed":
+        return True
+
     for key in ("resource_id",):
         if str(previous.get(key)) != str(current.get(key)):
             return True
@@ -411,13 +415,37 @@ def ingest_source(
         _write_manifest(manifest_path, manifest)
         return manifest"""
 
-    result = load_scd2(
-        credentials=app.warehouse_credentials,
-        snapshot_path=output_path,
-        source=source,
-        dataset_name=app.dataset_name,
-        destination_kind=app.warehouse_kind,
-    )
+    try:
+        result = load_scd2(
+            credentials=app.warehouse_credentials,
+            snapshot_path=output_path,
+            source=source,
+            dataset_name=app.dataset_name,
+            destination_kind=app.warehouse_kind,
+        )
+    except Exception as exc:
+        manifest.update(
+            {
+                "status": "load_failed",
+                "warehouse_status": "failed",
+                "warehouse_error": str(exc),
+                "warehouse_error_type": type(exc).__name__,
+                "warehouse_failed_at_utc": datetime.now(UTC).isoformat(),
+                "duration_seconds": round(time.monotonic() - started_monotonic, 3),
+            }
+        )
+        _write_manifest(manifest_path, manifest)
+        utils.log_event(
+            logging.ERROR,
+            "warehouse_load_failed",
+            source_name=source.name,
+            resource_id=resource.get("id"),
+            raw_path=str(output_path),
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        raise
+
     manifest.update(
         {
             "status": "success",
