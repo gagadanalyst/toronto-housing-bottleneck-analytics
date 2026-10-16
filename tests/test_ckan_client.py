@@ -238,6 +238,72 @@ def test_download_fallback_materializes_csv_and_json_offline(
     assert pq.read_table(output).column("id").to_pylist() == [1, 2]
 
 
+def test_csv_fallback_handles_mixed_revision_types_across_chunks(
+    monkeypatch, tmp_path
+) -> None:
+    """Keep column types consistent when CSV chunks infer different types."""
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    csv_lines = ["PERMIT_NUM,REVISION_NUM,PERMIT_TYPE,APPLICATION_DATE,EST_CONST_COST"]
+    csv_lines.extend(
+        f"P{i:05d},{i},BLD,2024-01-01,{i * 1000}.00" for i in range(1, 10_001)
+    )
+    csv_lines.append(
+        "P10001,revision-X,BLD,2024-01-01,DO NOT UPDATE OR DELETE THIS INFO FIELD"
+    )
+    payload = ("\n".join(csv_lines) + "\n").encode("utf-8")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield payload
+
+    output = tmp_path / "mixed-revisions.parquet"
+
+    with client() as c:
+
+        def fake_get(url, **kwargs):
+            assert kwargs["stream"] is True
+            return FakeResponse()
+
+        monkeypatch.setattr(c.session, "get", fake_get)
+
+        count = c.download_fallback(
+            resource={
+                "id": "cleared-csv",
+                "format": "csv",
+                "url": "https://example.com/cleared.csv",
+            },
+            output_path=output,
+            source_name="cleared_permits",
+            required_columns=(
+                "PERMIT_NUM",
+                "REVISION_NUM",
+                "PERMIT_TYPE",
+                "APPLICATION_DATE",
+                "EST_CONST_COST",
+            ),
+            date_columns=("APPLICATION_DATE",),
+        )
+
+    assert count == 10_001
+    table = pq.read_table(output)
+    revisions = table.column("REVISION_NUM").to_pylist()
+    costs = table.column("EST_CONST_COST").to_pylist()
+    assert revisions[0] == "1"
+    assert revisions[-1] == "revision-X"
+    assert costs[-1] == "DO NOT UPDATE OR DELETE THIS INFO FIELD"
+
+
 @pytest.mark.parametrize("snapshot_exists", [False, True])
 def test_completed_checkpoint_mismatch_restarts_extraction(
     monkeypatch, tmp_path, snapshot_exists
