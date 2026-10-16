@@ -89,6 +89,18 @@ Tests requiring captured snapshots, manifests, or a local warehouse are describe
 
 See [Test Guide](tests/README.md) for test categories, prerequisites, and commands. Test results should be reported only after the corresponding command has actually run.
 
+## Download the latest published data
+
+After the main-branch CI workflow successfully completes its data publication job, the latest data assets are available from the [`warehouse-latest` release](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest).
+
+- [Active Permits Parquet snapshot](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-active-permits.parquet)
+- [Cleared Permits Parquet snapshot](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-cleared-permits.parquet)
+- [DuckDB warehouse database](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto.duckdb)
+
+The two Parquet files contain full-source snapshots. The `APPLICATION_DATE >= 2020-01-01` cutoff applies to warehouse loading, not to the raw Parquet snapshots. The DuckDB database contains the `raw_active_permits` and `raw_cleared_permits` tables, including the warehouse's SCD2 history.
+
+These links refer to rolling data assets, not versioned historical snapshots. Successful publication runs replace the assets with the latest data. The separate GitHub Actions artifacts are intended for run-level troubleshooting and are retained for 14 days; GitHub provides artifact downloads as ZIP archives.
+
 ## Local artifacts and publication
 
-`.gitignore` excludes local environment files, dlt state, ingestion data, DuckDB files, caches, coverage output, and build artifacts. Do not commit credentials or local datasets. Any deliberate publication of Parquet or DuckDB data assets should use the project's documented publication process rather than committing local working files by accident.
+`.gitignore` excludes local environment files, dlt state, ingestion data, DuckDB files, caches, coverage output, and build artifacts. Do not commit credentials or local datasets. The publication workflow makes the intended Parquet and DuckDB assets available without committing local working files to Git.

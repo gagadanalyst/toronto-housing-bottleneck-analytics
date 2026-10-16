@@ -57,6 +57,7 @@ def test_scd2_same_snapshot_is_idempotent(tmp_path: Path) -> None:
     assert result2.total_rows == 2
     assert result2.current_rows == 2
 
+
 def test_warehouse_cutoff_filters_load_not_raw_snapshot(tmp_path: Path) -> None:
     import duckdb
     import pyarrow as pa
