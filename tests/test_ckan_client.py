@@ -1,6 +1,8 @@
+import pandas as pd
 import pytest
 import requests
 
+from toronto_housing_ingestion import utils
 from toronto_housing_ingestion.ckan_client import (
     DatastoreUnavailableError,
     TorontoCKANClient,
@@ -234,3 +236,63 @@ def test_download_fallback_materializes_csv_and_json_offline(
     assert output.is_file()
     assert count == 2
     assert pq.read_table(output).column("id").to_pylist() == [1, 2]
+
+
+@pytest.mark.parametrize("snapshot_exists", [False, True])
+def test_completed_checkpoint_mismatch_restarts_extraction(
+    monkeypatch, tmp_path, snapshot_exists
+) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    fingerprint = {"resource_hash": "stable"}
+
+    utils.atomic_write_json(
+        checkpoint_dir / "checkpoint.json",
+        {
+            "resource_id": "active-resource",
+            "fingerprint": fingerprint,
+            "next_offset": 3,
+            "next_page": 1,
+            "declared_total": 3,
+            "complete": True,
+        },
+    )
+    utils.atomic_write_parquet(
+        pd.DataFrame({"id": [1, 2]}),
+        checkpoint_dir / "part_000000.parquet",
+    )
+
+    output_path = tmp_path / "data.parquet"
+    if snapshot_exists:
+        utils.atomic_write_parquet(pd.DataFrame({"id": [1, 2]}), output_path)
+
+    offsets = []
+
+    def fake_action(action_name, **params):
+        assert action_name == "datastore_search"
+        offsets.append(params["offset"])
+        if params["offset"] == 0:
+            return {"records": [{"id": 1}, {"id": 2}], "total": 3}
+        return {"records": [{"id": 3}], "total": 3}
+
+    with client() as c:
+        monkeypatch.setattr(c, "action", fake_action)
+        count = c.fetch_datastore(
+            resource_id="active-resource",
+            page_size=2,
+            checkpoint_dir=checkpoint_dir,
+            fingerprint=fingerprint,
+            source_name="active_permits",
+            output_path=output_path,
+            pagination_sort="_id asc",
+            required_columns=("id",),
+            date_columns=(),
+        )
+
+    assert count == 3
+    assert offsets == [0, 2]
+    assert pq.read_table(output_path).column("id").to_pylist() == [1, 2, 3]
+    assert not checkpoint_dir.exists()
