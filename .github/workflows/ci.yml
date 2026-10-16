@@ -1,0 +1,232 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
+      timezone: "America/Toronto"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-housing-ingestion
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test and build
+    env:
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Upgrade pip to a patched release
+        run: python -m pip install --upgrade "pip>=26.2.1,<27"
+
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+
+      - name: Run unit and non-snapshot tests
+        run: >
+          pytest -q
+          --cov=toronto_housing_ingestion
+          --cov-report=term-missing
+          --ignore=tests/integration
+          --ignore=tests/test_warehouse_load.py
+
+      - name: Run SCD2 integration tests
+        run: >-
+          python -m pytest -s
+          tests/test_dlt_integration.py
+          tests/integration/test_dlt_scd2_row_hash.py
+
+      - name: Run live fallback integration tests
+        if: github.event_name != 'pull_request'
+        env:
+          RUN_LIVE_TESTS: "1"
+        run: python -m pytest -s tests/test_live_fallbacks.py
+
+      - run: pip-audit
+      - run: python -m build
+
+  data-assets:
+    name: Extract Toronto data and publish assets
+    permissions:
+      contents: write
+    env:
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Upgrade pip to a patched release
+        run: python -m pip install --upgrade "pip>=26.2.1,<27"
+
+      - run: python -m pip install -e .
+
+      - name: Install pytest
+        run: python -m pip install "pytest>=9,<10"
+
+      - name: Restore persistent DuckDB asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data/warehouse
+          if gh release view warehouse-latest >/dev/null 2>&1; then
+            gh release download warehouse-latest \
+              --pattern "toronto.duckdb" \
+              --dir data/warehouse \
+              --clobber
+          fi
+
+      - name: Extract Active and Cleared Permits only
+        run: >-
+          toronto-ingest
+          --config open_data_config.yml
+          --raw-root data/raw
+          --manifest-root data/manifests
+          --checkpoint-root data/checkpoints
+          --lock-file data/.ingestion.lock
+          --full-refresh
+
+      - name: Run local setup smoke test
+        env:
+          RUN_LIVE_TESTS: "1"
+        run: python -m pytest -q tests/test_local_setup.py
+
+      - name: Run Active Permits SCD2 integration test
+        run: python -m pytest -s tests/integration/test_scd2_active_permits.py
+
+      - name: Validate assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
+          test -s data/warehouse/toronto.duckdb
+
+          for file in $(find data/raw -type f -name 'data.parquet'); do
+            test -s "$file"
+          done
+
+          echo "Parquet assets:"
+          find data/raw -type f -name 'data.parquet' -print
+
+          echo "DuckDB:"
+          ls -lh data/warehouse/toronto.duckdb
+
+      #- name: Run permit business-key tests
+      #  run: python -m pytest -q tests/test_business_keys.py
+      - name: Validate DuckDB contents
+        run: |
+          python - <<'PY'
+          import duckdb
+          import os
+          db = "data/warehouse/toronto.duckdb"
+          print(os.listdir('data/warehouse/'))
+          with duckdb.connect(db, read_only=True) as con:
+              tables = {
+                  row[0]
+                  for row in con.execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE table_schema = 'raw'"
+                  ).fetchall()
+              }
+              print(tables)
+
+              required = {
+                  "raw_active_permits",
+                  "raw_cleared_permits",
+              }
+
+              missing = required - tables
+              if missing:
+                  raise SystemExit(
+                      f"Missing required warehouse tables: {sorted(missing)}"
+                  )
+
+              for table in sorted(required):
+                  count = con.execute(
+                      f"SELECT COUNT(*) FROM raw.{table}"
+                  ).fetchone()[0]
+
+                  if count == 0:
+                      raise SystemExit(
+                          f"Warehouse table {table} is empty."
+                      )
+
+                  print(f"{table}: {count:,} rows")
+          PY
+      - name: Validate permit warehouse loads
+        run: python -m pytest -s tests/test_warehouse_load.py
+      - name: Upload Parquet assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-parquet-${{ github.run_id }}
+          path: data/raw/**/*.parquet
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload DuckDB asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-duckdb-${{ github.run_id }}
+          path: data/warehouse/toronto.duckdb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Stage clearly named Parquet files
+        run: |
+          set -euo pipefail
+          test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
+          active="$(find data/raw/active_permits -type f -name 'data.parquet' -print -quit)"
+          cleared="$(find data/raw/cleared_permits -type f -name 'data.parquet' -print -quit)"
+          test -n "$active"
+          test -n "$cleared"
+          mkdir -p data-assets
+          cp "$active" data-assets/toronto-active-permits.parquet
+          cp "$cleared" data-assets/toronto-cleared-permits.parquet
+          test -s data-assets/toronto-active-permits.parquet
+          test -s data-assets/toronto-cleared-permits.parquet
+          ls -lh data-assets/*.parquet
+
+      - name: Publish durable data assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(
+            data-assets/toronto-active-permits.parquet
+            data-assets/toronto-cleared-permits.parquet
+            data/warehouse/toronto.duckdb
+          )
+          if gh release view warehouse-latest >/dev/null 2>&1; then
+            gh release upload warehouse-latest "${assets[@]}" --clobber
+          else
+            gh release create warehouse-latest "${assets[@]}" \
+              --title "Latest Toronto Housing Data Assets" \
+              --notes "Rolling data publication, not a semantic-version release. The two Parquet assets are full-source snapshots for Active and Cleared Permits. The DuckDB database contains the permit warehouse tables." \
+              --latest=false
+          fi
