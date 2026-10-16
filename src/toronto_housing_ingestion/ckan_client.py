@@ -399,7 +399,13 @@ class TorontoCKANClient:
                 pd.read_csv(
                     temp_path,
                     chunksize=10_000,
-                    dtype={"BUILDER_NAME": "string"},
+                    dtype={
+                        "BUILDER_NAME": "string",
+                        "PERMIT_NUM": "string",
+                        "REVISION_NUM": "string",
+                        "PERMIT_TYPE": "string",
+                        "EST_CONST_COST": "string",
+                    },
                 )
                 if fmt == "csv"
                 else self._iter_json_frames(temp_path)
