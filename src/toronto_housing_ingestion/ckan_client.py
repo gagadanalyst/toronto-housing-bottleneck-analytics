@@ -241,20 +241,52 @@ class TorontoCKANClient:
             offset = int(checkpoint.get("next_offset", 0))
             page_number = int(checkpoint.get("next_page", 0))
             declared_total = int(checkpoint.get("declared_total", 0))
+
             if checkpoint.get("complete"):
-                if not output_path.exists():
-                    utils.combine_parquet_parts(parts, output_path)
-                return utils.parquet_row_count(output_path)
-            parts = [p for p in parts if int(p.stem.split("_")[1]) < page_number]
-            utils.log_event(
-                logging.INFO,
-                "pagination_resume",
-                source_name=source_name,
-                resource_id=resource_id,
-                extraction_route="datastore",
-                page=page_number,
-                offset=offset,
-            )
+                actual_rows = None
+                try:
+                    if not output_path.exists():
+                        utils.combine_parquet_parts(parts, output_path)
+
+                    actual_rows = utils.parquet_row_count(output_path)
+                    if actual_rows != declared_total:
+                        raise RuntimeError(
+                            f"{source_name}: Parquet row count mismatch: "
+                            f"expected {declared_total}, got {actual_rows}."
+                        )
+                except Exception as exc:
+                    utils.log_event(
+                        logging.WARNING,
+                        "completed_checkpoint_invalid",
+                        source_name=source_name,
+                        resource_id=resource_id,
+                        expected_rows=declared_total,
+                        actual_rows=actual_rows,
+                        error=str(exc),
+                        exception_type=type(exc).__name__,
+                        recovery="restart_from_offset_zero",
+                    )
+                    output_path.unlink(missing_ok=True)
+                    shutil.rmtree(checkpoint_dir, ignore_errors=True)
+                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    parts = []
+                    offset = 0
+                    page_number = 0
+                    declared_total = None
+                else:
+                    return actual_rows
+
+            else:
+                parts = [p for p in parts if int(p.stem.split("_")[1]) < page_number]
+                utils.log_event(
+                    logging.INFO,
+                    "pagination_resume",
+                    source_name=source_name,
+                    resource_id=resource_id,
+                    extraction_route="datastore",
+                    page=page_number,
+                    offset=offset,
+                )
 
         self.last_quality_warnings = []
         while True:

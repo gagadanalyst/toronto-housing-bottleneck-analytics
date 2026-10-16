@@ -1,0 +1,10 @@
+# Local ingestion snapshots and state
+/data/raw/
+/data/manifests/
+/data/checkpoints/
+/data/warehouse/
+/data/.ingestion.lock
+
+# Python-generated files
+__pycache__/
+*.py[cod]
