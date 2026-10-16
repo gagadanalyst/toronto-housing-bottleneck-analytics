@@ -1,10 +1,30 @@
-# Local ingestion snapshots and state
-/data/raw/
-/data/manifests/
-/data/checkpoints/
-/data/warehouse/
-/data/.ingestion.lock
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.dlt/
 
-# Python-generated files
+# Local ingestion data and runtime state
+/data/
+
+# Python caches and test artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# DuckDB files created outside the data directory
+*.duckdb
+*.duckdb.wal
+
+# Local Python virtual environment
+.venv/
