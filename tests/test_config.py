@@ -110,9 +110,7 @@ def test_replace_strategy_allows_empty_primary_key(monkeypatch, tmp_path):
     config_path.write_text(yaml.safe_dump(raw))
 
     app = load_config(config_path)
-    source = next(
-        s for s in app.sources if s.name == "synthetic_replace_source"
-    )
+    source = next(s for s in app.sources if s.name == "synthetic_replace_source")
 
     assert source.warehouse_strategy == "replace"
     assert source.primary_key == ()
