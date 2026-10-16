@@ -11,13 +11,8 @@ The configured ingestion scope contains exactly two datasets:
 
 The two populations directly support the initial lifecycle and aging questions while keeping extraction, data-quality review, and downstream analysis manageable.
 
-Three additional datasets remain research candidates, not part of executable ingestion:
+Additional datasets were considered during discovery but are outside the initial ingestion scope. The [Dataset Selection decision record](docs/decisions/0001-dataset-scope.md) documents the research, rationale, risks, and criteria for reconsidering these candidates. Only Active and Cleared Permits are configured and processed by this ingestion component.
 
-- [Development Applications](https://open.toronto.ca/dataset/development-applications/) — potential upstream planning context; grain, join coverage, and double-counting risks must be established first.
-- [Preliminary Zoning Reviews](https://open.toronto.ca/dataset/preliminary-zoning-reviews/) — potential earlier review activity; date semantics and reliable links to permits need validation.
-- [Address Points](https://open.toronto.ca/dataset/address-points-municipal-toronto-one-address-repository/) — potential geographic enrichment; key uniqueness, match coverage, and ambiguous joins need validation.
-
-See [Dataset Selection: Start with Active and Cleared Permits](docs/decisions/0001-dataset-scope.md) for the discovery record, detailed rationale, and source references. The three candidates are not configured or processed by this initial ingestion component.
 
 ## How it works
 
