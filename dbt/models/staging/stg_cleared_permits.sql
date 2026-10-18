@@ -1,3 +1,5 @@
+-- dbt 2.0.5 strict analysis cannot resolve DuckDB's timezone() function
+-- used by the to_utc_date macro; keep baseline until a semantics-safe fix is verified.
 {{ config(static_analysis='baseline') }}
 
 with cleaned_typed as (

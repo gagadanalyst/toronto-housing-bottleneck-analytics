@@ -97,9 +97,9 @@ failures AS (
           m.age_since_application_days IS NULL
           OR m.age_since_application_days < 0
           OR m.age_since_application_days
-              IS DISTINCT FROM DATE_DIFF(
-                  'day', e.application_date, m.as_of_date
-              )
+              IS DISTINCT FROM {{ date_diff_days(
+                'e.application_date', 'm.as_of_date'
+            ) }}
       )
 
     UNION ALL
