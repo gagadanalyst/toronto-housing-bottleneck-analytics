@@ -1,0 +1,20 @@
+unit_tests:
+  - name: cleared_lifecycle_summary_known_values
+    description: >
+      Verify lifecycle measure filters, missing durations, negative intervals,
+      zero-day durations, and summary statistics against known results.
+    model: mart_cleared_lifecycle_by_year_type
+    given:
+      - input: ref('fct_cleared_permit_revision')
+        rows:
+          - {status: Closed, application_date: "2024-01-10", permit_type: "Fixture Type", application_to_issue_days_raw: -3, application_to_completion_days_raw: null, issue_to_completion_days_raw: 1}
+          - {status: Closed, application_date: "2024-04-11", permit_type: "Fixture Type", application_to_issue_days_raw: 0, application_to_completion_days_raw: 10, issue_to_completion_days_raw: 4}
+          - {status: Closed, application_date: "2024-07-04", permit_type: "Fixture Type", application_to_issue_days_raw: 5, application_to_completion_days_raw: 20, issue_to_completion_days_raw: null}
+          - {status: Closed, application_date: "2024-08-01", permit_type: "Fixture Type", application_to_issue_days_raw: null, application_to_completion_days_raw: -2, issue_to_completion_days_raw: 9}
+          - {status: Cancelled, application_date: "2024-06-01", permit_type: "Excluded Type", application_to_issue_days_raw: 100, application_to_completion_days_raw: 100, issue_to_completion_days_raw: 100}
+          - {status: Closed, application_date: null, permit_type: "Null Year Type", application_to_issue_days_raw: 100, application_to_completion_days_raw: 100, issue_to_completion_days_raw: 100}
+    expect:
+      rows:
+        - {application_year: 2024, permit_type: "Fixture Type", measure: "Application to issue", eligible_date_pairs: 3, negative_interval_count: 1, publishable_duration_count: 2, median_days: 2.5, p90_days: 4.5, max_days: 5, negative_interval_rate_pct: 33.33}
+        - {application_year: 2024, permit_type: "Fixture Type", measure: "Application to completion", eligible_date_pairs: 3, negative_interval_count: 1, publishable_duration_count: 2, median_days: 15, p90_days: 19, max_days: 20, negative_interval_rate_pct: 33.33}
+        - {application_year: 2024, permit_type: "Fixture Type", measure: "Issue to completion", eligible_date_pairs: 3, negative_interval_count: 0, publishable_duration_count: 3, median_days: 4, p90_days: 8, max_days: 9, negative_interval_rate_pct: 0.0}
