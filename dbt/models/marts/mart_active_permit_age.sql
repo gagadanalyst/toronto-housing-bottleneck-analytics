@@ -51,7 +51,7 @@ SELECT
     c.cohort_exclusion_reason IS NULL AS is_age_eligible,
     CASE
         WHEN c.cohort_exclusion_reason IS NULL
-        THEN DATE_DIFF('day', c.application_date, a.as_of_date)
+        THEN {{ date_diff_days('c.application_date', 'a.as_of_date') }}
         ELSE NULL
     END AS age_since_application_days
 FROM classified AS c
