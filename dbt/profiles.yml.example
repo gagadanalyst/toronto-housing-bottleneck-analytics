@@ -1,0 +1,8 @@
+toronto_housing_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH') }}"
+      schema: analytics
+      threads: 4

@@ -28,3 +28,15 @@ dist/
 
 # Local Python virtual environment
 .venv/
+# dbt generated artifacts
+/dbt/target/
+/dbt/logs/
+/dbt/dbt_packages/
+
+# Local dbt and Fusion configuration
+/.user.yml
+/profiles.yml
+/dbt/profiles.yml
+
+# Guard against local data created inside the dbt project
+/dbt/data/
