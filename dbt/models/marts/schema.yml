@@ -19,6 +19,12 @@ models:
         description: Permit revision number; part of the logical permit-revision key.
       - name: permit_type
         description: City-defined permit type; part of the logical permit-revision key.
+        data_tests:
+          # Catch future permit types that are missing from the dimension.
+          - relationships:
+              arguments:
+                to: ref('dim_permit_type')
+                field: permit_type
       - name: current_source_row_count
         description: Number of physical current SCD2 source rows consolidated into this logical revision.
       - name: builder_name
