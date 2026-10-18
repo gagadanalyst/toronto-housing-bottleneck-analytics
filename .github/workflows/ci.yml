@@ -279,9 +279,54 @@ jobs:
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
 
-      - name: Generate dbt documentation
+      - name: Generate dbt documentation site for publication
         working-directory: dbt
-        run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir .
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
+
+      - name: Promote dbt-built warehouse for publication
+        run: |
+          set -euo pipefail
+          test -s data/warehouse/dbt-ci/toronto.duckdb
+          cp data/warehouse/dbt-ci/toronto.duckdb data/warehouse/toronto.duckdb
+          test -s data/warehouse/toronto.duckdb
+          sha256sum data/warehouse/toronto.duckdb
+
+      - name: Package dbt documentation for publication
+        run: |
+          set -euo pipefail
+          test -s dbt/docs-site/index.html
+          mkdir -p data-assets/dbt-docs
+          cp -R dbt/docs-site/. data-assets/dbt-docs/
+          cat > data-assets/dbt-docs/README.txt <<'EOF'
+          Toronto Housing Analytics — dbt documentation
+
+          This archive contains the complete static dbt documentation site, including its assets and generated index files.
+
+          1. Extract toronto-dbt-docs.zip into a directory.
+          2. Open a terminal in that extracted directory.
+          3. Run: python3 -m http.server 8000
+          4. Open http://localhost:8000/ in your browser.
+          EOF
+          python - <<'PYZIP'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          source = Path("data-assets/dbt-docs")
+          archive = Path("data-assets/toronto-dbt-docs.zip")
+          files = sorted(path for path in source.rglob("*") if path.is_file())
+          if not any(path.name == "index.html" for path in files):
+              raise SystemExit("Documentation site is missing index.html")
+          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+              for path in files:
+                  zipped.write(path, path.relative_to(source).as_posix())
+          with ZipFile(archive) as zipped:
+              names = zipped.namelist()
+              if "index.html" not in names or "README.txt" not in names:
+                  raise SystemExit("Documentation archive is missing required root files")
+              print("Packaged dbt documentation files:")
+              print("\n".join(names))
+          PYZIP
+          test -s data-assets/toronto-dbt-docs.zip
 
       - name: Upload dbt logs on failure
         if: failure()
@@ -334,12 +379,27 @@ jobs:
             data-assets/toronto-active-permits.parquet
             data-assets/toronto-cleared-permits.parquet
             data/warehouse/toronto.duckdb
+            data-assets/toronto-dbt-docs.zip
           )
+          release_notes="$(cat <<'EOF'
+          Rolling data publication, not a semantic-version release.
+
+          Assets:
+          - toronto-active-permits.parquet: full-source snapshot for Active Permits.
+          - toronto-cleared-permits.parquet: full-source snapshot for Cleared Permits.
+          - toronto.duckdb: source warehouse tables plus dbt staging views and mart tables.
+          - toronto-dbt-docs.zip: complete static dbt documentation site, including assets and generated index files, plus viewing instructions. Extract it and run `python3 -m http.server 8000` in the extracted directory, then open http://localhost:8000/.
+          EOF
+          )"
           if gh release view warehouse-latest >/dev/null 2>&1; then
             gh release upload warehouse-latest "${assets[@]}" --clobber
+            gh release edit warehouse-latest \
+              --title "Latest Toronto Housing Data Assets" \
+              --notes "$release_notes" \
+              --latest=false
           else
             gh release create warehouse-latest "${assets[@]}" \
               --title "Latest Toronto Housing Data Assets" \
-              --notes "Rolling data publication, not a semantic-version release. The two Parquet assets are full-source snapshots for Active and Cleared Permits. The DuckDB database contains the permit warehouse tables." \
+              --notes "$release_notes" \
               --latest=false
           fi
