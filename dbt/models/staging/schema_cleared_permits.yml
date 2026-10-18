@@ -1,0 +1,115 @@
+# Data Dict here: https://open.toronto.ca/dataset/building-permits-cleared-permits/
+version: 2
+models:
+  - name: stg_cleared_permits
+    description: >-
+      Cleans and types the City's Cleared Permits source,
+      preserving original source values and dlt SCD2 row versions.
+      Grain: one row per physical source-row version, not one row
+      per logical permit revision.
+      Source: https://open.toronto.ca/dataset/building-permits-cleared-permits/
+    columns:
+      - name: source_uniq_id
+        description: >-
+          City Open Data row identifier preserved from _id.
+          It may recur across different SCD2 versions in staging.
+      - name: permit_num
+        description: Last two digits of calendar year, plus IBMS-generated sequence
+      - name: revision_num
+        description: Two digit number identifying revisions to permit application made after permit issuance
+      - name: permit_type
+        description: >-
+          Text field describing the type of permit. The less descriptive permit type names here include:
+          - Designated Structures: Designated structure, such as communication towers, crane runways, exterior tanks and supports, pedestrian bridges, retaining walls, satellite dishes and solar collectors.
+          - Partial Permits: Permits issued for parts of a building; Excavation, Shoring, Structure, etc…
+          - Authority to Occupy: Partial occupancy of a building
+
+      - name: structure_type
+        description: Identifies that type of structure the application relates to.
+      - name: work
+        description: Overall description of the type of work covered by application.
+      - name: street_num
+        description: Address - street number
+      - name: street_name
+        description: Address - street name
+      - name: street_type
+        description: Address - street type
+      - name: street_direction
+        description: Address - street direction
+      - name: postal
+        description: First three characters of the postal code, not digits.
+      - name: geo_id
+        description: City-defined, unique identifier for Property Address
+      - name: ward_grid
+        description: City field whose meaning is not defined in the available source documentation.
+      - name: application_date_raw
+        description: >-
+          Date that the application was received and entered into the city's
+          permit application management system (IBMS)
+      - name: application_date
+        description: >-
+          Date that the application was received and entered into the city's
+          permit application management system (IBMS). Converted to Date
+      - name: issued_date_raw
+        description: Original source value for the permit issue date.
+      - name: issued_date
+        description: Permit issue date parsed to DATE from the source value.
+      - name: completed_date_raw
+        description: Original source timestamp for when work is complete and the permit is cleared.
+      - name: completed_date
+        description: UTC calendar date derived by converting the source timestamp to UTC before casting to DATE.
+      - name: status
+        description: Current status of application / permit
+      - name: description
+        description: Description of work proposed in application
+      - name: current_use
+        description: Use of the property at the time of application submission
+      - name: proposed_use
+        description: Use of the property after completion of work covered by permit
+      - name: est_const_cost_raw
+        description: raw estimated cost
+      - name: est_const_cost
+        description: >-
+          Estimated construction cost parsed to DOUBLE after removing thousands-separator commas.
+          The known sentinel value is not a numeric cost.
+      - name: assembly
+        description: Assembly Occupancy area (in sq metres) covered by permit work. (eg Restaurant, Library, Theatre)
+      - name: institutional
+        description: Institutional Occupancy area (in sq metres) covered by permit work (eg Hospital, Nursing Home)
+      - name: residential
+        description: Residential Occupancy area (in sq metres) covered by permit work
+      - name: business_and_personal_services
+        description: Business and Personal Services Occupancy area (in sq metres) covered by permit work (Office, Bank, Medical Clinic)
+      - name: mercantile
+        description: Mercantile Occupancy area (in sq metres) covered by permit work (eg Department Store, Supermarket)
+      - name: industrial
+        description: Industrial Occupancy area (in sq metres) covered by permit work (eg Warehouse, Gas Station)
+      - name: interior_alterations
+        description: Floor area (in sq metres) covered by permit work
+      - name: demolition
+        description: Floor area (in sq metres) covered by permit work
+      - name: builder_name
+        description: builder name
+      - name: dwelling_units_created_raw
+        description: Original source value for dwelling units created (VARCHAR)
+      - name: dwelling_units_created
+        description: dwelling units created typed to BIGINT
+      - name: dwelling_units_lost_raw
+        description: Original source value for dwelling units lost (VARCHAR)
+      - name: dwelling_units_lost
+        description: dwelling units lost typed to BIGINT
+      - name: row_hash
+        description: row hash used by dlt to know when a row changed in source
+      - name: source_valid_from
+        description: >-
+          dlt SCD2 timestamp marking when this row version became valid in tracked source history.
+      - name: source_valid_to
+        description: >-
+          dlt SCD2 timestamp marking the end of this version's validity;
+          NULL indicates an open-ended version.
+      - name: source_load_id
+        description: dlt load id
+      - name: source_row_version_id
+        description: >-
+          dlt-generated identifier for a physical row version;
+          unlike the source row ID, this is the identifier tested for uniqueness in staging

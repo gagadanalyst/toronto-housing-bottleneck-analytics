@@ -1,0 +1,146 @@
+version: 2
+
+models:
+  - name: fct_cleared_permit_revision
+    description: >-
+      One row per logical cleared building-permit revision, keyed by
+      permit_num, revision_num, and permit_type. The model uses current SCD2
+      source rows only and consolidates duplicate current source rows without
+      arbitrarily selecting conflicting values. Lifecycle dates and geo_id are
+      published only when all current rows for a revision agree on the same
+      non-null value. Negative lifecycle durations are retained in the raw
+      duration columns and excluded from the corresponding analysis-facing
+      duration columns. Durations are elapsed calendar days, not business days.
+    columns:
+      - name: permit_num
+        description: Permit number; part of the logical permit-revision key.
+      - name: revision_num
+        description: Permit revision number; part of the logical permit-revision key.
+      - name: permit_type
+        description: City permit type; part of the logical permit-revision key.
+        data_tests:
+          # Purpose: prove every fact permit type has a corresponding dimension row,
+          # while the dimension key is unique and non-null.
+          - relationships:
+              arguments:
+                to: ref('dim_permit_type')
+                field: permit_type
+      - name: current_source_row_count
+        description: Number of current SCD2 source rows consolidated into this logical revision.
+      - name: observed_builder_names
+        description: Distinct non-null builder names observed across current source rows, concatenated for diagnostics.
+      - name: builder_name_conflict
+        description: True when current source rows disagree on builder_name, including null versus non-null values.
+      - name: application_date_conflict
+        description: True when current source rows disagree on application_date, including null versus non-null values.
+      - name: issued_date_conflict
+        description: True when current source rows disagree on issued_date, including null versus non-null values.
+      - name: completed_date_conflict
+        description: True when current source rows disagree on completed_date, including null versus non-null values.
+      - name: geo_id_conflict
+        description: True when current source rows disagree on geo_id, including null versus non-null values.
+      - name: application_date
+        description: Application date, published only when every current source row has the same non-null date.
+      - name: issued_date
+        description: Issue date, published only when every current source row has the same non-null date.
+      - name: completed_date
+        description: Completion date normalized to the source's UTC calendar date, published only when every current source row has the same non-null date.
+      - name: geo_id
+        description: Geographic identifier, published only when every current source row has the same non-null value.
+      - name: application_to_issue_days_raw
+        description: Signed elapsed calendar days from application to issue; negative values are retained for anomaly analysis.
+      - name: application_to_completion_days_raw
+        description: Signed elapsed calendar days from application to completion; negative values are retained for anomaly analysis.
+      - name: issue_to_completion_days_raw
+        description: Signed elapsed calendar days from issue to completion; negative values are retained for anomaly analysis.
+      - name: application_to_issue_days
+        description: Application-to-issue elapsed calendar days; null when the raw duration is negative or either date is unavailable.
+      - name: application_to_completion_days
+        description: Application-to-completion elapsed calendar days; null when the raw duration is negative or either date is unavailable.
+      - name: issue_to_completion_days
+        description: Issue-to-completion elapsed calendar days; null when the raw duration is negative or either date is unavailable.
+      - name: application_to_issue_negative
+        description: True when the raw application-to-issue duration is negative; null when it cannot be calculated.
+      - name: application_to_completion_negative
+        description: True when the raw application-to-completion duration is negative; null when it cannot be calculated.
+      - name: issue_to_completion_negative
+        description: True when the raw issue-to-completion duration is negative; null when it cannot be calculated.
+      - name: status
+        description: >-
+          Normalized status, published only when all current source rows
+          agree on the same non-null value.
+      - name: observed_status_values
+        description: Distinct normalized status values observed across current
+          source rows, including a marker for missing values.
+      - name: has_status_conflict
+        description: True when current source rows disagree on status, including null versus non-null.
+  - name: dim_date
+    description: >-
+      Continuous daily calendar spanning the lifecycle dates observed in the
+      Cleared Permits fact. One row per calendar date.
+    columns:
+      - name: date_day
+        description: Calendar date; the dimension's unique key.
+        data_tests:
+          - not_null
+          - unique
+      - name: year_number
+        description: Calendar year.
+      - name: quarter_number
+        description: Calendar quarter, 1 through 4.
+      - name: month_number
+        description: Calendar month, 1 through 12.
+      - name: day_of_month
+        description: Day of the month.
+      - name: month_start
+        description: First calendar date of the month.
+
+  - name: mart_cleared_lifecycle_by_year_type
+    description: >-
+      Closed-permit lifecycle duration statistics by application year,
+      permit type, and lifecycle measure. Negative intervals are counted
+      separately and excluded from published duration statistics.
+      Recent years are subject to closure-selection bias; 2026 is partial.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - application_year
+              - permit_type
+              - measure
+    columns:
+      - name: application_year
+        description: Calendar year of application.
+        data_tests:
+          - not_null
+      - name: permit_type
+        description: City-defined permit type.
+        data_tests:
+          - not_null
+      - name: measure
+        description: Lifecycle interval being summarized.
+        data_tests:
+          - not_null
+      - name: eligible_date_pairs
+        description: Number of revisions with both dates available for the measure.
+      - name: negative_interval_count
+        description: Number of eligible revisions with a negative raw duration.
+      - name: publishable_duration_count
+        description: Number of eligible revisions with a non-negative duration.
+      - name: negative_interval_rate_pct
+        description: Percentage of eligible date pairs with a negative duration.
+      - name: median_days
+        description: Median non-negative elapsed calendar days.
+      - name: p90_days
+        description: 90th percentile of non-negative elapsed calendar days.
+      - name: max_days
+        description: Maximum non-negative elapsed calendar days.
+
+  - name: dim_permit_type
+    description: One row per distinct permit type in the Cleared permit fact.
+    columns:
+      - name: permit_type
+        description: Natural key identifying a permit type.
+        data_tests:
+          - not_null
+          - unique

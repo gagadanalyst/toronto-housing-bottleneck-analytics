@@ -1,0 +1,13 @@
+sources:
+  - name: toronto_raw
+    description: "Persistent raw schema populated by the ingestion pipeline."
+    database: toronto
+    schema: raw
+    tables:
+      - name: cleared_permits
+        identifier: raw_cleared_permits
+        description: "Persisted Cleared Permits source history, including SCD2 versions."
+
+      - name: active_permits
+        identifier: raw_active_permits
+        description: "Persisted Active Permits source history, including SCD2 versions."
