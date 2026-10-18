@@ -1,6 +1,110 @@
 version: 2
 
 models:
+  - name: fct_active_permit_revision
+    description: >-
+      One row per logical Active Permits revision, keyed by permit_num,
+      revision_num, and permit_type. Uses current SCD2 source rows only and
+      consolidates duplicate physical rows. Builder, status, application
+      date, issue date, and geographic identifier are published only when
+      all current source rows agree on the same non-null value. Diagnostic
+      columns retain observed values and identify disagreements, including
+      missing versus non-missing values. All-null attributes are missing,
+      not conflicts. This is a current-source snapshot, not a complete
+      historical record of every source revision.
+    columns:
+      - name: permit_num
+        description: Permit number; part of the logical permit-revision key.
+      - name: revision_num
+        description: Permit revision number; part of the logical permit-revision key.
+      - name: permit_type
+        description: City-defined permit type; part of the logical permit-revision key.
+      - name: current_source_row_count
+        description: Number of physical current SCD2 source rows consolidated into this logical revision.
+      - name: builder_name
+        description: Builder name, published only when every current source row contains the same non-null value.
+      - name: observed_builder_names
+        description: Distinct observed builder names across current rows, including a marker for missing values.
+      - name: builder_name_conflict
+        description: True when observed builder names disagree, including a mixture of missing and non-missing values.
+      - name: status
+        description: Trimmed status, published only when every current source row contains the same non-null value.
+      - name: observed_status_values
+        description: Distinct observed trimmed status values across current rows, including a marker for missing values.
+      - name: has_status_conflict
+        description: True when status values disagree across current source rows, including missing versus non-missing values.
+      - name: application_date
+        description: Application date, published only when every current source row contains the same non-null date.
+      - name: observed_application_dates
+        description: Distinct application dates observed across current rows, including a marker for missing values.
+      - name: application_date_conflict
+        description: True when application dates disagree across current source rows, including missing versus non-missing values.
+      - name: issued_date
+        description: Issue date, published only when every current source row contains the same non-null date.
+      - name: observed_issued_dates
+        description: Distinct issue dates observed across current rows, including a marker for missing values.
+      - name: issued_date_conflict
+        description: True when issue dates disagree across current source rows, including missing versus non-missing values.
+      - name: geo_id
+        description: Geographic identifier, published only when every current source row contains the same non-null value.
+      - name: observed_geo_ids
+        description: Distinct geographic identifiers observed across current rows, including a marker for missing values.
+      - name: geo_id_conflict
+        description: True when geographic identifiers disagree across current source rows, including missing versus non-missing values.
+
+  - name: mart_active_permit_age
+    description: >-
+      One row per logical current Active Permits revision, with its age
+      measured as elapsed calendar days from application_date to as_of_date.
+      Eligibility is determined by the first matching exclusion rule:
+      status conflict, missing status, terminal or exception status, an
+      application-date conflict, or a missing application date. Eligible
+      permits have not necessarily completed their lifecycle. Their ages
+      are right-censored observations and must not be interpreted as
+      completed permit durations.
+    columns:
+      - name: permit_num
+        description: Permit number; part of the logical permit-revision key.
+      - name: revision_num
+        description: Permit revision number; part of the logical permit-revision key.
+      - name: permit_type
+        description: City-defined permit type; part of the logical permit-revision key.
+      - name: builder_name
+        description: Builder name consolidated from the current source rows.
+      - name: status
+        description: Consolidated trimmed source status.
+      - name: status_normalized
+        description: Lowercase trimmed status used for cohort classification.
+      - name: application_date
+        description: Consolidated application date; required for age eligibility.
+      - name: issued_date
+        description: Consolidated issue date, retained for analysis and drill-down.
+      - name: geo_id
+        description: Consolidated geographic identifier, retained for analysis and drill-down.
+      - name: current_source_row_count
+        description: Number of physical current source rows consolidated into the logical revision.
+      - name: has_status_conflict
+        description: Inherited flag indicating disagreement among current source status values.
+      - name: application_date_conflict
+        description: Inherited flag indicating disagreement among current source application dates.
+      - name: issued_date_conflict
+        description: Inherited flag indicating disagreement among current source issue dates.
+      - name: geo_id_conflict
+        description: Inherited flag indicating disagreement among current source geographic identifiers.
+      - name: as_of_date
+        description: Date at which age is measured; defaults from dbt run_started_at and can be overridden with the as_of_date variable.
+      - name: cohort_exclusion_reason
+        description: >-
+          First applicable exclusion reason: status_conflict, missing_status,
+          terminal_or_exception_status, application_date_conflict, or
+          missing_application_date. Null means the revision is eligible.
+      - name: is_age_eligible
+        description: True when cohort_exclusion_reason is null.
+      - name: age_since_application_days
+        description: >-
+          Elapsed calendar days from application_date to as_of_date for
+          eligible revisions; null for excluded revisions. This is an
+          observed age, not a completed lifecycle duration or business-day count.
   - name: fct_cleared_permit_revision
     description: >-
       One row per logical cleared building-permit revision, keyed by
