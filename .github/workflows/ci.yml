@@ -61,12 +61,78 @@ jobs:
       - run: pip-audit
       - run: python -m build
 
+  dbt-validation:
+    name: Validate dbt against published warehouse
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+      DBT_DUCKDB_PATH: ${{ github.workspace }}/data/warehouse/dbt-ci/toronto.duckdb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Create isolated dbt environment
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+
+      - name: Download published warehouse snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p data/warehouse/dbt-ci
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto.duckdb" \
+            -o data/warehouse/dbt-ci/toronto.duckdb
+          test -s data/warehouse/dbt-ci/toronto.duckdb
+          sha256sum data/warehouse/dbt-ci/toronto.duckdb
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt package dependencies
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
+
+      - name: Check connection and parse project
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
+
+      - name: Build models and run tests
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
+
+      - name: Generate dbt documentation
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir .
+
+      - name: Upload dbt logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dbt-pr-logs-${{ github.run_id }}
+          path: dbt/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
   data-assets:
     name: Extract Toronto data and publish assets
     permissions:
       contents: write
     env:
       RUNTIME__DLTHUB_TELEMETRY: "false"
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
@@ -177,8 +243,55 @@ jobs:
 
                   print(f"{table}: {count:,} rows")
           PY
+
       - name: Validate permit warehouse loads
         run: python -m pytest -s tests/test_warehouse_load.py
+
+      - name: Create isolated dbt environment
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+
+      - name: Prepare fresh warehouse copy for dbt
+        run: |
+          set -euo pipefail
+          mkdir -p data/warehouse/dbt-ci
+          cp data/warehouse/toronto.duckdb data/warehouse/dbt-ci/toronto.duckdb
+          echo "DBT_DUCKDB_PATH=${GITHUB_WORKSPACE}/data/warehouse/dbt-ci/toronto.duckdb" >> "$GITHUB_ENV"
+          sha256sum data/warehouse/dbt-ci/toronto.duckdb
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt package dependencies
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
+
+      - name: Check connection and parse project
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
+
+      - name: Build models and run tests
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
+
+      - name: Generate dbt documentation
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir .
+
+      - name: Upload dbt logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dbt-main-logs-${{ github.run_id }}
+          path: dbt/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload Parquet assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
