@@ -11,3 +11,35 @@ sources:
       - name: active_permits
         identifier: raw_active_permits
         description: "Persisted Active Permits source history, including SCD2 versions."
+
+      - name: active_permit_load_metadata
+        identifier: _dlt_loads
+        description: >-
+          Successful dlt warehouse loads for Active Permits, used to measure
+          warehouse load freshness independently of source record dates.
+        config:
+          loaded_at_field: inserted_at
+          freshness:
+            warn_after:
+              count: 36
+              period: hour
+            error_after:
+              count: 48
+              period: hour
+            filter: "schema_name = 'toronto_active_permits_scd2' AND status = 0"
+
+      - name: cleared_permit_load_metadata
+        identifier: _dlt_loads
+        description: >-
+          Successful dlt warehouse loads for Cleared Permits, used to measure
+          warehouse load freshness independently of source record dates.
+        config:
+          loaded_at_field: inserted_at
+          freshness:
+            warn_after:
+              count: 36
+              period: hour
+            error_after:
+              count: 48
+              period: hour
+            filter: "schema_name = 'toronto_cleared_permits_scd2' AND status = 0"

@@ -49,6 +49,16 @@ The project includes singular SQL tests for:
 
 Tests are organized alongside the models and grouped by the contract they verify. Existing tests should be extended where needed rather than duplicated.
 
+## Source freshness
+
+The Active and Cleared load-metadata definitions use dbt's native loaded_at_field and freshness filters against raw._dlt_loads. Each definition filters to its own dlt pipeline and completed loads (status = 0). These checks measure successful warehouse load freshness, not the age of permit application records. The separate ingestion freshness assessment evaluates Toronto's source metadata.
+
+Freshness warns after 36 hours and errors after 48 hours, matching the sources'
+daily expected cadence and the ingestion pipeline's existing 48-hour stale-data
+boundary. The production CD workflow runs `dbt freshness` after ingestion and
+before the dbt build, against the warehouse copy being prepared for publication.
+Run the same check manually from this directory with `dbt freshness --profiles-dir .`.
+
 ## Data scope and interpretation
 
 The production CD workflow publishes two Parquet snapshots and a DuckDB warehouse through the repository's rolling `warehouse-latest` GitHub release after a successful eligible CI run.
