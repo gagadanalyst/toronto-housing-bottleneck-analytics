@@ -167,6 +167,10 @@ jobs:
           "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
           "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
 
+      - name: Check dbt source freshness
+        working-directory: dbt
+        run: "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
+
       - name: Build models and run tests
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
