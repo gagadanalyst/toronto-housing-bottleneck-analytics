@@ -1,0 +1,17 @@
+exposures:
+  - name: toronto_housing_bottleneck_dashboard
+    label: Toronto Housing Bottleneck Analytics Dashboard
+    type: dashboard
+    maturity: medium
+    url: https://toronto-housing-bottleneck.streamlit.app/
+    description: >-
+      Public Streamlit dashboard for the Toronto Housing Bottleneck Analytics
+      project. It reads the published DuckDB warehouse and queries the dbt
+      serving models for active-permit age, cleared-permit lifecycle summaries,
+      and cleared-permit data-quality diagnostics.
+    depends_on:
+      - ref('mart_active_permit_age')
+      - ref('mart_cleared_lifecycle_by_year_type')
+      - ref('fct_cleared_permit_revision')
+    owner:
+      name: gagadanalyst
