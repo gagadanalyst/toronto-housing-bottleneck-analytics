@@ -59,6 +59,9 @@ models:
         description: True when geographic identifiers disagree across current source rows, including missing versus non-missing values.
 
   - name: mart_active_permit_age
+    config:
+      contract:
+        enforced: true
     description: >-
       One row per logical current Active Permits revision, with its age
       measured as elapsed calendar days from application_date to as_of_date.
@@ -70,48 +73,69 @@ models:
       completed permit durations.
     columns:
       - name: permit_num
+        data_type: VARCHAR
         description: Permit number; part of the logical permit-revision key.
       - name: revision_num
+        data_type: VARCHAR
         description: Permit revision number; part of the logical permit-revision key.
       - name: permit_type
+        data_type: VARCHAR
         description: City-defined permit type; part of the logical permit-revision key.
       - name: builder_name
+        data_type: VARCHAR
         description: Builder name consolidated from the current source rows.
       - name: status
+        data_type: VARCHAR
         description: Consolidated trimmed source status.
       - name: status_normalized
+        data_type: VARCHAR
         description: Lowercase trimmed status used for cohort classification.
       - name: application_date
+        data_type: DATE
         description: Consolidated application date; required for age eligibility.
       - name: issued_date
+        data_type: DATE
         description: Consolidated issue date, retained for analysis and drill-down.
       - name: geo_id
+        data_type: VARCHAR
         description: Consolidated geographic identifier, retained for analysis and drill-down.
       - name: current_source_row_count
+        data_type: BIGINT
         description: Number of physical current source rows consolidated into the logical revision.
       - name: has_status_conflict
+        data_type: BOOLEAN
         description: Inherited flag indicating disagreement among current source status values.
       - name: application_date_conflict
+        data_type: BOOLEAN
         description: Inherited flag indicating disagreement among current source application dates.
       - name: issued_date_conflict
+        data_type: BOOLEAN
         description: Inherited flag indicating disagreement among current source issue dates.
       - name: geo_id_conflict
+        data_type: BOOLEAN
         description: Inherited flag indicating disagreement among current source geographic identifiers.
       - name: as_of_date
+        data_type: DATE
         description: Date at which age is measured; defaults from dbt run_started_at and can be overridden with the as_of_date variable.
       - name: cohort_exclusion_reason
+        data_type: VARCHAR
         description: >-
           First applicable exclusion reason: status_conflict, missing_status,
           terminal_or_exception_status, application_date_conflict, or
           missing_application_date. Null means the revision is eligible.
       - name: is_age_eligible
+        data_type: BOOLEAN
         description: True when cohort_exclusion_reason is null.
       - name: age_since_application_days
+        data_type: BIGINT
         description: >-
           Elapsed calendar days from application_date to as_of_date for
           eligible revisions; null for excluded revisions. This is an
           observed age, not a completed lifecycle duration or business-day count.
   - name: fct_cleared_permit_revision
+    config:
+      contract:
+        enforced: true
     description: >-
       One row per logical cleared building-permit revision, keyed by
       permit_num, revision_num, and permit_type. The model uses current SCD2
@@ -123,10 +147,13 @@ models:
       duration columns. Durations are elapsed calendar days, not business days.
     columns:
       - name: permit_num
+        data_type: VARCHAR
         description: Permit number; part of the logical permit-revision key.
       - name: revision_num
+        data_type: VARCHAR
         description: Permit revision number; part of the logical permit-revision key.
       - name: permit_type
+        data_type: VARCHAR
         description: City permit type; part of the logical permit-revision key.
         data_tests:
           # Purpose: prove every fact permit type has a corresponding dimension row,
@@ -136,53 +163,76 @@ models:
                 to: ref('dim_permit_type')
                 field: permit_type
       - name: current_source_row_count
+        data_type: BIGINT
         description: Number of current SCD2 source rows consolidated into this logical revision.
       - name: observed_builder_names
+        data_type: VARCHAR
         description: Distinct non-null builder names observed across current source rows, concatenated for diagnostics.
       - name: builder_name_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on builder_name, including null versus non-null values.
       - name: application_date_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on application_date, including null versus non-null values.
       - name: issued_date_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on issued_date, including null versus non-null values.
       - name: completed_date_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on completed_date, including null versus non-null values.
       - name: geo_id_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on geo_id, including null versus non-null values.
       - name: application_date
+        data_type: DATE
         description: Application date, published only when every current source row has the same non-null date.
       - name: issued_date
+        data_type: DATE
         description: Issue date, published only when every current source row has the same non-null date.
       - name: completed_date
+        data_type: DATE
         description: Completion date normalized to the source's UTC calendar date, published only when every current source row has the same non-null date.
       - name: geo_id
+        data_type: VARCHAR
         description: Geographic identifier, published only when every current source row has the same non-null value.
       - name: application_to_issue_days_raw
+        data_type: BIGINT
         description: Signed elapsed calendar days from application to issue; negative values are retained for anomaly analysis.
       - name: application_to_completion_days_raw
+        data_type: BIGINT
         description: Signed elapsed calendar days from application to completion; negative values are retained for anomaly analysis.
       - name: issue_to_completion_days_raw
+        data_type: BIGINT
         description: Signed elapsed calendar days from issue to completion; negative values are retained for anomaly analysis.
       - name: application_to_issue_days
+        data_type: BIGINT
         description: Application-to-issue elapsed calendar days; null when the raw duration is negative or either date is unavailable.
       - name: application_to_completion_days
+        data_type: BIGINT
         description: Application-to-completion elapsed calendar days; null when the raw duration is negative or either date is unavailable.
       - name: issue_to_completion_days
+        data_type: BIGINT
         description: Issue-to-completion elapsed calendar days; null when the raw duration is negative or either date is unavailable.
       - name: application_to_issue_negative
+        data_type: BOOLEAN
         description: True when the raw application-to-issue duration is negative; null when it cannot be calculated.
       - name: application_to_completion_negative
+        data_type: BOOLEAN
         description: True when the raw application-to-completion duration is negative; null when it cannot be calculated.
       - name: issue_to_completion_negative
+        data_type: BOOLEAN
         description: True when the raw issue-to-completion duration is negative; null when it cannot be calculated.
       - name: status
+        data_type: VARCHAR
         description: >-
           Normalized status, published only when all current source rows
           agree on the same non-null value.
       - name: observed_status_values
+        data_type: VARCHAR
         description: Distinct normalized status values observed across current
           source rows, including a marker for missing values.
       - name: has_status_conflict
+        data_type: BOOLEAN
         description: True when current source rows disagree on status, including null versus non-null.
   - name: dim_date
     description: >-
@@ -206,6 +256,9 @@ models:
         description: First calendar date of the month.
 
   - name: mart_cleared_lifecycle_by_year_type
+    config:
+      contract:
+        enforced: true
     description: >-
       Closed-permit lifecycle duration statistics by application year,
       permit type, and lifecycle measure. Negative intervals are counted
@@ -220,30 +273,40 @@ models:
               - measure
     columns:
       - name: application_year
+        data_type: INTEGER
         description: Calendar year of application.
         data_tests:
           - not_null
       - name: permit_type
+        data_type: VARCHAR
         description: City-defined permit type.
         data_tests:
           - not_null
       - name: measure
+        data_type: VARCHAR
         description: Lifecycle interval being summarized.
         data_tests:
           - not_null
       - name: eligible_date_pairs
+        data_type: BIGINT
         description: Number of revisions with both dates available for the measure.
       - name: negative_interval_count
+        data_type: HUGEINT
         description: Number of eligible revisions with a negative raw duration.
       - name: publishable_duration_count
+        data_type: HUGEINT
         description: Number of eligible revisions with a non-negative duration.
       - name: negative_interval_rate_pct
+        data_type: DOUBLE
         description: Percentage of eligible date pairs with a negative duration.
       - name: median_days
+        data_type: DOUBLE
         description: Median non-negative elapsed calendar days.
       - name: p90_days
+        data_type: DOUBLE
         description: 90th percentile of non-negative elapsed calendar days.
       - name: max_days
+        data_type: BIGINT
         description: Maximum non-negative elapsed calendar days.
 
   - name: dim_permit_type
