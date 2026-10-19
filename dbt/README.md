@@ -51,7 +51,7 @@ Tests are organized alongside the models and grouped by the contract they verify
 
 ## Data scope and interpretation
 
-The ingestion workflow publishes two Parquet snapshots and a DuckDB warehouse through the repository's rolling `warehouse-latest` GitHub release.
+The production CD workflow publishes two Parquet snapshots and a DuckDB warehouse through the repository's rolling `warehouse-latest` GitHub release after a successful eligible CI run.
 
 The Parquet snapshots represent full-source Active and Cleared Permits data. The warehouse tables are scoped to records with `APPLICATION_DATE >= 2020-01-01`.
 

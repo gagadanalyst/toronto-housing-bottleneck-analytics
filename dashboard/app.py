@@ -19,9 +19,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# The mutable warehouse-latest release is rebuilt by the repository's CI after
-# ingestion and dbt build/tests. Download the published database, then query the
-# curated dbt relations in read-only mode. No local project database is required.
+# The mutable warehouse-latest release is published by CD after an eligible
+# CI run succeeds; CD runs ingestion and dbt build/tests before publication.
+# Download the published database and query curated dbt relations read-only.
+# No local project database is required.
 DUCKDB_RELEASE_URL = (
     "https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/"
     "releases/download/warehouse-latest/toronto.duckdb"
