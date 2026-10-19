@@ -5,8 +5,9 @@ ckan:
   page_size: 10000
 
 warehouse:
-  # DuckDB is used locally and in GitHub Actions. Switch this to snowflake in
-  # production and install the project's Snowflake extra.
+  # DuckDB is the configured, tested target for local runs and GitHub Actions.
+  # Snowflake is an optional ingestion destination; end-to-end dbt publication
+  # is currently validated with DuckDB.
   kind: "duckdb"
   credentials: "data/warehouse/toronto.duckdb"
   dataset_name: "raw"

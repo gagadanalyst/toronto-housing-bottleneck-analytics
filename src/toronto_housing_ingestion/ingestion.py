@@ -398,23 +398,6 @@ def ingest_source(
         _write_manifest(manifest_path, manifest)
         return manifest
 
-    """Removed below logic as it was blocking load to duck
-    as we have duplicates in old data.
-    """
-
-    """if warnings:
-        manifest.update(
-            {
-                "status": "success",
-                "warehouse_status": "blocked_quality_warning",
-                "warehouse_block_reason": (
-                    "Configured natural key is not valid for this snapshot."
-                ),
-            }
-        )
-        _write_manifest(manifest_path, manifest)
-        return manifest"""
-
     try:
         result = load_scd2(
             credentials=app.warehouse_credentials,
