@@ -269,38 +269,23 @@ jobs:
           ls -lh data-assets/*.parquet
 
       - name: Publish durable data assets
+        id: publish_assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          assets=(
-            data-assets/toronto-active-permits.parquet
-            data-assets/toronto-cleared-permits.parquet
-            data/warehouse/toronto.duckdb
-            data-assets/toronto-dbt-docs.zip
-          )
-          release_notes="$(cat <<'EOF'
-          Rolling data publication, not a semantic-version release.
+          WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
+          WAREHOUSE_LATEST_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python scripts/publish_release_assets.py
 
-          Assets:
-          - toronto-active-permits.parquet: full-source snapshot for Active Permits.
-          - toronto-cleared-permits.parquet: full-source snapshot for Cleared Permits.
-          - toronto.duckdb: source warehouse tables plus dbt staging views and mart tables.
-          - toronto-dbt-docs.zip: complete static dbt documentation site, including assets and generated index files, plus viewing instructions. Extract it and run `python3 -m http.server 8000` in the extracted directory, then open http://localhost:8000/.
-          EOF
-          )"
-          if gh release view warehouse-latest >/dev/null 2>&1; then
-            gh release upload warehouse-latest "${assets[@]}" --clobber
-            gh release edit warehouse-latest \
-              --title "Latest Toronto Housing Data Assets" \
-              --notes "$release_notes" \
-              --latest=false
-          else
-            gh release create warehouse-latest "${assets[@]}" \
-              --title "Latest Toronto Housing Data Assets" \
-              --notes "$release_notes" \
-              --latest=false
-          fi
+      - name: Preserve recovery backup if rollback fails
+        if: always() && steps.publish_assets.outcome != 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: warehouse-latest-recovery-${{ github.run_id }}
+          path: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}/last-known-good/
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 30
+
   deploy-dbt-docs:
     name: Deploy dbt documentation to GitHub Pages
     if: >-
