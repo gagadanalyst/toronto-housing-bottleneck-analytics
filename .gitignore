@@ -40,3 +40,7 @@ dist/
 
 # Guard against local data created inside the dbt project
 /dbt/data/
+
+# Local dbt configuration and generated documentation site
+/dbt/.user.yml
+/dbt/docs-site/
