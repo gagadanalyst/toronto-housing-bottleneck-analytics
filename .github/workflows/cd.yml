@@ -1,0 +1,322 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-housing-data-publication
+  cancel-in-progress: false
+
+jobs:
+  data-assets:
+    name: Extract Toronto data and publish assets
+    permissions:
+      contents: write
+    env:
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Upgrade pip to a patched release
+        run: python -m pip install --upgrade "pip>=26.2.1,<27"
+
+      - run: python -m pip install -e .
+
+      - name: Install pytest
+        run: python -m pip install "pytest>=9,<10"
+
+      - name: Restore persistent DuckDB asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data/warehouse
+          if gh release view warehouse-latest >/dev/null 2>&1; then
+            gh release download warehouse-latest \
+              --pattern "toronto.duckdb" \
+              --dir data/warehouse \
+              --clobber
+          fi
+
+      - name: Extract Active and Cleared Permits only
+        run: >-
+          toronto-ingest
+          --config open_data_config.yml
+          --raw-root data/raw
+          --manifest-root data/manifests
+          --checkpoint-root data/checkpoints
+          --lock-file data/.ingestion.lock
+          --full-refresh
+
+      - name: Run local setup smoke test
+        env:
+          RUN_LIVE_TESTS: "1"
+        run: python -m pytest -q tests/test_local_setup.py
+
+      - name: Run Active Permits SCD2 integration test
+        run: python -m pytest -s tests/integration/test_scd2_active_permits.py
+
+      - name: Validate assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
+          test -s data/warehouse/toronto.duckdb
+
+          for file in $(find data/raw -type f -name 'data.parquet'); do
+            test -s "$file"
+          done
+
+          echo "Parquet assets:"
+          find data/raw -type f -name 'data.parquet' -print
+
+          echo "DuckDB:"
+          ls -lh data/warehouse/toronto.duckdb
+
+      #- name: Run permit business-key tests
+      #  run: python -m pytest -q tests/test_business_keys.py
+      - name: Validate DuckDB contents
+        run: |
+          python - <<'PY'
+          import duckdb
+          import os
+          db = "data/warehouse/toronto.duckdb"
+          print(os.listdir('data/warehouse/'))
+          with duckdb.connect(db, read_only=True) as con:
+              tables = {
+                  row[0]
+                  for row in con.execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE table_schema = 'raw'"
+                  ).fetchall()
+              }
+              print(tables)
+
+              required = {
+                  "raw_active_permits",
+                  "raw_cleared_permits",
+              }
+
+              missing = required - tables
+              if missing:
+                  raise SystemExit(
+                      f"Missing required warehouse tables: {sorted(missing)}"
+                  )
+
+              for table in sorted(required):
+                  count = con.execute(
+                      f"SELECT COUNT(*) FROM raw.{table}"
+                  ).fetchone()[0]
+
+                  if count == 0:
+                      raise SystemExit(
+                          f"Warehouse table {table} is empty."
+                      )
+
+                  print(f"{table}: {count:,} rows")
+          PY
+
+      - name: Validate permit warehouse loads
+        run: python -m pytest -s tests/test_warehouse_load.py
+
+      - name: Create isolated dbt environment
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+
+      - name: Prepare fresh warehouse copy for dbt
+        run: |
+          set -euo pipefail
+          mkdir -p data/warehouse/dbt-ci
+          cp data/warehouse/toronto.duckdb data/warehouse/dbt-ci/toronto.duckdb
+          echo "DBT_DUCKDB_PATH=${GITHUB_WORKSPACE}/data/warehouse/dbt-ci/toronto.duckdb" >> "$GITHUB_ENV"
+          sha256sum data/warehouse/dbt-ci/toronto.duckdb
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt package dependencies
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
+
+      - name: Check connection and parse project
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
+
+      - name: Build models and run tests
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
+
+      - name: Generate dbt documentation site for publication
+        working-directory: dbt
+        run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
+
+      - name: Promote dbt-built warehouse for publication
+        run: |
+          set -euo pipefail
+          test -s data/warehouse/dbt-ci/toronto.duckdb
+          cp data/warehouse/dbt-ci/toronto.duckdb data/warehouse/toronto.duckdb
+          test -s data/warehouse/toronto.duckdb
+          sha256sum data/warehouse/toronto.duckdb
+
+      - name: Package dbt documentation for publication
+        run: |
+          set -euo pipefail
+          test -s dbt/docs-site/index.html
+          mkdir -p data-assets/dbt-docs
+          cp -R dbt/docs-site/. data-assets/dbt-docs/
+          cat > data-assets/dbt-docs/README.txt <<'EOF'
+          Toronto Housing Analytics — dbt documentation
+
+          This archive contains the complete static dbt documentation site, including its assets and generated index files.
+
+          1. Extract toronto-dbt-docs.zip into a directory.
+          2. Open a terminal in that extracted directory.
+          3. Run: python3 -m http.server 8000
+          4. Open http://localhost:8000/ in your browser.
+          EOF
+          python - <<'PYZIP'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          source = Path("data-assets/dbt-docs")
+          archive = Path("data-assets/toronto-dbt-docs.zip")
+          files = sorted(path for path in source.rglob("*") if path.is_file())
+          if not any(path.name == "index.html" for path in files):
+              raise SystemExit("Documentation site is missing index.html")
+          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+              for path in files:
+                  zipped.write(path, path.relative_to(source).as_posix())
+          with ZipFile(archive) as zipped:
+              names = zipped.namelist()
+              if "index.html" not in names or "README.txt" not in names:
+                  raise SystemExit("Documentation archive is missing required root files")
+              if zipped.testzip() is not None:
+                  raise SystemExit("Documentation archive failed its integrity check")
+              print(f"Validated {len(names)} documentation archive files")
+          PYZIP
+          test -s data-assets/toronto-dbt-docs.zip
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dbt/docs-site
+
+      - name: Upload dbt logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dbt-main-logs-${{ github.run_id }}
+          path: dbt/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload Parquet assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-parquet-${{ github.run_id }}
+          path: data/raw/**/*.parquet
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload DuckDB asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-duckdb-${{ github.run_id }}
+          path: data/warehouse/toronto.duckdb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Stage clearly named Parquet files
+        run: |
+          set -euo pipefail
+          test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
+          active="$(find data/raw/active_permits -type f -name 'data.parquet' -print -quit)"
+          cleared="$(find data/raw/cleared_permits -type f -name 'data.parquet' -print -quit)"
+          test -n "$active"
+          test -n "$cleared"
+          mkdir -p data-assets
+          cp "$active" data-assets/toronto-active-permits.parquet
+          cp "$cleared" data-assets/toronto-cleared-permits.parquet
+          test -s data-assets/toronto-active-permits.parquet
+          test -s data-assets/toronto-cleared-permits.parquet
+          ls -lh data-assets/*.parquet
+
+      - name: Publish durable data assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(
+            data-assets/toronto-active-permits.parquet
+            data-assets/toronto-cleared-permits.parquet
+            data/warehouse/toronto.duckdb
+            data-assets/toronto-dbt-docs.zip
+          )
+          release_notes="$(cat <<'EOF'
+          Rolling data publication, not a semantic-version release.
+
+          Assets:
+          - toronto-active-permits.parquet: full-source snapshot for Active Permits.
+          - toronto-cleared-permits.parquet: full-source snapshot for Cleared Permits.
+          - toronto.duckdb: source warehouse tables plus dbt staging views and mart tables.
+          - toronto-dbt-docs.zip: complete static dbt documentation site, including assets and generated index files, plus viewing instructions. Extract it and run `python3 -m http.server 8000` in the extracted directory, then open http://localhost:8000/.
+          EOF
+          )"
+          if gh release view warehouse-latest >/dev/null 2>&1; then
+            gh release upload warehouse-latest "${assets[@]}" --clobber
+            gh release edit warehouse-latest \
+              --title "Latest Toronto Housing Data Assets" \
+              --notes "$release_notes" \
+              --latest=false
+          else
+            gh release create warehouse-latest "${assets[@]}" \
+              --title "Latest Toronto Housing Data Assets" \
+              --notes "$release_notes" \
+              --latest=false
+          fi
+  deploy-dbt-docs:
+    name: Deploy dbt documentation to GitHub Pages
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_branch == 'main'
+    needs: data-assets
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy dbt documentation
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
