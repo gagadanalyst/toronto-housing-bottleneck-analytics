@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
@@ -236,6 +237,8 @@ class TorontoCKANClient:
         offset = 0
         page_number = 0
         declared_total: int | None = None
+        max_snapshot_restarts = 2
+        snapshot_restarts = 0
 
         if checkpoint:
             offset = int(checkpoint.get("next_offset", 0))
@@ -308,10 +311,39 @@ class TorontoCKANClient:
             if declared_total is None:
                 declared_total = page_total
             elif page_total != declared_total:
-                raise RuntimeError(
-                    f"{source_name}: DataStore total changed during extraction "
-                    f"({declared_total} -> {page_total})."
+                if snapshot_restarts >= max_snapshot_restarts:
+                    output_path.unlink(missing_ok=True)
+                    shutil.rmtree(checkpoint_dir, ignore_errors=True)
+                    raise RuntimeError(
+                        f"{source_name}: DataStore total kept changing during "
+                        f"extraction after {snapshot_restarts} full restart(s): "
+                        f"{declared_total} -> {page_total}."
+                    )
+
+                snapshot_restarts += 1
+                retry_delay_seconds = 5 * snapshot_restarts
+                utils.log_event(
+                    logging.WARNING,
+                    "datastore_total_changed_restart",
+                    source_name=source_name,
+                    resource_id=resource_id,
+                    previous_total=declared_total,
+                    current_total=page_total,
+                    attempt=snapshot_restarts,
+                    max_restarts=max_snapshot_restarts,
+                    retry_delay_seconds=retry_delay_seconds,
+                    recovery="restart_from_offset_zero",
                 )
+
+                output_path.unlink(missing_ok=True)
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                parts = []
+                offset = 0
+                page_number = 0
+                declared_total = None
+                time.sleep(retry_delay_seconds)
+                continue
 
             if not records and offset < page_total:
                 raise RuntimeError(

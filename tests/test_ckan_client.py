@@ -172,6 +172,89 @@ def test_fetch_datastore_paginates_with_sort_and_keeps_all_rows(
     assert pq.read_table(output).column("id").to_pylist() == [1, 2, 3]
 
 
+def test_fetch_datastore_restarts_from_zero_when_total_changes(
+    monkeypatch, tmp_path
+) -> None:
+    pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    calls = []
+    delays = []
+
+    def fake_action(action_name, **params):
+        calls.append(params.copy())
+        if len(calls) == 1:
+            return {"records": [{"id": 1}, {"id": 2}], "total": 4}
+        if len(calls) == 2:
+            return {"records": [{"id": 3}], "total": 3}
+        if params["offset"] == 0:
+            return {"records": [{"id": 1}, {"id": 2}], "total": 3}
+        return {"records": [{"id": 3}], "total": 3}
+
+    output = tmp_path / "data.parquet"
+    checkpoint_dir = tmp_path / "checkpoints"
+
+    with client() as c:
+        monkeypatch.setattr(c, "action", fake_action)
+        monkeypatch.setattr(
+            "toronto_housing_ingestion.ckan_client.time.sleep", delays.append
+        )
+        count = c.fetch_datastore(
+            resource_id="active-resource",
+            page_size=2,
+            checkpoint_dir=checkpoint_dir,
+            fingerprint={"resource_hash": "test"},
+            source_name="active_permits",
+            output_path=output,
+            pagination_sort="_id asc",
+            required_columns=("id",),
+            date_columns=(),
+        )
+
+    assert count == 3
+    assert [call["offset"] for call in calls] == [0, 2, 0, 2]
+    assert delays == [5]
+    assert pq.read_table(output).column("id").to_pylist() == [1, 2, 3]
+    assert not checkpoint_dir.exists()
+
+
+def test_fetch_datastore_fails_cleanly_when_total_keeps_changing(
+    monkeypatch, tmp_path
+) -> None:
+    pytest.importorskip("pyarrow")
+    delays = []
+
+    def fake_action(action_name, **params):
+        if params["offset"] == 0:
+            return {"records": [{"id": 1}, {"id": 2}], "total": 4}
+        return {"records": [{"id": 3}], "total": 3}
+
+    output = tmp_path / "data.parquet"
+    checkpoint_dir = tmp_path / "checkpoints"
+
+    with client() as c:
+        monkeypatch.setattr(c, "action", fake_action)
+        monkeypatch.setattr(
+            "toronto_housing_ingestion.ckan_client.time.sleep", delays.append
+        )
+        with pytest.raises(RuntimeError, match="DataStore total kept changing"):
+            c.fetch_datastore(
+                resource_id="active-resource",
+                page_size=2,
+                checkpoint_dir=checkpoint_dir,
+                fingerprint={"resource_hash": "unstable"},
+                source_name="active_permits",
+                output_path=output,
+                pagination_sort="_id asc",
+                required_columns=("id",),
+                date_columns=(),
+            )
+
+    assert delays == [5, 10]
+    assert not output.exists()
+    assert not checkpoint_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("fmt", "payload"),
     [
