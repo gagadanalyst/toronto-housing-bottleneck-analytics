@@ -1,0 +1,27 @@
+-- Run as ACCOUNTADMIN after setup.
+-- Each SHOW command returns its own result set.
+
+USE ROLE ACCOUNTADMIN;
+
+SELECT
+    CURRENT_ROLE() AS ACTIVE_ROLE,
+    CURRENT_REGION() AS CLOUD_REGION;
+
+SHOW DATABASES LIKE 'TORONTO';
+SHOW SCHEMAS IN DATABASE TORONTO;
+
+-- Both monitors should be present with the expected quotas and triggers.
+-- LEVEL should be ACCOUNT for the account monitor and WAREHOUSE
+-- for the monitor assigned to TORONTO_XS_WH.
+SHOW RESOURCE MONITORS;
+
+-- Inspect STATE, SIZE, AUTO_SUSPEND, AUTO_RESUME and RESOURCE_MONITOR.
+SHOW WAREHOUSES LIKE 'TORONTO_XS_WH';
+DESCRIBE WAREHOUSE TORONTO_XS_WH;
+
+SHOW GRANTS TO ROLE TORONTO_INGEST_ROLE;
+SHOW GRANTS TO ROLE TORONTO_DBT_ROLE;
+
+-- If TORONTO_XS_WH reports STARTED, run:
+-- ALTER WAREHOUSE TORONTO_XS_WH SUSPEND;
+-- Then verify its state again.
