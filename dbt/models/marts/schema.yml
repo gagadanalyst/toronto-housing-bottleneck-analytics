@@ -291,10 +291,10 @@ models:
         data_type: BIGINT
         description: Number of revisions with both dates available for the measure.
       - name: negative_interval_count
-        data_type: HUGEINT
+        data_type: BIGINT
         description: Number of eligible revisions with a negative raw duration.
       - name: publishable_duration_count
-        data_type: HUGEINT
+        data_type: BIGINT
         description: Number of eligible revisions with a non-negative duration.
       - name: negative_interval_rate_pct
         data_type: DOUBLE

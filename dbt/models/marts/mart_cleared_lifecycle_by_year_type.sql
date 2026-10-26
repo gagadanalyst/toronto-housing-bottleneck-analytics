@@ -40,10 +40,14 @@ summary AS (
         permit_type,
         measure,
         COUNT(duration_days) AS eligible_date_pairs,
-        SUM(CASE WHEN duration_days < 0 THEN 1 ELSE 0 END)
-            AS negative_interval_count,
-        SUM(CASE WHEN duration_days >= 0 THEN 1 ELSE 0 END)
-            AS publishable_duration_count,
+        CAST(
+            SUM(CASE WHEN duration_days < 0 THEN 1 ELSE 0 END)
+            AS BIGINT
+        ) AS negative_interval_count,
+        CAST(
+            SUM(CASE WHEN duration_days >= 0 THEN 1 ELSE 0 END)
+            AS BIGINT
+        ) AS publishable_duration_count,
         MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
             AS median_days,
         CAST(
