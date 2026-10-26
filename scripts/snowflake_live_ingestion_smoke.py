@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import dlt
+
 from toronto_housing_ingestion.config import load_config
 
 
@@ -51,6 +52,139 @@ def _run_cli(*arguments: str) -> None:
     command = [sys.executable, "-m", "toronto_housing_ingestion.ingestion", *arguments]
     print("\n$ " + " ".join(command), flush=True)
     subprocess.run(command, check=True)
+
+
+def _quote_identifier(value: str) -> str:
+    """Quote a Snowflake identifier after checking its shape."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Unsafe Snowflake identifier: {value!r}")
+    return f'"{value}"'
+
+
+def _columns(client, schema: str, table: str) -> list[str]:
+    """Read the ordered column list for one table in TORONTO."""
+    schema = schema.upper()
+    table = table.upper()
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", schema) or not re.fullmatch(
+        r"[A-Z_][A-Z0-9_]*", table
+    ):
+        raise ValueError("Unsafe schema or table name for hash compatibility check.")
+    rows = client.execute_sql(
+        "SELECT COLUMN_NAME FROM TORONTO.INFORMATION_SCHEMA.COLUMNS "
+        f"WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}' "
+        "ORDER BY ORDINAL_POSITION"
+    )
+    return [str(row[0]) for row in rows]
+
+
+def _verify_fresh_hash_compatibility(
+    pipeline: dlt.Pipeline, dataset: str, source
+) -> None:
+    """Compare fresh hashes with migrated hashes for rows with identical data.
+
+    The live smoke test already performs a full current CKAN extraction. This
+    read-only comparison reuses that load and checks only rows whose tracked
+    source attributes are identical in the fresh table and migrated TORONTO.RAW.
+    Changed business values are intentionally excluded because their new hash is
+    expected to differ. No production table is written.
+    """
+    table = source.warehouse_table.upper()
+    dataset = dataset.upper()
+    with pipeline.sql_client() as client:
+        fresh_columns = _columns(client, dataset, table)
+        migrated_columns = _columns(client, "RAW", table)
+        fresh_map = {column.lower(): column for column in fresh_columns}
+        migrated_map = {column.lower(): column for column in migrated_columns}
+
+        required = {"row_hash", "_dlt_valid_to", *[key.lower() for key in source.primary_key]}
+        for label, column_map in (("fresh", fresh_map), ("migrated", migrated_map)):
+            missing = sorted(required - set(column_map))
+            if missing:
+                raise AssertionError(
+                    f"{source.name}: {label} table is missing columns required for "
+                    f"hash compatibility validation: {missing}"
+                )
+
+        def tracked_columns(column_map: dict[str, str]) -> dict[str, str]:
+            return {
+                lower: actual
+                for lower, actual in column_map.items()
+                if lower not in {"_id", "row_hash"}
+                and not lower.startswith("_dlt_")
+            }
+
+        fresh_tracked = tracked_columns(fresh_map)
+        migrated_tracked = tracked_columns(migrated_map)
+        fresh_only = sorted(set(fresh_tracked) - set(migrated_tracked))
+        migrated_only = sorted(set(migrated_tracked) - set(fresh_tracked))
+        if fresh_only or migrated_only:
+            raise AssertionError(
+                f"{source.name}: cannot establish hash compatibility because source "
+                "hash-input schemas differ between the fresh snapshot and migrated RAW. "
+                f"Fresh-only columns={fresh_only}; migrated-only columns={migrated_only}. "
+                "Review source schema drift before cutover."
+            )
+
+        key_columns = [key.lower() for key in source.primary_key]
+        key_join = " AND ".join(
+            f"fresh.{_quote_identifier(fresh_map[key])} = "
+            f"migrated.{_quote_identifier(migrated_map[key])}"
+            for key in key_columns
+        )
+        non_null_keys = " AND ".join(
+            f"fresh.{_quote_identifier(fresh_map[key])} IS NOT NULL AND "
+            f"migrated.{_quote_identifier(migrated_map[key])} IS NOT NULL"
+            for key in key_columns
+        )
+        same_data = " AND ".join(
+            f"fresh.{_quote_identifier(fresh_tracked[column])} IS NOT DISTINCT FROM "
+            f"migrated.{_quote_identifier(migrated_tracked[column])}"
+            for column in sorted(fresh_tracked)
+        )
+        fresh_hash = f"fresh.{_quote_identifier(fresh_map['row_hash'])}"
+        migrated_hash = f"migrated.{_quote_identifier(migrated_map['row_hash'])}"
+        fresh_valid_to = f"fresh.{_quote_identifier(fresh_map['_dlt_valid_to'])}"
+        migrated_valid_to = f"migrated.{_quote_identifier(migrated_map['_dlt_valid_to'])}"
+        join_and_filter = (
+            f"FROM TORONTO.{dataset}.{table} AS fresh "
+            f"JOIN TORONTO.RAW.{table} AS migrated ON {key_join} "
+            f"WHERE {fresh_valid_to} IS NULL AND {migrated_valid_to} IS NULL "
+            f"AND ({non_null_keys}) AND ({same_data})"
+        )
+        result = client.execute_sql(
+            f"SELECT COUNT(*), COUNT_IF({fresh_hash} IS DISTINCT FROM {migrated_hash}) "
+            f"{join_and_filter}"
+        )[0]
+        identical_rows = int(result[0] or 0)
+        mismatched_hashes = int(result[1] or 0)
+
+        if identical_rows == 0:
+            raise AssertionError(
+                f"{source.name}: no current rows had identical tracked attributes in the "
+                "fresh snapshot and migrated RAW, so hash compatibility could not be tested."
+            )
+        if mismatched_hashes:
+            key_projection = ", ".join(
+                f"fresh.{_quote_identifier(fresh_map[key])}" for key in key_columns
+            )
+            examples = client.execute_sql(
+                f"SELECT {key_projection}, {fresh_hash}, {migrated_hash} "
+                f"{join_and_filter} AND ({fresh_hash} IS DISTINCT FROM {migrated_hash}) "
+                "LIMIT 5"
+            )
+            raise AssertionError(
+                f"{source.name}: fresh-snapshot row hashes differ from migrated hashes for "
+                f"{mismatched_hashes:,} of {identical_rows:,} current rows whose tracked "
+                f"attributes are identical. Example (business key, fresh hash, migrated hash): "
+                f"{examples!r}. This indicates a hash-input/type-normalization incompatibility."
+            )
+
+        print(
+            f"PASS fresh-snapshot hash compatibility {source.name}: "
+            f"{identical_rows:,} current rows with identical tracked attributes; "
+            "zero hash mismatches against TORONTO.RAW.",
+            flush=True,
+        )
 
 
 def main() -> None:
@@ -99,6 +233,7 @@ def main() -> None:
                 f"expired={counts[2]:,}",
                 flush=True,
             )
+            _verify_fresh_hash_compatibility(probe, dataset, source)
 
         # Two loads of the identical Parquet snapshots: local-load reuses the
         # most recent successful extraction and does not make another CKAN call.
