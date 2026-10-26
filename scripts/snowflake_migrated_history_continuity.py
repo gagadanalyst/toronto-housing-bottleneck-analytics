@@ -2,7 +2,7 @@
 
 The workflow clones TORONTO.RAW into a uniquely named, temporary schema,
 performs a live Active/Cleared extract and dlt load into that clone, then replays
-the exact extracted snapshots twice. TORONTO.RAW is source-only and is never a
+the exact extracted snapshots once. TORONTO.RAW is source-only and is never a
 write destination during the test.
 """
 
@@ -326,7 +326,12 @@ def main() -> None:
 
         # Same pipeline names as the migrated state; only the dataset target is
         # redirected to the isolated clone. This is the continuity check.
+        # Close the control connection during the long extraction/load subprocess
+        # so it does not hold an idle Snowflake session for the whole extraction.
+        conn.close()
+        conn = None
         _run_cli("--full-refresh", *source_args)
+        conn = _connect(credentials)
 
         after_live: dict[str, tuple[int, int, int]] = {}
         for name, table in zip(SOURCE_NAMES, SCD2_TABLES, strict=True):
@@ -368,31 +373,39 @@ def main() -> None:
             )
         print(f"METADATA AFTER CONTINUATION: {metadata_after}")
 
-        # Reuse exactly the extracted Parquet snapshots and assert no new SCD2
-        # versions across two consecutive loads.
+        # The separate Snowflake Live Ingestion Smoke workflow already verifies
+        # two identical replays on a clean target. For migrated-history
+        # continuity, one replay is sufficient to prove this target stays stable
+        # after the live continuation load.
         baseline = dict(after_live)
-        for replay in (1, 2):
-            _run_cli("--local-load", *source_args)
-            for name, table in zip(SOURCE_NAMES, SCD2_TABLES, strict=True):
-                current = _counts(conn, dataset, table)
-                if current != baseline[table]:
-                    raise AssertionError(
-                        f"{table}: replay {replay} changed counts. "
-                        f"Baseline={baseline[table]}, after={current}."
-                    )
-                print(
-                    f"PASS {name} replay {replay}: total={current[0]:,}, "
-                    f"current={current[1]:,}, expired={current[2]:,}; no extra versions."
+        conn.close()
+        conn = None
+        _run_cli("--local-load", *source_args)
+        conn = _connect(credentials)
+        for name, table in zip(SOURCE_NAMES, SCD2_TABLES, strict=True):
+            current = _counts(conn, dataset, table)
+            if current != baseline[table]:
+                raise AssertionError(
+                    f"{table}: identical replay changed counts. "
+                    f"Baseline={baseline[table]}, after={current}."
                 )
+            print(
+                f"PASS {name} identical replay: total={current[0]:,}, "
+                f"current={current[1]:,}, expired={current[2]:,}; no extra versions."
+            )
 
         print(
             "SNOWFLAKE MIGRATED-HISTORY CONTINUITY PASSED: cloned migrated "
             "history accepted a live extraction, preserved prior versions, "
-            "and stayed stable across two identical replays."
+            "and stayed stable across one identical replay."
         )
     finally:
         if schema_created:
             try:
+                # If the CLI subprocess failed while the control connection was
+                # closed, reconnect only for best-effort cleanup.
+                if conn is None:
+                    conn = _connect(credentials)
                 cursor = conn.cursor()
                 try:
                     cursor.execute(f"DROP SCHEMA IF EXISTS {DATABASE}.{dataset} CASCADE")
@@ -405,7 +418,8 @@ def main() -> None:
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":
