@@ -48,8 +48,10 @@ summary AS (
             SUM(CASE WHEN duration_days >= 0 THEN 1 ELSE 0 END)
             AS BIGINT
         ) AS publishable_duration_count,
-        MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
-            AS median_days,
+        CAST(
+            MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
+            AS DOUBLE
+        ) AS median_days,
         CAST(
             ROUND(
                 PERCENTILE_CONT(0.90) WITHIN GROUP (
@@ -68,9 +70,11 @@ summary AS (
 
 SELECT
     *,
-    ROUND(
-        100.0 * negative_interval_count
-        / NULLIF(eligible_date_pairs, 0),
-        2
+    CAST(
+        ROUND(
+            100.0 * negative_interval_count
+            / NULLIF(eligible_date_pairs, 0),
+            2
+        ) AS DOUBLE
     ) AS negative_interval_rate_pct
 FROM summary
