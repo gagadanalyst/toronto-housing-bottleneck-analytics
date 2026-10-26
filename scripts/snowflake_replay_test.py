@@ -69,7 +69,7 @@ def _export_current_snapshot(
         arrow_table = connection.execute(
             f'SELECT {projection} FROM "raw".{_quoted_identifier(table)} '
             f'WHERE {_quoted_identifier(valid_to)} IS NULL'
-        ).fetch_arrow_table()
+        ).to_arrow_table()
 
     if arrow_table.num_rows == 0:
         raise RuntimeError(f"raw.{table} has no current rows to replay.")
