@@ -1,0 +1,101 @@
+name: Snowflake dbt Validation
+
+on:
+  push:
+    branches:
+      - feat/snowflake-ingestion-smoke
+    paths:
+      - "dbt/**"
+      - ".github/workflows/snowflake-dbt.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-snowflake-dbt
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Parse, build and test dbt on Snowflake
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install pinned dbt dependencies
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -r dbt/requirements.txt
+
+      - name: Prepare temporary Snowflake key and connection settings
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          from urllib.parse import parse_qs, unquote, urlsplit
+
+          uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
+          if not uri:
+              raise SystemExit("Missing secret SNOWFLAKE_DLT_CONNECTION")
+
+          parts = urlsplit(uri)
+          params = parse_qs(parts.query)
+          if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
+              raise SystemExit("Snowflake connection URI is invalid.")
+          if "private_key" not in params:
+              raise SystemExit("Connection URI has no private_key parameter.")
+
+          key_path = Path(os.environ["RUNNER_TEMP"]) / "snowflake_key.p8"
+          key_path.write_bytes(base64.b64decode(params["private_key"][0]))
+          key_path.chmod(0o600)
+
+          values = {
+              "SNOWFLAKE_ACCOUNT": parts.hostname,
+              "SNOWFLAKE_USER": unquote(parts.username),
+              "SNOWFLAKE_PRIVATE_KEY_PATH": str(key_path),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+          PY
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt packages
+        working-directory: dbt
+        run: dbt deps --profiles-dir .
+
+      - name: Verify connection
+        working-directory: dbt
+        run: dbt debug --profiles-dir . --target snowflake
+
+      - name: Parse project
+        working-directory: dbt
+        run: dbt parse --profiles-dir . --target snowflake
+
+      - name: Build models and run tests
+        working-directory: dbt
+        run: |
+          dbt build \
+            --profiles-dir . \
+            --target snowflake \
+            --vars '{"as_of_date": "2026-10-23"}'
+
+      - name: Generate dbt documentation
+        working-directory: dbt
+        run: dbt docs generate --profiles-dir . --target snowflake
