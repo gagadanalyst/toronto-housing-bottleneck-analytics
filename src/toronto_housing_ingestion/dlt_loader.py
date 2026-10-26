@@ -102,9 +102,36 @@ def _iter_snapshot_rows(
             yield row
 
 
+_HASH_FLOAT_FIELDS = frozenset({
+    "ASSEMBLY",
+    "BUSINESS_AND_PERSONAL_SERVICES",
+    "DEMOLITION",
+    "INDUSTRIAL",
+    "INSTITUTIONAL",
+    "INTERIOR_ALTERATIONS",
+    "MERCANTILE",
+    "RESIDENTIAL",
+})
+
+
 def _row_hash(row: dict[str, Any]) -> str:
-    """Return a stable hash of source attributes, excluding the unstable _id."""
-    tracked = {key: value for key, value in row.items() if key != "_id"}
+    """Hash source attributes using legacy-compatible numeric normalization."""
+    tracked = {}
+
+    for key, value in row.items():
+        if key == "_id":
+            continue
+
+        if (
+            key.upper() in _HASH_FLOAT_FIELDS
+            and value is not None
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            value = float(value)
+
+        tracked[key] = value
+
     payload = json.dumps(
         tracked,
         sort_keys=True,
