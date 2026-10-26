@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - feat/snowflake-ingestion-smoke
+    paths:
+      - "src/toronto_housing_ingestion/**"
+      - "tests/test_config.py"
+      - "tests/test_dlt_loader.py"
+      - "scripts/snowflake_smoke_test.py"
+      - "open_data_config.yml"
   workflow_dispatch:
 
 permissions:

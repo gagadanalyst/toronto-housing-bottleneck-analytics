@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - feat/snowflake-ingestion-smoke
+    paths:
+      - "scripts/migrate_duckdb_history_to_snowflake.py"
   workflow_dispatch:
 
 permissions:

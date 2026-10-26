@@ -304,7 +304,7 @@ models:
         description: Median non-negative elapsed calendar days.
       - name: p90_days
         data_type: DOUBLE
-        description: 90th percentile of non-negative elapsed calendar days.
+        description: 90th percentile of non-negative elapsed calendar days, rounded to two decimal places.
       - name: max_days
         data_type: BIGINT
         description: Maximum non-negative elapsed calendar days.
