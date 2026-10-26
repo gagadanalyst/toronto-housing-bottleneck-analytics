@@ -3,14 +3,17 @@
 Uses 500 business keys per source from the exact DuckDB recovery artifact used for
 migration. The isolated Snowflake clone is reduced to the complete migrated history
 for those keys before loading, so dlt never treats unrelated current rows as absent.
-One non-key STATUS value is deliberately changed, then the identical snapshot is
-replayed once to prove idempotence. Live CKAN extraction completeness is covered by
-the separate, manually triggered Snowflake Live Ingestion Smoke workflow.
+One non-key STATUS value and its row_hash are deliberately changed, then the identical
+snapshot is replayed once to prove idempotence. Because the recovery artifact contains
+warehouse-typed rows rather than original source Parquet, this test preserves stored hashes
+for unchanged rows; raw-source hash canonicalization is a separate verification. Live CKAN
+extraction completeness is covered by the manually triggered Live Ingestion Smoke workflow.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -373,11 +376,16 @@ def _export_sample_and_change_one(
         by_lower = {name.lower(): name for name in columns}
         valid_to = by_lower.get("_dlt_valid_to")
         status_col = by_lower.get("status")
-        if not valid_to or not status_col:
-            raise RuntimeError(f"raw.{table} must contain _dlt_valid_to and STATUS.")
+        row_hash_col = by_lower.get("row_hash")
+        if not valid_to or not status_col or not row_hash_col:
+            raise RuntimeError(
+                f"raw.{table} must contain _dlt_valid_to, STATUS, and row_hash."
+            )
+        # This recovery artifact is the typed warehouse table, not the original
+        # source Parquet. Re-hashing typed timestamps/nulls can change their JSON
+        # representation, so carry existing hashes for unchanged rows instead.
         business_columns = [
-            name for name in columns
-            if not name.lower().startswith("_dlt_") and name.lower() != "row_hash"
+            name for name in columns if not name.lower().startswith("_dlt_")
         ]
         key_columns = [by_lower[key.lower()] for key in source.primary_key if key.lower() in by_lower]
         missing_keys = [key for key in source.primary_key if key.lower() not in by_lower]
@@ -407,12 +415,32 @@ def _export_sample_and_change_one(
         changed_status = f"{changed_status}_CHANGED"
     status_values[0] = changed_status
     field = arrow_table.schema.field(status_index)
-    arrow_table = arrow_table.set_column(status_index, field, pa.array(status_values, type=field.type))
+    arrow_table = arrow_table.set_column(
+        status_index, field, pa.array(status_values, type=field.type)
+    )
+
+    # The migration baseline already contains the hash produced from the original
+    # source snapshot. Preserve it for the unchanged keys; use a deterministic new
+    # hash for the one intentional STATUS change so the test exercises SCD2 versioning.
+    row_hash_index = arrow_table.schema.get_field_index(row_hash_col)
+    hash_values = arrow_table.column(row_hash_index).to_pylist()
+    original_hash = hash_values[0]
+    if not isinstance(original_hash, str) or not original_hash:
+        raise RuntimeError(f"raw.{table} contains an empty/non-string row_hash.")
+    hash_values[0] = hashlib.sha256(
+        f"{original_hash}|continuity-test|{changed_status}".encode()
+    ).hexdigest()
+    hash_field = arrow_table.schema.field(row_hash_index)
+    arrow_table = arrow_table.set_column(
+        row_hash_index, hash_field, pa.array(hash_values, type=hash_field.type)
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(arrow_table, output_path, compression="zstd")
     print(
-        f"SAMPLED {table}: {arrow_table.num_rows:,} current rows; changed STATUS for "
-        f"one row while preserving its primary key; included {arrow_table.num_columns} business columns."
+        f"SAMPLED {table}: {arrow_table.num_rows:,} current rows; changed STATUS and row_hash "
+        "for one key, preserving stored hashes for all unchanged keys; "
+        f"included {arrow_table.num_columns} columns."
     )
     return selected_keys
 
@@ -424,6 +452,7 @@ def _load_sample(credentials: str, dataset: str, source, path: Path) -> None:
         source=source,
         dataset_name=dataset,
         destination_kind="snowflake",
+        preserve_row_hash=True,
     )
     result.load_info.raise_on_failed_jobs()
 
@@ -649,8 +678,8 @@ def main() -> None:
         print(
             "SNOWFLAKE MIGRATED-HISTORY CONTINUITY PASSED: the isolated clone retained "
             "complete migrated histories for 500 selected keys per source; unchanged keys "
-            "created no versions, one deliberate STATUS change created exactly one version, "
-            "and an identical replay changed no per-key history."
+            "created no versions, one deliberate STATUS/hash change created exactly one "
+            "version, and an identical replay changed no per-key history."
         )
     finally:
         if schema_created:
