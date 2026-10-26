@@ -1,15 +1,9 @@
 name: Snowflake Live Ingestion Smoke
 
+# This is the full live CKAN extraction test. Run it deliberately rather than
+# repeating two large source extracts on every code change; migrated-history
+# continuity uses a bounded sample from the exact migration baseline.
 on:
-  push:
-    branches:
-      - feat/snowflake-ingestion-smoke
-    paths:
-      - "scripts/snowflake_live_ingestion_smoke.py"
-      - ".github/workflows/snowflake-live-ingestion-smoke.yml"
-      - "src/toronto_housing_ingestion/**"
-      - "open_data_config.yml"
-      - "pyproject.toml"
   workflow_dispatch:
 
 permissions:
@@ -30,6 +24,8 @@ jobs:
       TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_INGEST_SMOKE_${{ github.run_id }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
+      AWS_REGION: ca-central-1
+      AWS_EC2_METADATA_DISABLED: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

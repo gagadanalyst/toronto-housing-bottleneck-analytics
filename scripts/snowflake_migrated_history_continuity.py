@@ -1,9 +1,10 @@
-"""Verify the real dlt pipeline can continue from migrated Snowflake SCD2 history.
+"""Fast, isolated verification that dlt continues from migrated Snowflake SCD2 history.
 
-The workflow clones TORONTO.RAW into a uniquely named, temporary schema,
-performs a live Active/Cleared extract and dlt load into that clone, then replays
-the exact extracted snapshots once. TORONTO.RAW is source-only and is never a
-write destination during the test.
+Uses a 500-row sample per source from the exact DuckDB recovery artifact used for
+migration. One non-key STATUS value is deliberately changed to prove that a
+migrated current version is expired and replaced. The identical sample is then
+replayed once to prove idempotence. Live CKAN extraction completeness is covered
+by the separate, manually triggered Snowflake Live Ingestion Smoke workflow.
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ from __future__ import annotations
 import base64
 import os
 import re
-import subprocess
-import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 import snowflake.connector
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
@@ -24,7 +27,9 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_private_key,
     load_pem_private_key,
 )
+
 from toronto_housing_ingestion.config import load_config
+from toronto_housing_ingestion.dlt_loader import load_scd2
 
 DATABASE = "TORONTO"
 SOURCE_SCHEMA = "RAW"
@@ -38,10 +43,20 @@ REQUIRED_TABLES = (
 )
 SOURCE_NAMES = ("active_permits", "cleared_permits")
 PIPELINE_NAMES = {"TORONTO_ACTIVE_PERMITS_SCD2", "TORONTO_CLEARED_PERMITS_SCD2"}
+SAMPLE_ROWS = 500
+
+
+def _safe_identifier(value: str, label: str = "identifier") -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Unsafe {label}: {value!r}")
+    return value
+
+
+def _quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _safe_schema(value: str) -> str:
-    """Accept only this test's per-run destination schema convention."""
     normalized = value.upper()
     if not re.fullmatch(r"SNOWFLAKE_CONTINUITY_[A-Z0-9_]+", normalized):
         raise ValueError("Refusing to run outside SNOWFLAKE_CONTINUITY_<run-id>.")
@@ -49,20 +64,11 @@ def _safe_schema(value: str) -> str:
 
 
 def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
-    """Decode dlt-supported PEM/DER key representations to connector-ready DER.
-
-    dlt accepts plain PEM, base64-encoded PEM, and base64-encoded DER. Query
-    strings also require URL-encoding ``+`` characters; this tries a recovery
-    candidate for common URLs where ``+`` was decoded as a space.
-    """
+    """Decode dlt-supported PEM/DER key representations to connector-ready DER."""
     password = passphrase.encode("utf-8") if passphrase else None
-    candidates: list[str] = [encoded_key]
+    candidates = [encoded_key]
     if "-----BEGIN" not in encoded_key:
-        # parse_qs turns an unescaped '+' into a space. Try both a compact
-        # candidate (for line-wrapped base64) and a restored-plus candidate.
-        compact = "".join(encoded_key.split())
-        restored_plus = encoded_key.replace(" ", "+")
-        candidates.extend((restored_plus, compact))
+        candidates.extend((encoded_key.replace(" ", "+"), "".join(encoded_key.split())))
 
     attempted: set[bytes] = set()
     for candidate in candidates:
@@ -71,13 +77,10 @@ def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
             attempted.add(raw)
             for loader in (load_pem_private_key, load_der_private_key):
                 try:
-                    private_key = loader(raw, password=password)
-                    return private_key.private_bytes(
-                        Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
-                    )
+                    key = loader(raw, password=password)
+                    return key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
                 except (TypeError, ValueError):
                     pass
-
         try:
             decoded = base64.b64decode(candidate, validate=False)
         except (ValueError, base64.binascii.Error):
@@ -87,22 +90,18 @@ def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
         attempted.add(decoded)
         for loader in (load_pem_private_key, load_der_private_key):
             try:
-                private_key = loader(decoded, password=password)
-                return private_key.private_bytes(
-                    Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
-                )
+                key = loader(decoded, password=password)
+                return key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
             except (TypeError, ValueError):
                 pass
 
     raise ValueError(
-        "Unable to decode the Snowflake private_key. Supported formats are "
-        "plain PEM, base64-encoded PEM, and base64-encoded DER; verify URL "
-        "encoding of the private_key query parameter and passphrase."
+        "Unable to decode Snowflake private_key. Check the key format, URL encoding, "
+        "and private_key_passphrase."
     )
 
 
 def _connect(uri: str):
-    """Connect using the key-pair Snowflake dlt URI from GitHub Secrets."""
     parts = urlsplit(uri)
     query = parse_qs(parts.query, keep_blank_values=True)
     if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
@@ -110,15 +109,12 @@ def _connect(uri: str):
     encoded_key = query.get("private_key", [None])[0]
     if not encoded_key:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION has no private_key parameter.")
-
     database = unquote(parts.path.strip("/").split("/")[0])
     if database.upper() != DATABASE:
         raise ValueError(f"Expected database {DATABASE}; found {database!r}.")
     if not query.get("warehouse") or not query.get("role"):
         raise ValueError("Snowflake URI must specify warehouse and role.")
-
-    passphrase = query.get("private_key_passphrase", [None])[0]
-    key_der = _decode_private_key(encoded_key, passphrase)
+    key_der = _decode_private_key(encoded_key, query.get("private_key_passphrase", [None])[0])
     return snowflake.connector.connect(
         account=parts.hostname,
         user=unquote(parts.username),
@@ -164,17 +160,13 @@ def _columns(conn, schema: str, table: str) -> set[str]:
 def _state_pipeline_names(conn, schema: str) -> set[str]:
     columns = _columns(conn, schema, "_DLT_PIPELINE_STATE")
     if "PIPELINE_NAME" not in columns:
-        raise RuntimeError(
-            f"{schema}._DLT_PIPELINE_STATE has no PIPELINE_NAME column; "
-            "cannot verify migrated state."
-        )
+        raise RuntimeError(f"{schema}._DLT_PIPELINE_STATE has no PIPELINE_NAME column.")
     cursor = conn.cursor()
     try:
         return {
             str(row[0]).upper()
             for row in cursor.execute(
-                f"SELECT DISTINCT PIPELINE_NAME "
-                f"FROM {DATABASE}.{schema}._DLT_PIPELINE_STATE "
+                f"SELECT DISTINCT PIPELINE_NAME FROM {DATABASE}.{schema}._DLT_PIPELINE_STATE "
                 "WHERE PIPELINE_NAME IS NOT NULL"
             ).fetchall()
         }
@@ -189,17 +181,14 @@ def _counts(conn, schema: str, table: str) -> tuple[int, int, int]:
     try:
         row = cursor.execute(
             f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), "
-            f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) "
-            f"FROM {DATABASE}.{schema}.{table}"
+            f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) FROM {DATABASE}.{schema}.{table}"
         ).fetchone()
     finally:
         cursor.close()
-    total, current, expired = (int(value or 0) for value in row)
-    if total != current + expired:
-        raise AssertionError(
-            f"{schema}.{table}: total {total} != current {current} + expired {expired}."
-        )
-    return total, current, expired
+    result = tuple(int(value or 0) for value in row)
+    if result[0] != result[1] + result[2]:
+        raise AssertionError(f"{schema}.{table}: total/current/expired counts do not reconcile: {result}.")
+    return result  # type: ignore[return-value]
 
 
 def _row_count(conn, schema: str, table: str) -> int:
@@ -207,29 +196,94 @@ def _row_count(conn, schema: str, table: str) -> int:
         raise ValueError(f"Unexpected metadata table: {table}")
     cursor = conn.cursor()
     try:
-        return int(
-            cursor.execute(
-                f"SELECT COUNT(*) FROM {DATABASE}.{schema}.{table}"
-            ).fetchone()[0]
-        )
+        return int(cursor.execute(f"SELECT COUNT(*) FROM {DATABASE}.{schema}.{table}").fetchone()[0])
     finally:
         cursor.close()
 
 
-def _run_cli(*arguments: str) -> None:
-    command = [sys.executable, "-m", "toronto_housing_ingestion.ingestion", *arguments]
-    print("\n$ " + " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+def _duckdb_counts(db: duckdb.DuckDBPyConnection, table: str) -> tuple[int, int, int]:
+    table = _safe_identifier(table, "DuckDB table")
+    row = db.execute(
+        f'SELECT COUNT(*), COUNT(*) FILTER (WHERE "_dlt_valid_to" IS NULL), '
+        f'COUNT(*) FILTER (WHERE "_dlt_valid_to" IS NOT NULL) FROM raw.{_quoted_identifier(table)}'
+    ).fetchone()
+    return tuple(int(value or 0) for value in row)  # type: ignore[return-value]
+
+
+def _duckdb_row_count(db: duckdb.DuckDBPyConnection, table: str) -> int:
+    table = _safe_identifier(table, "DuckDB metadata table")
+    return int(db.execute(f'SELECT COUNT(*) FROM raw.{_quoted_identifier(table)}').fetchone()[0])
+
+
+def _export_sample_and_change_one(
+    *, source_db: Path, source, output_path: Path, sample_rows: int = SAMPLE_ROWS
+) -> int:
+    """Export a bounded current-row sample and change one non-key STATUS value."""
+    table = _safe_identifier(source.warehouse_table, "source warehouse table")
+    with duckdb.connect(str(source_db), read_only=True) as db:
+        described = db.execute(f'DESCRIBE SELECT * FROM raw.{_quoted_identifier(table)}').fetchall()
+        columns = [str(row[0]) for row in described]
+        by_lower = {name.lower(): name for name in columns}
+        valid_to = by_lower.get("_dlt_valid_to")
+        status_col = by_lower.get("status")
+        if not valid_to or not status_col:
+            raise RuntimeError(f"raw.{table} must contain _dlt_valid_to and STATUS.")
+        business_columns = [
+            name for name in columns
+            if not name.lower().startswith("_dlt_") and name.lower() != "row_hash"
+        ]
+        missing_keys = [key for key in source.primary_key if key.lower() not in by_lower]
+        if missing_keys:
+            raise RuntimeError(f"raw.{table} is missing configured primary-key columns: {missing_keys}")
+        projection = ", ".join(_quoted_identifier(name) for name in business_columns)
+        order_by = ", ".join(_quoted_identifier(by_lower[key.lower()]) for key in source.primary_key)
+        arrow_table = db.execute(
+            f"SELECT {projection} FROM raw.{_quoted_identifier(table)} "
+            f"WHERE {_quoted_identifier(valid_to)} IS NULL ORDER BY {order_by} LIMIT {int(sample_rows)}"
+        ).to_arrow_table()
+
+    if arrow_table.num_rows < 1:
+        raise RuntimeError(f"raw.{table} has no current rows to sample.")
+    status_index = arrow_table.schema.get_field_index(status_col)
+    status_values = arrow_table.column(status_index).to_pylist()
+    original_status = status_values[0]
+    status_values[0] = f"{original_status or 'UNKNOWN'}__CONTINUITY_TEST__"
+    field = arrow_table.schema.field(status_index)
+    arrow_table = arrow_table.set_column(status_index, field, pa.array(status_values, type=field.type))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(arrow_table, output_path, compression="zstd")
+    print(
+        f"SAMPLED {table}: {arrow_table.num_rows:,} current rows; changed STATUS for "
+        f"one row while preserving its primary key; included {arrow_table.num_columns} business columns."
+    )
+    return int(arrow_table.num_rows)
+
+
+def _load_sample(credentials: str, dataset: str, source, path: Path) -> None:
+    result = load_scd2(
+        credentials=credentials,
+        snapshot_path=path,
+        source=source,
+        dataset_name=dataset,
+        destination_kind="snowflake",
+    )
+    result.load_info.raise_on_failed_jobs()
 
 
 def main() -> None:
-    """Clone migrated history, load live snapshots, and check idempotent replay."""
     credentials = os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS", "")
     if os.environ.get("TORONTO_WAREHOUSE_KIND", "").lower() != "snowflake":
         raise SystemExit("Set TORONTO_WAREHOUSE_KIND=snowflake for this test.")
     if not credentials:
         raise SystemExit("TORONTO_WAREHOUSE_CREDENTIALS is not configured.")
     dataset = _safe_schema(os.environ.get("TORONTO_WAREHOUSE_DATASET", ""))
+    source_db = Path(os.environ.get("SOURCE_DB", "data/recovery/warehouse-2026-10-23/toronto.duckdb"))
+    if not source_db.is_file():
+        raise SystemExit(f"Recovery DuckDB database not found: {source_db}")
+
+    app = load_config(Path("open_data_config.yml"))
+    sources = {source.name: source for source in app.sources}
+    source_map = {name: sources[name] for name in SOURCE_NAMES}
 
     conn = _connect(credentials)
     schema_created = False
@@ -241,169 +295,118 @@ def main() -> None:
             ).fetchone()
             print(f"Connected as {role} to {database}.{current_schema}.")
             if database.upper() != DATABASE or role.upper() != "TORONTO_INGEST_ROLE":
-                raise RuntimeError(
-                    "Unexpected Snowflake database or role; stopping before cloning."
-                )
+                raise RuntimeError("Unexpected Snowflake database or role; stopping before cloning.")
         finally:
             cursor.close()
 
         available = _table_inventory(conn, SOURCE_SCHEMA)
         missing = set(REQUIRED_TABLES) - available
         if missing:
-            raise RuntimeError(
-                f"TORONTO.RAW is missing migrated tables: {sorted(missing)}. "
-                "Run the Snowflake History Migration workflow first."
-            )
-
-        prior = {table: _counts(conn, SOURCE_SCHEMA, table) for table in SCD2_TABLES}
-        metadata_prior = {
-            table: _row_count(conn, SOURCE_SCHEMA, table)
-            for table in REQUIRED_TABLES
-            if table.startswith("_DLT_")
-        }
+            raise RuntimeError(f"TORONTO.RAW is missing migrated tables: {sorted(missing)}.")
+        prior = {source_map[name].warehouse_table.upper(): _counts(conn, SOURCE_SCHEMA, source_map[name].warehouse_table.upper()) for name in SOURCE_NAMES}
+        metadata_prior = {table: _row_count(conn, SOURCE_SCHEMA, table) for table in REQUIRED_TABLES if table.startswith("_DLT_")}
         state_names = _state_pipeline_names(conn, SOURCE_SCHEMA)
-        missing_states = PIPELINE_NAMES - state_names
-        if missing_states:
-            raise RuntimeError(
-                "TORONTO.RAW is missing migrated dlt pipeline state for: "
-                f"{sorted(missing_states)}."
-            )
-        if any(values[0] == 0 or values[1] == 0 for values in prior.values()):
-            raise RuntimeError(f"TORONTO.RAW SCD2 source tables look empty: {prior}")
-        if metadata_prior.get("_DLT_PIPELINE_STATE", 0) == 0:
-            raise RuntimeError("TORONTO.RAW has no migrated _DLT_PIPELINE_STATE rows.")
-        for table, values in prior.items():
-            print(
-                f"MIGRATED BASELINE {table}: total={values[0]:,}, "
-                f"current={values[1]:,}, expired={values[2]:,}"
-            )
-        print(f"MIGRATED METADATA ROWS: {metadata_prior}")
-        print(f"MIGRATED PIPELINE STATES: {sorted(state_names)}")
+        if not PIPELINE_NAMES.issubset(state_names):
+            raise RuntimeError(f"Missing migrated pipeline state: {sorted(PIPELINE_NAMES - state_names)}")
 
-        # Each run starts from a fresh clone. The allowlist above ensures this
-        # cleanup can never target TORONTO.RAW or any unrelated schema.
+        # Verify the supplied recovery DB is exactly the baseline that was migrated.
+        with duckdb.connect(str(source_db), read_only=True) as db:
+            for name in SOURCE_NAMES:
+                table = source_map[name].warehouse_table
+                expected = _duckdb_counts(db, table)
+                if expected != prior[table.upper()]:
+                    raise AssertionError(
+                        f"Recovery baseline mismatch for {table}: DuckDB={expected}; Snowflake={prior[table.upper()]}"
+                    )
+            for table, count in metadata_prior.items():
+                if _duckdb_row_count(db, table.lower()) != count:
+                    raise AssertionError(f"Recovery metadata count mismatch for {table}.")
+
+        print(f"MIGRATED BASELINE: {prior}")
+        print(f"MIGRATED METADATA ROWS: {metadata_prior}")
+
         cursor = conn.cursor()
         try:
             cursor.execute(f"DROP SCHEMA IF EXISTS {DATABASE}.{dataset} CASCADE")
-            cursor.execute(
-                f"CREATE SCHEMA {DATABASE}.{dataset} CLONE {DATABASE}.{SOURCE_SCHEMA}"
-            )
+            cursor.execute(f"CREATE SCHEMA {DATABASE}.{dataset} CLONE {DATABASE}.{SOURCE_SCHEMA}")
             schema_created = True
         finally:
             cursor.close()
         print(f"CLONED {DATABASE}.{SOURCE_SCHEMA} to isolated {DATABASE}.{dataset}.")
 
         cloned_states = _state_pipeline_names(conn, dataset)
-        missing_cloned = PIPELINE_NAMES - cloned_states
-        if missing_cloned:
-            raise RuntimeError(
-                f"Clone is missing pipeline state: {sorted(missing_cloned)}."
-            )
-
-        # Verify the clone is identical to the migrated baseline before letting
-        # the application write to it. This prevents a bad clone from being
-        # masked by newly ingested rows.
+        if not PIPELINE_NAMES.issubset(cloned_states):
+            raise RuntimeError(f"Clone is missing pipeline state: {sorted(PIPELINE_NAMES - cloned_states)}")
         for table, expected in prior.items():
             actual = _counts(conn, dataset, table)
             if actual != expected:
-                raise AssertionError(
-                    f"Cloned {table} does not match TORONTO.RAW. "
-                    f"Expected={expected}; cloned={actual}."
-                )
-        cloned_metadata = {
-            table: _row_count(conn, dataset, table) for table in metadata_prior
-        }
+                raise AssertionError(f"Clone mismatch for {table}: expected={expected}; actual={actual}")
+        cloned_metadata = {table: _row_count(conn, dataset, table) for table in metadata_prior}
         if cloned_metadata != metadata_prior:
-            raise AssertionError(
-                "Cloned dlt metadata row counts do not match TORONTO.RAW. "
-                f"Expected={metadata_prior}; cloned={cloned_metadata}."
-            )
-        print(f"CLONE VERIFIED: SCD2 counts={prior}; metadata rows={cloned_metadata}")
+            raise AssertionError(f"Cloned metadata mismatch: expected={metadata_prior}; actual={cloned_metadata}")
+        print(f"CLONE VERIFIED: SCD2 counts={prior}; metadata={cloned_metadata}")
 
-        app = load_config(Path("open_data_config.yml"))
-        sources = {source.name: source for source in app.sources}
-        source_args = tuple(arg for name in SOURCE_NAMES for arg in ("--source", name))
+        with TemporaryDirectory(prefix="snowflake-continuity-sample-") as temp_dir:
+            temp = Path(temp_dir)
+            snapshots: dict[str, Path] = {}
+            for name in SOURCE_NAMES:
+                source = source_map[name]
+                snapshot = temp / f"{name}.parquet"
+                _export_sample_and_change_one(source_db=source_db, source=source, output_path=snapshot)
+                snapshots[name] = snapshot
 
-        # Same pipeline names as the migrated state; only the dataset target is
-        # redirected to the isolated clone. This is the continuity check.
-        # Close the control connection during the long extraction/load subprocess
-        # so it does not hold an idle Snowflake session for the whole extraction.
-        conn.close()
-        conn = None
-        _run_cli("--full-refresh", *source_args)
-        conn = _connect(credentials)
+            # Release the direct SQL session while dlt opens its own destination session(s).
+            conn.close()
+            conn = None
+            for name in SOURCE_NAMES:
+                _load_sample(credentials, dataset, source_map[name], snapshots[name])
 
-        after_live: dict[str, tuple[int, int, int]] = {}
-        for name, table in zip(SOURCE_NAMES, SCD2_TABLES, strict=True):
-            after = _counts(conn, dataset, table)
-            before = prior[table]
-            if after[0] < before[0] or after[2] < before[2]:
-                raise AssertionError(
-                    f"{table}: migrated history was lost. Before={before}; after live load={after}."
-                )
-            # If existing row hashes/state were not restored, nearly all current
-            # rows could be re-versioned. This threshold catches that failure.
-            max_growth = max(10_000, int(before[1] * 0.10))
-            if after[0] - before[0] > max_growth:
-                raise AssertionError(
-                    f"{table}: history grew by {after[0] - before[0]:,} rows, above "
-                    f"the safety threshold of {max_growth:,}; likely state/hash mismatch."
-                )
-            if after[1] == 0:
-                raise AssertionError(f"{table}: there are no current rows after continuation.")
-            after_live[table] = after
-            print(
-                f"PASS migrated-state continuation {name}: before={before}; "
-                f"after live load={after}; history added={after[0] - before[0]:,}"
-            )
+            conn = _connect(credentials)
+            after_load: dict[str, tuple[int, int, int]] = {}
+            for name in SOURCE_NAMES:
+                table = source_map[name].warehouse_table.upper()
+                before = prior[table]
+                expected_after = (before[0] + 1, before[1], before[2] + 1)
+                actual = _counts(conn, dataset, table)
+                if actual != expected_after:
+                    raise AssertionError(
+                        f"{table}: expected exactly one migrated version change. "
+                        f"Before={before}; expected after={expected_after}; actual={actual}. "
+                        "Extra versions may indicate row-hash or type incompatibility."
+                    )
+                after_load[table] = actual
+                print(f"PASS migrated-history change detection {name}: before={before}; after={actual}")
 
-        metadata_after = {
-            table: _row_count(conn, dataset, table) for table in metadata_prior
-        }
-        for table, count in metadata_prior.items():
-            if metadata_after.get(table, 0) < count:
-                raise AssertionError(
-                    f"{table}: metadata row count decreased from {count} to "
-                    f"{metadata_after.get(table, 0)}."
-                )
-        state_names_after = _state_pipeline_names(conn, dataset)
-        if not PIPELINE_NAMES.issubset(state_names_after):
-            raise AssertionError(
-                f"Pipeline state records missing after continuation: {sorted(PIPELINE_NAMES - state_names_after)}."
-            )
-        print(f"METADATA AFTER CONTINUATION: {metadata_after}")
+            metadata_after = {table: _row_count(conn, dataset, table) for table in metadata_prior}
+            for table, count in metadata_prior.items():
+                if metadata_after[table] < count:
+                    raise AssertionError(f"{table}: metadata count decreased from {count} to {metadata_after[table]}.")
+            state_names_after = _state_pipeline_names(conn, dataset)
+            if not PIPELINE_NAMES.issubset(state_names_after):
+                raise AssertionError(f"Pipeline state records missing after load: {sorted(PIPELINE_NAMES - state_names_after)}")
+            print(f"METADATA AFTER LOAD: {metadata_after}")
 
-        # The separate Snowflake Live Ingestion Smoke workflow already verifies
-        # two identical replays on a clean target. For migrated-history
-        # continuity, one replay is sufficient to prove this target stays stable
-        # after the live continuation load.
-        baseline = dict(after_live)
-        conn.close()
-        conn = None
-        _run_cli("--local-load", *source_args)
-        conn = _connect(credentials)
-        for name, table in zip(SOURCE_NAMES, SCD2_TABLES, strict=True):
-            current = _counts(conn, dataset, table)
-            if current != baseline[table]:
-                raise AssertionError(
-                    f"{table}: identical replay changed counts. "
-                    f"Baseline={baseline[table]}, after={current}."
-                )
-            print(
-                f"PASS {name} identical replay: total={current[0]:,}, "
-                f"current={current[1]:,}, expired={current[2]:,}; no extra versions."
-            )
+            conn.close()
+            conn = None
+            # One identical replay is sufficient here; the standalone live smoke checks two replays.
+            for name in SOURCE_NAMES:
+                _load_sample(credentials, dataset, source_map[name], snapshots[name])
+            conn = _connect(credentials)
+            for name in SOURCE_NAMES:
+                table = source_map[name].warehouse_table.upper()
+                actual = _counts(conn, dataset, table)
+                if actual != after_load[table]:
+                    raise AssertionError(f"{table}: identical sample replay changed counts: before replay={after_load[table]}; after={actual}")
+                print(f"PASS identical replay {name}: total={actual[0]:,}, current={actual[1]:,}, expired={actual[2]:,}")
 
         print(
-            "SNOWFLAKE MIGRATED-HISTORY CONTINUITY PASSED: cloned migrated "
-            "history accepted a live extraction, preserved prior versions, "
-            "and stayed stable across one identical replay."
+            "SNOWFLAKE MIGRATED-HISTORY CONTINUITY PASSED: 500-row samples from the exact "
+            "migration baseline preserved row hashes, one changed key created one new version, "
+            "and one identical replay added no further versions."
         )
     finally:
         if schema_created:
             try:
-                # If the CLI subprocess failed while the control connection was
-                # closed, reconnect only for best-effort cleanup.
                 if conn is None:
                     conn = _connect(credentials)
                 cursor = conn.cursor()
@@ -413,11 +416,7 @@ def main() -> None:
                     cursor.close()
                 print(f"Cleaned up isolated schema {DATABASE}.{dataset}.", flush=True)
             except Exception as exc:
-                print(
-                    f"WARNING: unable to clean up isolated schema {DATABASE}.{dataset}: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+                print(f"WARNING: unable to clean up isolated schema {DATABASE}.{dataset}: {type(exc).__name__}: {exc}", flush=True)
         if conn is not None:
             conn.close()
 

@@ -14,22 +14,26 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: toronto-snowflake-migrated-history-continuity-${{ github.run_id }}
-  cancel-in-progress: false
+  group: toronto-snowflake-migrated-history-continuity-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   continuity:
     name: Continue dlt from migrated SCD2 history in an isolated schema
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_CONTINUITY_${{ github.run_id }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
+      AWS_REGION: ca-central-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +48,20 @@ jobs:
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -e ".[snowflake]"
 
+      - name: Download the exact October 23 migration baseline
+        run: |
+          set -euo pipefail
+          mkdir -p data/recovery/warehouse-2026-10-23
+          gh run download 40001052104 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name toronto-duckdb-40001052104 \
+            --dir data/recovery/warehouse-2026-10-23
+          db="$(find data/recovery/warehouse-2026-10-23 -type f -name toronto.duckdb -print -quit)"
+          test -n "$db"
+          test -s "$db"
+          echo "SOURCE_DB=$db" >> "$GITHUB_ENV"
+          ls -lh "$db"
+
       - name: Check destination guard
         run: |
           test -n "$TORONTO_WAREHOUSE_CREDENTIALS" || {
@@ -55,5 +73,5 @@ jobs:
             *) echo "Refusing to run outside isolated continuity schema"; exit 1 ;;
           esac
 
-      - name: Clone migrated history, continue live ingestion, and replay
+      - name: Verify migrated history with bounded sample loads and one replay
         run: python scripts/snowflake_migrated_history_continuity.py
