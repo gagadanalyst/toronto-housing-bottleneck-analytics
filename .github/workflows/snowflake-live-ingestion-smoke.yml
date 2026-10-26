@@ -1,0 +1,59 @@
+name: Snowflake Live Ingestion Smoke
+
+on:
+  push:
+    branches:
+      - feat/snowflake-ingestion-smoke
+    paths:
+      - "scripts/snowflake_live_ingestion_smoke.py"
+      - ".github/workflows/snowflake-live-ingestion-smoke.yml"
+      - "src/toronto_housing_ingestion/**"
+      - "open_data_config.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-snowflake-live-ingestion-smoke
+  cancel-in-progress: false
+
+jobs:
+  live-ingestion:
+    name: Extract and replay real Active/Cleared snapshots in an isolated schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TORONTO_WAREHOUSE_KIND: snowflake
+      TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_INGEST_SMOKE_${{ github.run_id }}
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install the Snowflake destination
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[snowflake]"
+
+      - name: Check required configuration
+        run: |
+          test -n "$TORONTO_WAREHOUSE_CREDENTIALS" || {
+            echo "Missing repository secret: SNOWFLAKE_DLT_CONNECTION"
+            exit 1
+          }
+          case "$TORONTO_WAREHOUSE_DATASET" in
+            SNOWFLAKE_INGEST_SMOKE_*) ;;
+            *) echo "Refusing to run outside the isolated test schema"; exit 1 ;;
+          esac
+
+      - name: Run live ingestion and idempotent replay checks
+        run: python scripts/snowflake_live_ingestion_smoke.py
