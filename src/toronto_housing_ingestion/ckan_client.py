@@ -20,6 +20,129 @@ from urllib3.util.retry import Retry
 from . import utils
 
 
+_SOURCE_FIELD_TYPES: dict[str, str] = {
+    "_id": "int4",
+    "PERMIT_NUM": "text",
+    "REVISION_NUM": "text",
+    "PERMIT_TYPE": "text",
+    "STRUCTURE_TYPE": "text",
+    "WORK": "text",
+    "STREET_NUM": "text",
+    "STREET_NAME": "text",
+    "STREET_TYPE": "text",
+    "STREET_DIRECTION": "text",
+    "POSTAL": "text",
+    "GEO_ID": "text",
+    "WARD_GRID": "text",
+    "APPLICATION_DATE": "date",
+    "ISSUED_DATE": "date",
+    "COMPLETED_DATE": "date",
+    "STATUS": "text",
+    "DESCRIPTION": "text",
+    "CURRENT_USE": "text",
+    "PROPOSED_USE": "text",
+    "DWELLING_UNITS_CREATED": "text",
+    "DWELLING_UNITS_LOST": "text",
+    "EST_CONST_COST": "text",
+    "ASSEMBLY": "float8",
+    "INSTITUTIONAL": "float8",
+    "RESIDENTIAL": "float8",
+    "BUSINESS_AND_PERSONAL_SERVICES": "float8",
+    "MERCANTILE": "float8",
+    "INDUSTRIAL": "float8",
+    "INTERIOR_ALTERATIONS": "float8",
+    "DEMOLITION": "float8",
+    "BUILDER_NAME": "text",
+}
+_SOURCE_TEXT_COLUMNS = frozenset(
+    name for name, field_type in _SOURCE_FIELD_TYPES.items()
+    if field_type in {"text", "date"}
+)
+_SOURCE_FLOAT_COLUMNS = frozenset(
+    name for name, field_type in _SOURCE_FIELD_TYPES.items() if field_type == "float8"
+)
+_SOURCE_INTEGER_COLUMNS = frozenset(
+    name for name, field_type in _SOURCE_FIELD_TYPES.items()
+    if field_type in {"int2", "int4", "int8"}
+)
+
+
+def _source_csv_dtypes() -> dict[str, str]:
+    # Prevent inference for source text and date fields.
+    return {column: "string" for column in _SOURCE_TEXT_COLUMNS}
+
+
+def _source_text_value(value: object, column: str, declared_type: str) -> object:
+    # Preserve original text. Reject numbers because padding may already be lost.
+    if value is None or value is pd.NA:
+        return pd.NA
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        return pd.NA if value == "" else value
+    value_kind = type(value).__name__
+    raise ValueError(
+        f"CKAN field {column!r} is declared {declared_type} but received "
+        f"a non-string value ({value_kind}: {value!r}); refusing lossy coercion. "
+        "A numeric JSON value may already have lost leading zeroes."
+    )
+
+
+def _normalize_source_schema(frame: pd.DataFrame) -> pd.DataFrame:
+    # Stabilize all known fields across DataStore, CSV and JSON routes.
+    # Raw date columns stay strings for legacy hash compatibility.
+    # Unknown fields are preserved after the canonical fields for drift review.
+    actual_columns = {str(column).upper(): column for column in frame.columns}
+    for wanted, declared_type in _SOURCE_FIELD_TYPES.items():
+        column = actual_columns.get(wanted.upper())
+        if column is None:
+            continue
+        if declared_type in {"text", "date"}:
+            values = [
+                _source_text_value(value, str(column), declared_type)
+                for value in frame[column].tolist()
+            ]
+            frame[column] = pd.Series(values, index=frame.index, dtype="string")
+        elif declared_type == "float8":
+            series = frame[column].replace("", pd.NA)
+            try:
+                converted = pd.to_numeric(series, errors="raise")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"CKAN field {column!r} is declared float8 but contains non-numeric values."
+                ) from exc
+            frame[column] = converted.astype("float64")
+        elif declared_type in {"int2", "int4", "int8"}:
+            series = frame[column].replace("", pd.NA)
+            try:
+                converted = pd.to_numeric(series, errors="raise")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"CKAN field {column!r} is declared {declared_type} but contains non-numeric values."
+                ) from exc
+            non_null = converted.dropna()
+            if not (non_null % 1 == 0).all():
+                raise ValueError(
+                    f"CKAN field {column!r} is declared {declared_type} but contains fractional values."
+                )
+            integer_dtype = {"int2": "Int16", "int4": "Int32", "int8": "Int64"}[declared_type]
+            frame[column] = converted.astype(integer_dtype)
+
+    # Input resource order may differ even when the source schema is identical.
+    actual_columns = {str(column).upper(): column for column in frame.columns}
+    canonical = [
+        actual_columns[name.upper()]
+        for name in _SOURCE_FIELD_TYPES
+        if name.upper() in actual_columns
+    ]
+    known_names = {name.upper() for name in _SOURCE_FIELD_TYPES}
+    unknown = [column for column in frame.columns if str(column).upper() not in known_names]
+    return frame.loc[:, canonical + unknown]
+
+
 class DatastoreUnavailableError(RuntimeError):
     """Raised when DataStore extraction fails and fallback should be attempted."""
 
@@ -111,7 +234,8 @@ class TorontoCKANClient:
         resources = [
             resource
             for resource in package.get("resources", [])
-            if str(resource.get("format", "")).lower() in {"csv", "json"}
+            if resource.get("datastore_active") is not True
+            and str(resource.get("format", "")).lower() in {"csv", "json"}
             and resource.get("url")
         ]
         return sorted(
@@ -353,6 +477,7 @@ class TorontoCKANClient:
 
             if records:
                 frame = pd.DataFrame.from_records(records)
+                frame = _normalize_source_schema(frame)
                 utils.validate_required_columns(frame, required_columns, source_name)
                 utils.validate_data_types(frame, date_columns, source_name)
                 part_path = checkpoint_dir / f"part_{page_number:06d}.parquet"
@@ -431,18 +556,13 @@ class TorontoCKANClient:
                 pd.read_csv(
                     temp_path,
                     chunksize=10_000,
-                    dtype={
-                        "BUILDER_NAME": "string",
-                        "PERMIT_NUM": "string",
-                        "REVISION_NUM": "string",
-                        "PERMIT_TYPE": "string",
-                        "EST_CONST_COST": "string",
-                    },
+                    dtype=_source_csv_dtypes(), keep_default_na=False,
                 )
                 if fmt == "csv"
                 else self._iter_json_frames(temp_path)
             )
             for index, frame in enumerate(frames):
+                frame = _normalize_source_schema(frame)
                 utils.validate_required_columns(frame, required_columns, source_name)
                 utils.validate_data_types(frame, date_columns, source_name)
                 if frame.empty:

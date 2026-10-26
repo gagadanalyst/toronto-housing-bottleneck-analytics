@@ -153,6 +153,7 @@ def _run_fallbacks(
     source: config.SourceConfig,
     output_path: Path,
     first: dict[str, Any] | None = None,
+    expected_rows: int | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, Any]]:
     """Try available CSV/JSON resources until one extracts successfully."""
     candidates = client.fallback_resources(package)
@@ -171,6 +172,12 @@ def _run_fallbacks(
                 required_columns=source.required_columns,
                 date_columns=source.date_columns,
             )
+            if expected_rows is not None and row_count != expected_rows:
+                raise RuntimeError(
+                    f"{source.name}: fallback resource {resource.get('name')!r} "
+                    f"returned {row_count:,} rows; DataStore reported "
+                    f"{expected_rows:,}. Refusing an incomplete or inconsistent snapshot."
+                )
             fingerprint = client.file_fingerprint(
                 resource,
                 package.get("metadata_modified"),
@@ -324,7 +331,11 @@ def ingest_source(
                 error=str(exc),
             )
             resource, row_count, fingerprint = _run_fallbacks(
-                client, package, source, output_path
+                client,
+                package,
+                source,
+                output_path,
+                expected_rows=probe.get("declared_total") if probe else None,
             )
             is_datastore = False
     else:
