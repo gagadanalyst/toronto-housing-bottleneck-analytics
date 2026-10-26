@@ -312,6 +312,7 @@ def ingest_source(
                 required_columns=source.required_columns,
                 date_columns=source.date_columns,
             )
+            fingerprint = {**fingerprint, "datastore_total": row_count}
         except DatastoreUnavailableError as exc:
             utils.log_event(
                 logging.WARNING,

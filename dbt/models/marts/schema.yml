@@ -310,7 +310,7 @@ models:
         description: Maximum non-negative elapsed calendar days.
 
   - name: dim_permit_type
-    description: One row per distinct permit type in the Cleared permit fact.
+    description: One row per distinct non-null permit type across the Active and Cleared permit facts.
     columns:
       - name: permit_type
         description: Natural key identifying a permit type.
