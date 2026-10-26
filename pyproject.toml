@@ -9,7 +9,7 @@ description = "Simple, configuration-driven ingestion for Toronto Open Data with
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
-    "dlt[duckdb]==1.30.0",
+    "dlt[duckdb]==1.31.0",
     "ijson>=3.3,<4",
     "pandas>=2.2,<3",
     "pyarrow==25.0.1",
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-snowflake = ["dlt[snowflake]==1.30.0"]
+snowflake = ["dlt[snowflake]==1.31.0"]
 dev = [
     "build>=1.6,<2",
     "pip-audit>=2.9,<3",

@@ -98,6 +98,9 @@ enabled in Snowsight for the account administrator. The `NOTIFY_USERS` column
 was empty, so no additional notification recipients were explicitly listed.
 Actual alert delivery has not been independently tested.
 
-This verifies the initial Snowflake objects and configuration only. No source
-data has been migrated yet, and ingestion, dbt execution, analytical parity,
-and recovery remain future tasks.
+The initial Snowflake objects and configuration were verified on 2026-10-25.
+Since then, the recovered DuckDB history has been migrated to `TORONTO.RAW`,
+Snowflake dbt validation has passed, and live Active/Cleared ingestion with
+two identical replays has passed in an isolated schema. Analytical parity,
+migrated-history continuity, and the production cutover/recovery review remain
+separate acceptance steps. These tests have not switched production CI/CD to Snowflake.

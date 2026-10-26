@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
     PrivateFormat,
+    load_der_private_key,
     load_pem_private_key,
 )
 from toronto_housing_ingestion.config import load_config
@@ -47,24 +48,77 @@ def _safe_schema(value: str) -> str:
     return normalized
 
 
+def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
+    """Decode dlt-supported PEM/DER key representations to connector-ready DER.
+
+    dlt accepts plain PEM, base64-encoded PEM, and base64-encoded DER. Query
+    strings also require URL-encoding ``+`` characters; this tries a recovery
+    candidate for common URLs where ``+`` was decoded as a space.
+    """
+    password = passphrase.encode("utf-8") if passphrase else None
+    candidates: list[str] = [encoded_key]
+    if "-----BEGIN" not in encoded_key:
+        # parse_qs turns an unescaped '+' into a space. Try both a compact
+        # candidate (for line-wrapped base64) and a restored-plus candidate.
+        compact = "".join(encoded_key.split())
+        restored_plus = encoded_key.replace(" ", "+")
+        candidates.extend((restored_plus, compact))
+
+    attempted: set[bytes] = set()
+    for candidate in candidates:
+        raw = candidate.encode("utf-8")
+        if raw not in attempted:
+            attempted.add(raw)
+            for loader in (load_pem_private_key, load_der_private_key):
+                try:
+                    private_key = loader(raw, password=password)
+                    return private_key.private_bytes(
+                        Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+        try:
+            decoded = base64.b64decode(candidate, validate=False)
+        except (ValueError, base64.binascii.Error):
+            continue
+        if decoded in attempted:
+            continue
+        attempted.add(decoded)
+        for loader in (load_pem_private_key, load_der_private_key):
+            try:
+                private_key = loader(decoded, password=password)
+                return private_key.private_bytes(
+                    Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+                )
+            except (TypeError, ValueError):
+                pass
+
+    raise ValueError(
+        "Unable to decode the Snowflake private_key. Supported formats are "
+        "plain PEM, base64-encoded PEM, and base64-encoded DER; verify URL "
+        "encoding of the private_key query parameter and passphrase."
+    )
+
+
 def _connect(uri: str):
     """Connect using the key-pair Snowflake dlt URI from GitHub Secrets."""
     parts = urlsplit(uri)
-    query = parse_qs(parts.query)
+    query = parse_qs(parts.query, keep_blank_values=True)
     if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
         raise ValueError("Expected a Snowflake dlt connection URI.")
     encoded_key = query.get("private_key", [None])[0]
     if not encoded_key:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION has no private_key parameter.")
 
-    private_key = load_pem_private_key(base64.b64decode(encoded_key), password=None)
-    key_der = private_key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
     database = unquote(parts.path.strip("/").split("/")[0])
     if database.upper() != DATABASE:
         raise ValueError(f"Expected database {DATABASE}; found {database!r}.")
     if not query.get("warehouse") or not query.get("role"):
         raise ValueError("Snowflake URI must specify warehouse and role.")
 
+    passphrase = query.get("private_key_passphrase", [None])[0]
+    key_der = _decode_private_key(encoded_key, passphrase)
     return snowflake.connector.connect(
         account=parts.hostname,
         user=unquote(parts.username),
@@ -245,6 +299,26 @@ def main() -> None:
             raise RuntimeError(
                 f"Clone is missing pipeline state: {sorted(missing_cloned)}."
             )
+
+        # Verify the clone is identical to the migrated baseline before letting
+        # the application write to it. This prevents a bad clone from being
+        # masked by newly ingested rows.
+        for table, expected in prior.items():
+            actual = _counts(conn, dataset, table)
+            if actual != expected:
+                raise AssertionError(
+                    f"Cloned {table} does not match TORONTO.RAW. "
+                    f"Expected={expected}; cloned={actual}."
+                )
+        cloned_metadata = {
+            table: _row_count(conn, dataset, table) for table in metadata_prior
+        }
+        if cloned_metadata != metadata_prior:
+            raise AssertionError(
+                "Cloned dlt metadata row counts do not match TORONTO.RAW. "
+                f"Expected={metadata_prior}; cloned={cloned_metadata}."
+            )
+        print(f"CLONE VERIFIED: SCD2 counts={prior}; metadata rows={cloned_metadata}")
 
         app = load_config(Path("open_data_config.yml"))
         sources = {source.name: source for source in app.sources}

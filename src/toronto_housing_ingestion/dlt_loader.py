@@ -41,7 +41,9 @@ def _destination(kind: str, credentials: str) -> Any:
     if kind == "snowflake":
         from dlt.destinations import snowflake
 
-        return snowflake(credentials=credentials)
+        # Keep dlt's staging schema aligned with the migrated TIMESTAMP_LTZ contract.
+        # This option is supported by the project's new dlt 1.31.0 pin.
+        return snowflake(credentials=credentials, use_timestamp_tz=False)
     raise ValueError(f"Unsupported warehouse destination: {kind}")
 
 
