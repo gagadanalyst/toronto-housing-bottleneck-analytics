@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: toronto-snowflake-live-ingestion-smoke
@@ -26,6 +27,7 @@ jobs:
       DO_NOT_TRACK: "1"
       AWS_REGION: ca-central-1
       AWS_EC2_METADATA_DISABLED: "true"
+      TORONTO_HISTORICAL_PARQUET_ROOT: data/recovery/parquet-2026-10-23
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,5 +53,27 @@ jobs:
             *) echo "Refusing to run outside the isolated test schema"; exit 1 ;;
           esac
 
+      - name: Download original migration Parquet for diagnostics
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$TORONTO_HISTORICAL_PARQUET_ROOT"
+          gh run download 40001052104 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name toronto-parquet-40001052104 \
+            --dir "$TORONTO_HISTORICAL_PARQUET_ROOT"
+          find "$TORONTO_HISTORICAL_PARQUET_ROOT" -type f -name data.parquet -print
+
       - name: Run live ingestion and idempotent replay checks
         run: python scripts/snowflake_live_ingestion_smoke.py
+
+      - name: Upload hash mismatch diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hash-mismatch-diagnostics-${{ github.run_id }}
+          path: data/diagnostics/hash_mismatch_diagnostics.duckdb
+          if-no-files-found: warn
+          retention-days: 14

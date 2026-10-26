@@ -77,6 +77,268 @@ def _columns(client, schema: str, table: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _latest_parquet_snapshot(root: Path, source_name: str) -> Path | None:
+    """Find the latest data.parquet snapshot for one source beneath root."""
+    source_root = root / source_name
+    candidates = list(source_root.glob("ingest_date=*/run_id=*/data.parquet"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
+    """Persist mismatch keys, complete typed snapshots, and field summaries."""
+    import duckdb
+    import pyarrow.parquet as pq
+
+    if tuple(key.lower() for key in source.primary_key) != (
+        "permit_num", "revision_num", "permit_type"
+    ):
+        raise ValueError(
+            "Diagnostic capture currently expects the Active/Cleared permit key."
+        )
+
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    db_path = Path(os.environ.get(
+        "HASH_MISMATCH_DIAGNOSTICS_PATH",
+        "data/diagnostics/hash_mismatch_diagnostics.duckdb",
+    ))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_path = _latest_parquet_snapshot(Path("data/raw"), source.name)
+    historical_root = Path(os.environ.get(
+        "TORONTO_HISTORICAL_PARQUET_ROOT",
+        "data/recovery/parquet-2026-10-23",
+    ))
+    historical_path = _latest_parquet_snapshot(historical_root, source.name)
+
+    with duckdb.connect(str(db_path)) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS hash_mismatches (
+                run_id VARCHAR,
+                source_name VARCHAR,
+                permit_num VARCHAR,
+                revision_num VARCHAR,
+                permit_type VARCHAR,
+                fresh_hash VARCHAR,
+                migrated_hash VARCHAR,
+                fresh_parquet_path VARCHAR,
+                historical_parquet_path VARCHAR
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS diagnostic_runs (
+                run_id VARCHAR,
+                source_name VARCHAR,
+                mismatch_join_rows BIGINT,
+                distinct_business_keys BIGINT,
+                fresh_parquet_path VARCHAR,
+                historical_parquet_path VARCHAR,
+                captured_at_utc TIMESTAMP
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS snapshot_schemas (
+                run_id VARCHAR,
+                source_name VARCHAR,
+                snapshot_kind VARCHAR,
+                column_name VARCHAR,
+                parquet_type VARCHAR,
+                nullable BOOLEAN
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS duplicate_keys (
+                run_id VARCHAR,
+                source_name VARCHAR,
+                snapshot_kind VARCHAR,
+                permit_num VARCHAR,
+                revision_num VARCHAR,
+                permit_type VARCHAR,
+                physical_rows BIGINT
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS field_diff_summary (
+                run_id VARCHAR,
+                source_name VARCHAR,
+                column_name VARCHAR,
+                compared_row_pairs BIGINT,
+                json_diff_row_pairs BIGINT,
+                type_diff_row_pairs BIGINT
+            )
+        """)
+
+        for table in (
+            "hash_mismatches", "diagnostic_runs", "snapshot_schemas",
+            "duplicate_keys", "field_diff_summary",
+        ):
+            db.execute(
+                f"DELETE FROM {table} WHERE run_id = ? AND source_name = ?",
+                [run_id, source.name],
+            )
+
+        # Each row returned from Snowflake is: three key values, fresh hash, migrated hash.
+        mismatch_values = [
+            (
+                run_id, source.name,
+                *(None if value is None else str(value) for value in row[:3]),
+                str(row[3]), str(row[4]),
+                str(fresh_path) if fresh_path else None,
+                str(historical_path) if historical_path else None,
+            )
+            for row in mismatch_rows
+        ]
+        db.executemany(
+            "INSERT INTO hash_mismatches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            mismatch_values,
+        )
+
+        distinct_keys = len({tuple(row[:3]) for row in mismatch_rows})
+        from datetime import datetime, timezone
+        db.execute(
+            "INSERT INTO diagnostic_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, source.name, len(mismatch_rows), distinct_keys,
+                str(fresh_path) if fresh_path else None,
+                str(historical_path) if historical_path else None,
+                datetime.now(timezone.utc).replace(tzinfo=None),
+            ],
+        )
+
+        snapshot_tables: dict[str, tuple[str, Path]] = {}
+        for snapshot_kind, path in (
+            ("fresh", fresh_path), ("historical", historical_path)
+        ):
+            if path is None:
+                print(
+                    f"WARNING hash diagnostics: {snapshot_kind} Parquet not found "
+                    f"for {source.name}; its snapshot values cannot be stored.",
+                    flush=True,
+                )
+                continue
+            table_name = f"{snapshot_kind}_{source.name}"
+            db.execute(
+                f'CREATE OR REPLACE TABLE "{table_name}" AS '
+                "SELECT * FROM read_parquet(?)",
+                [str(path)],
+            )
+            snapshot_tables[snapshot_kind] = (table_name, path)
+            schema = pq.ParquetFile(path).schema_arrow
+            db.executemany(
+                "INSERT INTO snapshot_schemas VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (run_id, source.name, snapshot_kind, field.name,
+                     str(field.type), bool(field.nullable))
+                    for field in schema
+                ],
+            )
+
+            key_map = {name.lower(): name for name in schema.names}
+            if all(key in key_map for key in ("permit_num", "revision_num", "permit_type")):
+                qkeys = ", ".join(
+                    f'"{key_map[key]}"' for key in
+                    ("permit_num", "revision_num", "permit_type")
+                )
+                duplicate_rows = db.execute(
+                    f"SELECT {qkeys}, COUNT(*) FROM read_parquet(?) "
+                    f"GROUP BY {qkeys} HAVING COUNT(*) > 1",
+                    [str(path)],
+                ).fetchall()
+                if duplicate_rows:
+                    db.executemany(
+                        "INSERT INTO duplicate_keys VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (run_id, source.name, snapshot_kind,
+                             *(None if value is None else str(value) for value in row[:3]),
+                             int(row[3]))
+                            for row in duplicate_rows
+                        ],
+                    )
+
+        # Compare the historical and fresh Parquet representations for keys that
+        # failed Snowflake hash compatibility. Store a compact per-column summary.
+        if "fresh" in snapshot_tables and "historical" in snapshot_tables:
+            fresh_table = snapshot_tables["fresh"][0]
+            historical_table = snapshot_tables["historical"][0]
+            fresh_schema = pq.ParquetFile(fresh_path).schema_arrow
+            historical_schema = pq.ParquetFile(historical_path).schema_arrow
+            fresh_map = {name.lower(): name for name in fresh_schema.names}
+            historical_map = {name.lower(): name for name in historical_schema.names}
+            common = sorted(
+                lower for lower in set(fresh_map) & set(historical_map)
+                if lower != "_id" and not lower.startswith("_dlt_")
+            )
+            key_names = ("permit_num", "revision_num", "permit_type")
+            common = [name for name in common if name not in key_names]
+            selected_fields: list[str] = []
+            value_tuples: list[str] = []
+            for index, lower in enumerate(common):
+                hname = historical_map[lower]
+                fname = fresh_map[lower]
+                selected_fields.extend([
+                    f'h."{hname}" AS hist_{index}',
+                    f'f."{fname}" AS fresh_{index}',
+                ])
+                value_tuples.append(
+                    f"('{lower.upper()}', "
+                    f"CAST(to_json(hist_{index}) AS VARCHAR), typeof(hist_{index}), "
+                    f"CAST(to_json(fresh_{index}) AS VARCHAR), typeof(fresh_{index}))"
+                )
+
+            join_keys = " AND ".join(
+                f'h."{historical_map[key]}" = m.{key}' for key in key_names
+            ) + " AND " + " AND ".join(
+                f'f."{fresh_map[key]}" = m.{key}' for key in key_names
+            )
+            if selected_fields and value_tuples:
+                analysis_sql = f"""
+                    WITH mismatch_keys AS (
+                        SELECT DISTINCT permit_num, revision_num, permit_type
+                        FROM hash_mismatches
+                        WHERE run_id = ? AND source_name = ?
+                    ), matched_rows AS (
+                        SELECT m.permit_num, m.revision_num, m.permit_type,
+                               {', '.join(selected_fields)}
+                        FROM mismatch_keys m
+                        JOIN "{historical_table}" h ON
+                            h."{historical_map['permit_num']}" = m.permit_num AND
+                            h."{historical_map['revision_num']}" = m.revision_num AND
+                            h."{historical_map['permit_type']}" = m.permit_type
+                        JOIN "{fresh_table}" f ON
+                            f."{fresh_map['permit_num']}" = m.permit_num AND
+                            f."{fresh_map['revision_num']}" = m.revision_num AND
+                            f."{fresh_map['permit_type']}" = m.permit_type
+                    ), field_values AS (
+                        SELECT d.column_name, d.historical_json, d.historical_type,
+                               d.fresh_json, d.fresh_type
+                        FROM matched_rows
+                        CROSS JOIN LATERAL (VALUES {', '.join(value_tuples)}) AS d(
+                            column_name, historical_json, historical_type,
+                            fresh_json, fresh_type
+                        )
+                    )
+                    INSERT INTO field_diff_summary
+                    SELECT ?, ?, column_name, COUNT(*),
+                           SUM(CASE WHEN historical_json IS DISTINCT FROM fresh_json
+                                    THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN historical_type IS DISTINCT FROM fresh_type
+                                    THEN 1 ELSE 0 END)
+                    FROM field_values
+                    GROUP BY column_name
+                """
+                db.execute(analysis_sql, [run_id, source.name, run_id, source.name])
+
+    print(
+        f"HASH DIAGNOSTICS SAVED: {db_path}; source={source.name}; "
+        f"mismatch join rows={len(mismatch_rows):,}; "
+        f"distinct business keys={distinct_keys:,}; "
+        f"fresh Parquet={'found' if fresh_path else 'missing'}; "
+        f"historical Parquet={'found' if historical_path else 'missing'}.",
+        flush=True,
+    )
+    return db_path
+
+
 def _verify_fresh_hash_compatibility(
     pipeline: dlt.Pipeline, dataset: str, source
 ) -> None:
@@ -167,11 +429,22 @@ def _verify_fresh_hash_compatibility(
             key_projection = ", ".join(
                 f"fresh.{_quote_identifier(fresh_map[key])}" for key in key_columns
             )
-            examples = client.execute_sql(
+            mismatch_query = (
                 f"SELECT {key_projection}, {fresh_hash}, {migrated_hash} "
-                f"{join_and_filter} AND ({fresh_hash} IS DISTINCT FROM {migrated_hash}) "
-                "LIMIT 5"
+                f"{join_and_filter} AND ({fresh_hash} IS DISTINCT FROM {migrated_hash})"
             )
+            mismatch_rows = client.execute_sql(mismatch_query)
+            try:
+                _save_hash_mismatch_diagnostics(source, mismatch_rows)
+            except Exception as diagnostic_error:
+                # Never mask the original compatibility failure with a diagnostic error.
+                print(
+                    f"WARNING: unable to save hash mismatch diagnostics for "
+                    f"{source.name}: {type(diagnostic_error).__name__}: "
+                    f"{diagnostic_error}",
+                    flush=True,
+                )
+            examples = mismatch_rows[:5]
             raise AssertionError(
                 f"{source.name}: fresh-snapshot row hashes differ from migrated hashes for "
                 f"{mismatched_hashes:,} of {identical_rows:,} current rows whose tracked "
