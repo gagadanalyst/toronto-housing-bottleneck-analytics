@@ -15,5 +15,5 @@ toronto_housing_analytics:
       role: TORONTO_DBT_ROLE
       warehouse: TORONTO_XS_WH
       database: TORONTO
-      schema: ANALYTICS
+      schema: "{{ env_var('TORONTO_DBT_TARGET_SCHEMA', 'ANALYTICS') }}"
       threads: 4

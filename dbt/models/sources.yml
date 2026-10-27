@@ -2,7 +2,7 @@ sources:
   - name: toronto_raw
     description: "Persistent raw schema populated by the ingestion pipeline."
     database: toronto
-    schema: raw
+    schema: "{{ env_var('TORONTO_DBT_SOURCE_SCHEMA', 'raw') }}"
     tables:
       - name: cleared_permits
         identifier: raw_cleared_permits

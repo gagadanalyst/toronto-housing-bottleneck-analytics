@@ -1,22 +1,32 @@
-name: Snowflake dbt Validation
+name: Snowflake dbt Baseline Validation
 
 on:
   workflow_dispatch:
+    inputs:
+      snapshot_run_id:
+        description: Successful main-branch CD run ID used to create the Snowflake baseline
+        required: true
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: toronto-snowflake-dbt
+  group: toronto-snowflake-dbt-baseline-${{ inputs.snapshot_run_id }}
   cancel-in-progress: false
 
 jobs:
   validate:
-    name: Parse, build and test dbt on Snowflake
+    if: github.ref == 'refs/heads/main'
+    name: Build and test dbt against an isolated Snowflake baseline
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
+      # The unused DuckDB profile output still has an env_var reference.
+      DBT_DUCKDB_PATH: /tmp/toronto-dbt-placeholder.duckdb
       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
       DO_NOT_TRACK: "1"
 
@@ -28,10 +38,116 @@ jobs:
           python-version: "3.14"
           cache: pip
 
-      - name: Install pinned dbt dependencies
+      - name: Install pinned dbt and Snowflake Python connector
         run: |
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -r dbt/requirements.txt
+          python -m pip install "snowflake-connector-python[secure-local-storage]==4.8.1"
+
+      - name: Validate source CD run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not os.environ.get("SNOWFLAKE_DLT_CONNECTION"):
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+
+          result = subprocess.run(
+              [
+                  "gh", "run", "view", run_id,
+                  "--repo", os.environ["GITHUB_REPOSITORY"],
+                  "--json", "name,status,conclusion,headBranch,headSha,event",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          run = json.loads(result.stdout)
+          expected = {
+              "name": "CD",
+              "status": "completed",
+              "conclusion": "success",
+              "headBranch": "main",
+              "event": "workflow_run",
+          }
+          mismatches = {
+              key: (wanted, run.get(key))
+              for key, wanted in expected.items()
+              if run.get(key) != wanted
+          }
+          if mismatches:
+              raise ValueError(f"Selected run is not a successful main-branch CD run: {mismatches}")
+          if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("headSha", ""))):
+              raise ValueError("Selected CD run did not return a valid source commit SHA.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={run['headSha']}\n")
+          print(f"Verified successful CD run {run_id} on main at {run['headSha']}.")
+          PY
+
+      - name: Download snapshot bundle and set matching dbt schemas/date
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/snapshot-download
+          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
+            --dir data/snapshot-download
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          commit = os.environ["SNAPSHOT_SOURCE_COMMIT"]
+          path = Path("data/snapshot-download/toronto-snapshot-bundle.zip")
+          if not path.is_file() or path.stat().st_size == 0:
+              raise ValueError(f"Snapshot bundle was not downloaded: {path}")
+
+          with ZipFile(path) as archive:
+              if "bundle.json" not in archive.namelist():
+                  raise ValueError("Snapshot bundle has no bundle.json metadata.")
+              bundle = json.loads(archive.read("bundle.json"))
+
+          if bundle.get("format_version") != 1:
+              raise ValueError("Unsupported snapshot bundle format version.")
+          if str(bundle.get("source_run_id")) != run_id:
+              raise ValueError("Bundle source run ID differs from the selected CD run.")
+          if bundle.get("source_commit") != commit:
+              raise ValueError("Bundle source commit differs from the selected CD run.")
+          started_at = bundle.get("extraction_started_at_utc", "")
+          as_of_date = datetime.fromisoformat(started_at.replace("Z", "+00:00")).date().isoformat()
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}"
+          target_schema = f"ANALYTICS_BASELINE_{run_id}"
+          if not re.fullmatch(r"SNOWFLAKE_BASELINE_[0-9]+", source_schema):
+              raise ValueError("Derived source schema name failed validation.")
+          if not re.fullmatch(r"ANALYTICS_BASELINE_[0-9]+", target_schema):
+              raise ValueError("Derived target schema name failed validation.")
+
+          values = {
+              "TORONTO_DBT_SOURCE_SCHEMA": source_schema,
+              "TORONTO_DBT_TARGET_SCHEMA": target_schema,
+              "TORONTO_DBT_AS_OF_DATE": as_of_date,
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+          print(f"Validated snapshot bundle: {path} ({path.stat().st_size:,} bytes)")
+          print(f"dbt source schema: TORONTO.{source_schema}")
+          print(f"dbt target schema: TORONTO.{target_schema}")
+          print(f"Shared as_of_date: {as_of_date}")
+          PY
 
       - name: Prepare temporary Snowflake key and connection settings
         run: |
@@ -42,20 +158,16 @@ jobs:
           from urllib.parse import parse_qs, unquote, urlsplit
 
           uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
-          if not uri:
-              raise SystemExit("Missing secret SNOWFLAKE_DLT_CONNECTION")
-
           parts = urlsplit(uri)
           params = parse_qs(parts.query)
           if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
-              raise SystemExit("Snowflake connection URI is invalid.")
+              raise ValueError("Snowflake connection URI is invalid.")
           if "private_key" not in params:
-              raise SystemExit("Connection URI has no private_key parameter.")
+              raise ValueError("Connection URI has no private_key parameter.")
 
           key_path = Path(os.environ["RUNNER_TEMP"]) / "snowflake_key.p8"
           key_path.write_bytes(base64.b64decode(params["private_key"][0]))
           key_path.chmod(0o600)
-
           values = {
               "SNOWFLAKE_ACCOUNT": parts.hostname,
               "SNOWFLAKE_USER": unquote(parts.username),
@@ -64,6 +176,83 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
               for key, value in values.items():
                   env.write(f"{key}={value}\n")
+          PY
+
+      - name: Grant dbt access to the isolated baseline and target schemas
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import snowflake.connector
+
+          source_schema = os.environ["TORONTO_DBT_SOURCE_SCHEMA"].upper()
+          target_schema = os.environ["TORONTO_DBT_TARGET_SCHEMA"].upper()
+          if not re.fullmatch(r"SNOWFLAKE_BASELINE_[0-9]+", source_schema):
+              raise ValueError("Refusing unexpected Snowflake source schema.")
+          if not re.fullmatch(r"ANALYTICS_BASELINE_[0-9]+", target_schema):
+              raise ValueError("Refusing unexpected Snowflake target schema.")
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_INGEST_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  "SELECT TABLE_NAME FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  (source_schema,),
+              )
+              existing = {row[0].upper() for row in cursor.fetchall()}
+              required = {"RAW_ACTIVE_PERMITS", "RAW_CLEARED_PERMITS"}
+              missing = sorted(required - existing)
+              if missing:
+                  raise ValueError(
+                      f"Baseline schema TORONTO.{source_schema} is missing tables: {missing}"
+                  )
+
+              # Do not let dbt validate a schema left behind by a failed/partial load.
+              for table in sorted(required):
+                  cursor.execute(
+                      f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL) "
+                      f"FROM TORONTO.{source_schema}.{table}"
+                  )
+                  total_rows, current_rows = cursor.fetchone()
+                  if not total_rows or not current_rows:
+                      raise ValueError(
+                          f"Baseline table TORONTO.{source_schema}.{table} has "
+                          f"no rows or no current SCD2 rows: "
+                          f"total={total_rows}, current={current_rows}"
+                      )
+                  print(
+                      f"Verified TORONTO.{source_schema}.{table}: "
+                      f"{total_rows:,} total / {current_rows:,} current SCD2 rows."
+                  )
+
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{source_schema} TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT SELECT ON ALL TABLES IN SCHEMA TORONTO.{source_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(f"CREATE SCHEMA IF NOT EXISTS TORONTO.{target_schema}")
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{target_schema} TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT CREATE TABLE, CREATE VIEW ON SCHEMA TORONTO.{target_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              print(f"Granted dbt access to source schema TORONTO.{source_schema}.")
+              print(f"Prepared isolated dbt target schema TORONTO.{target_schema}.")
+          finally:
+              cursor.close()
+              connection.close()
           PY
 
       - name: Configure dbt profile
@@ -82,13 +271,13 @@ jobs:
         working-directory: dbt
         run: dbt parse --profiles-dir . --target snowflake
 
-      - name: Build models and run tests
+      - name: Build models and run tests against the baseline
         working-directory: dbt
         run: |
           dbt build \
             --profiles-dir . \
             --target snowflake \
-            --vars '{"as_of_date": "2026-10-23"}'
+            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
 
       - name: Generate dbt documentation
         working-directory: dbt

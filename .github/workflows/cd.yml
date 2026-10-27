@@ -58,7 +58,11 @@ jobs:
           fi
 
       - name: Record snapshot extraction start
-        run: echo "SNAPSHOT_EXTRACTION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+        shell: bash
+        run: |
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "SNAPSHOT_EXTRACTION_STARTED_AT=${started_at}" >> "$GITHUB_ENV"
+          echo "TORONTO_DBT_AS_OF_DATE=${started_at:0:10}" >> "$GITHUB_ENV"
 
       - name: Extract Active and Cleared Permits only
         run: >-
@@ -177,7 +181,10 @@ jobs:
 
       - name: Build models and run tests
         working-directory: dbt
-        run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" build \
+            --profiles-dir . \
+            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
 
       - name: Generate dbt documentation site for publication
         working-directory: dbt
