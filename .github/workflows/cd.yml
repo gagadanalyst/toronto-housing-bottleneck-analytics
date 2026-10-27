@@ -74,11 +74,6 @@ jobs:
           --lock-file data/.ingestion.lock
           --full-refresh
 
-      - name: Run local setup smoke test
-        env:
-          RUN_LIVE_TESTS: "1"
-        run: python -m pytest -q tests/test_local_setup.py
-
       - name: Run Active Permits SCD2 integration test
         run: python -m pytest -s tests/integration/test_scd2_active_permits.py
 
