@@ -1,0 +1,239 @@
+name: Snowflake Serving Schema Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_serving_schema:
+        description: "Confirm dbt may create or replace project models in TORONTO.ANALYTICS"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-snowflake-serving-schema
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Build and verify Snowflake dashboard models
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      DBT_DUCKDB_PATH: /tmp/toronto-dbt-placeholder.duckdb
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require explicit serving-schema confirmation
+        env:
+          CONFIRM_SERVING_SCHEMA: ${{ inputs.confirm_serving_schema }}
+        run: |
+          if [ "$CONFIRM_SERVING_SCHEMA" != "true" ]; then
+            echo "Refusing to build into TORONTO.ANALYTICS without explicit confirmation."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dbt and Snowflake connector
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -r dbt/requirements.txt
+          python -m pip install "snowflake-connector-python[secure-local-storage]==4.8.1"
+
+      - name: Validate configuration and inspect target schemas
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import parse_qs, unquote, urlsplit
+
+          import snowflake.connector
+
+          uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
+          if not uri:
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+
+          parts = urlsplit(uri)
+          params = parse_qs(parts.query)
+          if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
+              raise ValueError("Snowflake connection URI is invalid.")
+          if "private_key" not in params:
+              raise ValueError("Snowflake connection URI has no private_key parameter.")
+
+          key_path = Path(os.environ["RUNNER_TEMP"]) / "snowflake_key.p8"
+          key_path.write_bytes(base64.b64decode(params["private_key"][0]))
+          key_path.chmod(0o600)
+
+          values = {
+              "SNOWFLAKE_ACCOUNT": parts.hostname,
+              "SNOWFLAKE_USER": unquote(parts.username),
+              "SNOWFLAKE_PRIVATE_KEY_PATH": str(key_path),
+              "TORONTO_DBT_SOURCE_SCHEMA": "RAW",
+              "TORONTO_DBT_TARGET_SCHEMA": "ANALYTICS",
+              "TORONTO_DBT_AS_OF_DATE": datetime.now(timezone.utc).date().isoformat(),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for name, value in values.items():
+                  env.write(f"{name}={value}\n")
+
+          connection = snowflake.connector.connect(
+              account=values["SNOWFLAKE_ACCOUNT"],
+              user=values["SNOWFLAKE_USER"],
+              private_key_file=str(key_path),
+              role="TORONTO_DBT_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  "SELECT SCHEMA_NAME "
+                  "FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
+                  "WHERE SCHEMA_NAME IN (%s, %s)",
+                  ("RAW", "ANALYTICS"),
+              )
+              schemas = {str(row[0]).upper() for row in cursor.fetchall()}
+              missing_schemas = {"RAW", "ANALYTICS"} - schemas
+              if missing_schemas:
+                  raise ValueError(f"Required schemas are missing: {sorted(missing_schemas)}")
+
+              cursor.execute(
+                  "SELECT TABLE_NAME "
+                  "FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  ("RAW",),
+              )
+              raw_names = {str(row[0]).upper() for row in cursor.fetchall()}
+              required_raw = {"RAW_ACTIVE_PERMITS", "RAW_CLEARED_PERMITS"}
+              missing_raw = required_raw - raw_names
+              if missing_raw:
+                  raise ValueError(f"Required raw tables are missing: {sorted(missing_raw)}")
+
+              for table in sorted(required_raw):
+                  cursor.execute(
+                      f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL) "
+                      f"FROM TORONTO.RAW.{table}"
+                  )
+                  total, current = cursor.fetchone()
+                  if not total or not current:
+                      raise ValueError(
+                          f"TORONTO.RAW.{table} has no rows or no current SCD2 rows: "
+                          f"total={total}, current={current}"
+                      )
+                  print(f"TORONTO.RAW.{table}: {total:,} historical / {current:,} current rows")
+
+              expected_models = {
+                  "STG_ACTIVE_PERMITS",
+                  "STG_CLEARED_PERMITS",
+                  "FCT_ACTIVE_PERMIT_REVISION",
+                  "FCT_CLEARED_PERMIT_REVISION",
+                  "DIM_DATE",
+                  "DIM_PERMIT_TYPE",
+                  "MART_ACTIVE_PERMIT_AGE",
+                  "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+              }
+              cursor.execute(
+                  "SELECT TABLE_NAME "
+                  "FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  ("ANALYTICS",),
+              )
+              existing = {str(row[0]).upper() for row in cursor.fetchall()}
+              unexpected = existing - expected_models
+              if unexpected:
+                  raise ValueError(
+                      "Refusing to build because TORONTO.ANALYTICS contains "
+                      f"unexpected objects: {sorted(unexpected)}"
+                  )
+              print(
+                  "Serving schema preflight passed. Existing project models, "
+                  "if any, may be rebuilt."
+              )
+          finally:
+              cursor.close()
+              connection.close()
+          PY
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt packages
+        working-directory: dbt
+        run: dbt deps --profiles-dir .
+
+      - name: Verify Snowflake connection and parse project
+        working-directory: dbt
+        run: |
+          dbt debug --profiles-dir . --target snowflake
+          dbt parse --profiles-dir . --target snowflake
+
+      - name: Check raw source freshness
+        working-directory: dbt
+        run: dbt freshness --profiles-dir . --target snowflake
+
+      - name: Build models and run dbt tests in serving schema
+        working-directory: dbt
+        run: |
+          dbt build \
+            --profiles-dir . \
+            --target snowflake \
+            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
+
+      - name: Verify dashboard relations and non-empty results
+        run: |
+          python - <<'PY'
+          import os
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_DBT_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+              schema="ANALYTICS",
+          )
+          cursor = connection.cursor()
+          try:
+              required = (
+                  "MART_ACTIVE_PERMIT_AGE",
+                  "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "FCT_CLEARED_PERMIT_REVISION",
+              )
+              cursor.execute(
+                  "SELECT TABLE_NAME "
+                  "FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  ("ANALYTICS",),
+              )
+              available = {str(row[0]).upper() for row in cursor.fetchall()}
+              missing = set(required) - available
+              if missing:
+                  raise ValueError(f"Serving relations are missing: {sorted(missing)}")
+
+              for table in required:
+                  cursor.execute(f"SELECT COUNT(*) FROM TORONTO.ANALYTICS.{table}")
+                  count = int(cursor.fetchone()[0])
+                  if count == 0:
+                      raise ValueError(f"Serving relation is empty: {table}")
+                  print(f"TORONTO.ANALYTICS.{table}: {count:,} rows")
+              print("Snowflake serving-schema build and relation checks passed.")
+          finally:
+              cursor.close()
+              connection.close()
+          PY
