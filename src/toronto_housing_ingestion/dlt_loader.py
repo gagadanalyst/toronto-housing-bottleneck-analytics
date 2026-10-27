@@ -41,7 +41,9 @@ def _destination(kind: str, credentials: str) -> Any:
     if kind == "snowflake":
         from dlt.destinations import snowflake
 
-        return snowflake(credentials=credentials)
+        # Keep dlt's staging schema aligned with the migrated TIMESTAMP_LTZ contract.
+        # This option is supported by the project's new dlt 1.31.0 pin.
+        return snowflake(credentials=credentials, use_timestamp_tz=False)
     raise ValueError(f"Unsupported warehouse destination: {kind}")
 
 
@@ -100,9 +102,38 @@ def _iter_snapshot_rows(
             yield row
 
 
+_HASH_FLOAT_FIELDS = frozenset(
+    {
+        "ASSEMBLY",
+        "BUSINESS_AND_PERSONAL_SERVICES",
+        "DEMOLITION",
+        "INDUSTRIAL",
+        "INSTITUTIONAL",
+        "INTERIOR_ALTERATIONS",
+        "MERCANTILE",
+        "RESIDENTIAL",
+    }
+)
+
+
 def _row_hash(row: dict[str, Any]) -> str:
-    """Return a stable hash of source attributes, excluding the unstable _id."""
-    tracked = {key: value for key, value in row.items() if key != "_id"}
+    """Hash source attributes using legacy-compatible numeric normalization."""
+    tracked = {}
+
+    for key, value in row.items():
+        if key == "_id":
+            continue
+
+        if (
+            key.upper() in _HASH_FLOAT_FIELDS
+            and value is not None
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            value = float(value)
+
+        tracked[key] = value
+
     payload = json.dumps(
         tracked,
         sort_keys=True,
@@ -119,6 +150,7 @@ def load_scd2(
     source: SourceConfig,
     dataset_name: str,
     destination_kind: str,
+    preserve_row_hash: bool = False,
 ) -> LoadResult:
     """Load a full Parquet snapshot using ``source.warehouse_strategy``.
 
@@ -126,6 +158,10 @@ def load_scd2(
     work. For ``scd2``, the configured primary key and row hash maintain history.
     For ``replace``, the destination table is replaced by the latest snapshot,
     without applying a dlt primary-key hint.
+
+    ``preserve_row_hash`` is an opt-in for controlled continuity fixtures that
+    carry stored hashes from the migrated warehouse. Normal ingestion leaves it
+    disabled and computes hashes from source snapshot attributes as before.
 
     If the source config has ``warehouse_since`` and ``warehouse_date_column``,
     only rows on or after that date are sent to the warehouse.
@@ -141,6 +177,8 @@ def load_scd2(
         )
     if strategy == "scd2" and not source.primary_key:
         raise ValueError(f"{source.name}: primary_key is required for SCD2.")
+    if preserve_row_hash and strategy != "scd2":
+        raise ValueError("preserve_row_hash is supported only for SCD2 snapshots.")
 
     path = Path(snapshot_path)
     if not path.is_file():
@@ -158,7 +196,21 @@ def load_scd2(
             path, source.warehouse_date_column, source.warehouse_since
         ):
             if strategy == "scd2":
-                row["row_hash"] = _row_hash(row)
+                if preserve_row_hash:
+                    hash_key = next(
+                        (key for key in row if key.lower() == "row_hash"), None
+                    )
+                    supplied_hash = row.get(hash_key) if hash_key is not None else None
+                    if not isinstance(supplied_hash, str) or not supplied_hash:
+                        raise ValueError(
+                            f"{source.name}: preserve_row_hash=True requires a non-empty "
+                            "string row_hash in every snapshot row."
+                        )
+                    if hash_key != "row_hash":
+                        row.pop(hash_key)
+                        row["row_hash"] = supplied_hash
+                else:
+                    row["row_hash"] = _row_hash(row)
             yield row
 
     resource = rows()

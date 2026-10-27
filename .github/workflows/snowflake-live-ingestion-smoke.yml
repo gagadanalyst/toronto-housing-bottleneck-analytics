@@ -1,0 +1,106 @@
+name: Snowflake Snapshot Baseline and Replay
+
+# Consume a completed main-branch CD run's exact Parquet bundle. This workflow
+# does not call CKAN and never writes to TORONTO.RAW.
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_run_id:
+        description: Successful main-branch CD run ID that published the snapshot bundle
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: toronto-snowflake-snapshot-baseline-${{ inputs.snapshot_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    name: Load and replay an exact validated source snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TORONTO_WAREHOUSE_KIND: snowflake
+      TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id }}
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
+      SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install the Snowflake destination
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[snowflake]"
+
+      - name: Validate source CD run and required settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS"):
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+
+          result = subprocess.run(
+              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
+               "--json", "name,status,conclusion,headBranch,headSha,event"],
+              check=True, capture_output=True, text=True,
+          )
+          run = json.loads(result.stdout)
+          expected = {
+              "name": "CD", "status": "completed", "conclusion": "success",
+              "headBranch": "main", "event": "workflow_run",
+          }
+          mismatches = {
+              key: (expected_value, run.get(key))
+              for key, expected_value in expected.items()
+              if run.get(key) != expected_value
+          }
+          if mismatches:
+              raise ValueError(f"Selected run is not a successful main-branch CD run: {mismatches}")
+          if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("headSha", ""))):
+              raise ValueError("Selected CD run did not return a valid source commit SHA.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={run['headSha']}\n")
+          print(f"Verified successful CD run {run_id} on main at {run['headSha']}.")
+          PY
+
+      - name: Download the exact validated snapshot bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/snapshot-download
+          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
+            --dir data/snapshot-download
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("data/snapshot-download/toronto-snapshot-bundle.zip")
+          if not path.is_file() or path.stat().st_size == 0:
+              raise ValueError(f"Snapshot bundle was not downloaded: {path}")
+          print(f"Downloaded snapshot bundle: {path} ({path.stat().st_size:,} bytes)")
+          PY
+
+      - name: Initialize or verify the baseline and replay it once
+        run: python scripts/snowflake_snapshot_baseline.py

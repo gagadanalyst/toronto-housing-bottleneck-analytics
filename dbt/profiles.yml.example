@@ -6,3 +6,14 @@ toronto_housing_analytics:
       path: "{{ env_var('DBT_DUCKDB_PATH') }}"
       schema: analytics
       threads: 4
+
+    snowflake:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: TORONTO_DBT_ROLE
+      warehouse: TORONTO_XS_WH
+      database: TORONTO
+      schema: ANALYTICS
+      threads: 4

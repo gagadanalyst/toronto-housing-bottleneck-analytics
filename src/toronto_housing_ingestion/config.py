@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -245,8 +246,17 @@ def load_config(path: Path) -> AppConfig:
         timeout_seconds=int(ckan["timeout_seconds"]),
         retries=int(ckan["retries"]),
         page_size=int(ckan["page_size"]),
-        warehouse_kind=str(warehouse.get("kind", "duckdb")).lower(),
-        warehouse_credentials=str(warehouse["credentials"]),
-        dataset_name=str(warehouse["dataset_name"]),
+        warehouse_kind=os.getenv(
+            "TORONTO_WAREHOUSE_KIND",
+            str(warehouse.get("kind", "duckdb")),
+        ).lower(),
+        warehouse_credentials=os.getenv(
+            "TORONTO_WAREHOUSE_CREDENTIALS",
+            str(warehouse["credentials"]),
+        ),
+        dataset_name=os.getenv(
+            "TORONTO_WAREHOUSE_DATASET",
+            str(warehouse["dataset_name"]),
+        ),
         sources=sources,
     )

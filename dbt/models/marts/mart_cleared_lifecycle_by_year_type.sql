@@ -40,14 +40,27 @@ summary AS (
         permit_type,
         measure,
         COUNT(duration_days) AS eligible_date_pairs,
-        SUM(CASE WHEN duration_days < 0 THEN 1 ELSE 0 END)
-            AS negative_interval_count,
-        SUM(CASE WHEN duration_days >= 0 THEN 1 ELSE 0 END)
-            AS publishable_duration_count,
-        MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
-            AS median_days,
-        PERCENTILE_CONT(0.90) WITHIN GROUP (
-            ORDER BY CASE WHEN duration_days >= 0 THEN duration_days END
+        CAST(
+            SUM(CASE WHEN duration_days < 0 THEN 1 ELSE 0 END)
+            AS BIGINT
+        ) AS negative_interval_count,
+        CAST(
+            SUM(CASE WHEN duration_days >= 0 THEN 1 ELSE 0 END)
+            AS BIGINT
+        ) AS publishable_duration_count,
+        CAST(
+            MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
+            AS DOUBLE
+        ) AS median_days,
+        CAST(
+            ROUND(
+                PERCENTILE_CONT(0.90) WITHIN GROUP (
+                    ORDER BY CASE
+                        WHEN duration_days >= 0 THEN duration_days
+                    END
+                ),
+                2
+            ) AS DOUBLE
         ) AS p90_days,
         MAX(CASE WHEN duration_days >= 0 THEN duration_days END) AS max_days
     FROM duration_rows
@@ -57,9 +70,11 @@ summary AS (
 
 SELECT
     *,
-    ROUND(
-        100.0 * negative_interval_count
-        / NULLIF(eligible_date_pairs, 0),
-        2
+    CAST(
+        ROUND(
+            100.0 * negative_interval_count
+            / NULLIF(eligible_date_pairs, 0),
+            2
+        ) AS DOUBLE
     ) AS negative_interval_rate_pct
 FROM summary

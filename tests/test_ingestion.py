@@ -126,6 +126,32 @@ def test_fallback_tries_next_resource() -> None:
     assert result[1] == 2
 
 
+def test_fallback_rejects_incomplete_candidate_and_tries_next() -> None:
+    class FakeClient:
+        def fallback_resources(self, package):
+            return [
+                {
+                    "id": "dump",
+                    "name": "datastore dump",
+                    "format": "CSV",
+                    "url": "dump",
+                },
+                {"id": "csv", "name": "published CSV", "format": "CSV", "url": "csv"},
+            ]
+
+        def download_fallback(self, *, resource, **kwargs):
+            return 128_000 if resource["id"] == "dump" else 446_667
+
+        def file_fingerprint(self, resource, package_metadata_modified):
+            return {"resource_id": resource["id"]}
+
+    result = ingestion._run_fallbacks(
+        FakeClient(), {}, source(), Path("out.parquet"), expected_rows=446_667
+    )
+    assert result[0]["id"] == "csv"
+    assert result[1] == 446_667
+
+
 def test_stale_source_is_warning_only() -> None:
     now = datetime(2026, 10, 7, tzinfo=UTC)
     assert (

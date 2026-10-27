@@ -114,3 +114,23 @@ def test_replace_strategy_allows_empty_primary_key(monkeypatch, tmp_path):
 
     assert source.warehouse_strategy == "replace"
     assert source.primary_key == ()
+
+
+def test_load_config_supports_warehouse_environment_overrides(monkeypatch) -> None:
+    import toronto_housing_ingestion.config as config_module
+
+    monkeypatch.setattr(config_module.sys, "version_info", (3, 14, 0))
+    monkeypatch.setattr(config_module.sys, "version", "3.14.0")
+    monkeypatch.setenv("TORONTO_WAREHOUSE_KIND", "snowflake")
+    monkeypatch.setenv(
+        "TORONTO_WAREHOUSE_CREDENTIALS",
+        "snowflake://smoke_user:smoke_password@example-account/TORONTO"
+        "?warehouse=TORONTO_XS_WH&role=TORONTO_INGEST_ROLE",
+    )
+    monkeypatch.setenv("TORONTO_WAREHOUSE_DATASET", "SNOWFLAKE_SMOKE")
+
+    app = load_config(Path("open_data_config.yml"))
+
+    assert app.warehouse_kind == "snowflake"
+    assert app.warehouse_credentials.startswith("snowflake://smoke_user:")
+    assert app.dataset_name == "SNOWFLAKE_SMOKE"

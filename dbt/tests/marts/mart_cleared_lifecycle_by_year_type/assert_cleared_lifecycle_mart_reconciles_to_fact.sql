@@ -42,9 +42,12 @@ expected AS (
         ) AS negative_interval_rate_pct,
         MEDIAN(CASE WHEN duration_days >= 0 THEN duration_days END)
             AS median_days,
-        PERCENTILE_CONT(0.90) WITHIN GROUP (
-            ORDER BY CASE WHEN duration_days >= 0
-                THEN duration_days END
+        ROUND(
+            PERCENTILE_CONT(0.90) WITHIN GROUP (
+                ORDER BY CASE WHEN duration_days >= 0
+                    THEN duration_days END
+            ),
+            2
         ) AS p90_days,
         MAX(CASE WHEN duration_days >= 0 THEN duration_days END)
             AS max_days
