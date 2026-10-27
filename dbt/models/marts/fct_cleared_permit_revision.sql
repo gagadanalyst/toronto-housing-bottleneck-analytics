@@ -20,8 +20,10 @@ revision_level AS (
         revision_num,
         permit_type,
         COUNT(*) AS current_source_row_count,
-        {{ ordered_distinct_string_agg('builder_name', "' | '", 'builder_name') }}
-            AS observed_builder_names,
+        NULLIF(
+            {{ ordered_distinct_string_agg('builder_name', "' | '", 'builder_name') }},
+            ''
+        ) AS observed_builder_names,
         CASE
             WHEN
                 COUNT(DISTINCT builder_name) > 1

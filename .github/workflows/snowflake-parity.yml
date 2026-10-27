@@ -1,0 +1,286 @@
+name: DuckDB and Snowflake Parity Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_run_id:
+        description: Successful main-branch CD run ID used for both fresh baselines
+        required: true
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/snowflake-parity.yml"
+      - "scripts/prepare_duckdb_parity_baseline.py"
+      - "scripts/compare_duckdb_snowflake_parity.py"
+      - "dbt/**"
+      - "pyproject.toml"
+      - "open_data_config.yml"
+      - "src/toronto_housing_ingestion/**"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: toronto-snowflake-parity-${{ inputs.snapshot_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+    name: Compare equivalent DuckDB and Snowflake dbt outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      # The default is a one-time parity audit against the current validated
+      # baseline during this PR. Manual runs must supply their own CD run ID.
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id || '40470002594' }}
+      TORONTO_WAREHOUSE_KIND: duckdb
+      TORONTO_WAREHOUSE_CREDENTIALS: ${{ github.workspace }}/data/warehouse/parity/toronto.duckdb
+      TORONTO_WAREHOUSE_DATASET: raw
+      DBT_DUCKDB_PATH: ${{ github.workspace }}/data/warehouse/parity/toronto.duckdb
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Validate source CD run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not os.environ.get("SNOWFLAKE_DLT_CONNECTION"):
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+          result = subprocess.run(
+              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
+               "--json", "name,status,conclusion,headBranch,headSha,event"],
+              check=True, capture_output=True, text=True,
+          )
+          run = json.loads(result.stdout)
+          expected = {
+              "name": "CD", "status": "completed", "conclusion": "success",
+              "headBranch": "main", "event": "workflow_run",
+          }
+          mismatches = {key: (value, run.get(key)) for key, value in expected.items() if run.get(key) != value}
+          if mismatches:
+              raise ValueError(f"Selected run is not a successful main-branch CD run: {mismatches}")
+          if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("headSha", ""))):
+              raise ValueError("Selected CD run has an invalid source commit SHA.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={run['headSha']}\n")
+          print(f"Verified CD run {run_id} at {run['headSha']}.")
+          PY
+
+      - name: Download the exact validated snapshot bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/snapshot-download data/warehouse/parity
+          test ! -e "$DBT_DUCKDB_PATH"
+          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
+            --dir data/snapshot-download
+          test -s data/snapshot-download/toronto-snapshot-bundle.zip
+
+      - name: Install ingestion and dbt dependencies
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[dev]"
+          python -m pip install -r dbt/requirements.txt
+          python -m pip install "snowflake-connector-python[secure-local-storage]==4.8.1"
+
+      - name: Build a fresh DuckDB baseline from the same Parquet bundle
+        run: python scripts/prepare_duckdb_parity_baseline.py
+
+      - name: Configure dbt profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Build DuckDB dbt models with the shared as_of_date
+        working-directory: dbt
+        run: |
+          dbt deps --profiles-dir .
+          dbt build --profiles-dir . --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
+
+      - name: Prepare temporary Snowflake key and connection settings
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          from urllib.parse import parse_qs, unquote, urlsplit
+
+          uri = os.environ["SNOWFLAKE_DLT_CONNECTION"]
+          parts = urlsplit(uri)
+          params = parse_qs(parts.query)
+          if parts.scheme != "snowflake" or not parts.hostname or not parts.username:
+              raise ValueError("Snowflake connection URI is invalid.")
+          if "private_key" not in params:
+              raise ValueError("Connection URI has no private_key parameter.")
+          key_path = Path(os.environ["RUNNER_TEMP"]) / "snowflake_key.p8"
+          key_path.write_bytes(base64.b64decode(params["private_key"][0]))
+          key_path.chmod(0o600)
+          values = {
+              "SNOWFLAKE_ACCOUNT": parts.hostname,
+              "SNOWFLAKE_USER": unquote(parts.username),
+              "SNOWFLAKE_PRIVATE_KEY_PATH": str(key_path),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+          PY
+
+      - name: Prepare isolated Snowflake parity target and grant dbt access
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import snowflake.connector
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          workflow_run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not re.fullmatch(r"[0-9]+", workflow_run_id):
+              raise ValueError("GitHub workflow run ID must contain digits only.")
+          if not re.fullmatch(r"[0-9]+", attempt):
+              raise ValueError("GitHub workflow attempt must contain digits only.")
+
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}"
+          target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
+
+          values = {
+              "TORONTO_DBT_SOURCE_SCHEMA": source_schema,
+              "TORONTO_DBT_TARGET_SCHEMA": target_schema,
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_INGEST_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  "SELECT TABLE_NAME FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  (source_schema,),
+              )
+              existing = {str(row[0]).upper() for row in cursor.fetchall()}
+              required = {"RAW_ACTIVE_PERMITS", "RAW_CLEARED_PERMITS"}
+              missing = sorted(required - existing)
+              if missing:
+                  raise ValueError(
+                      f"Source baseline TORONTO.{source_schema} "
+                      f"is missing tables: {missing}"
+                  )
+
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{source_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT SELECT ON ALL TABLES IN SCHEMA TORONTO.{source_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"CREATE SCHEMA IF NOT EXISTS TORONTO.{target_schema}"
+              )
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{target_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT CREATE TABLE, CREATE VIEW ON SCHEMA TORONTO.{target_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+          finally:
+              cursor.close()
+              connection.close()
+
+          print(f"Snowflake source schema: TORONTO.{source_schema}")
+          print(f"Isolated Snowflake target schema: TORONTO.{target_schema}")
+          PY
+
+      - name: Build Snowflake dbt models from the same PR code and snapshot
+        working-directory: dbt
+        run: |
+          vars_json="$(printf '{"as_of_date":"%s"}' "$TORONTO_DBT_AS_OF_DATE")"
+          dbt build \
+            --profiles-dir . \
+            --target snowflake \
+            --vars "$vars_json"
+
+      - name: Compare model schemas, grains, row values, and dashboard metrics
+        run: python scripts/compare_duckdb_snowflake_parity.py
+
+      - name: Upload parity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: duckdb-snowflake-parity-${{ github.run_id }}
+          path: |
+            duckdb-snowflake-parity-report.json
+            duckdb-parity-baseline.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up isolated Snowflake parity target
+        if: ${{ always() }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          target_schema = os.environ.get("TORONTO_DBT_TARGET_SCHEMA")
+          if not target_schema:
+              print("No parity target schema was registered; skipping cleanup.")
+              raise SystemExit(0)
+
+          if not re.fullmatch(r"ANALYTICS_PARITY_[0-9]+_[0-9]+", target_schema):
+              raise ValueError("Unexpected Snowflake parity target schema.")
+
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_INGEST_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(f"DROP SCHEMA IF EXISTS TORONTO.{target_schema}")
+          finally:
+              cursor.close()
+              connection.close()
+          PY
