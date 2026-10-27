@@ -1,0 +1,124 @@
+name: Snowflake Canonical RAW Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_run_id:
+        description: Successful, recent main-branch CD run that published the snapshot bundle
+        required: true
+        type: string
+      confirm_canonical_raw:
+        description: Confirm this run may update SCD2 history in TORONTO.RAW
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: toronto-snowflake-canonical-raw-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.ref == 'refs/heads/main'
+    name: Refresh and verify canonical Snowflake RAW
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TORONTO_WAREHOUSE_KIND: snowflake
+      TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      TORONTO_WAREHOUSE_DATASET: RAW
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
+      SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DO_NOT_TRACK: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require explicit canonical RAW confirmation
+        env:
+          CONFIRM_CANONICAL_RAW: ${{ inputs.confirm_canonical_raw }}
+        run: |
+          if [ "$CONFIRM_CANONICAL_RAW" != "true" ]; then
+            echo "Refusing to write canonical SCD2 tables in TORONTO.RAW without explicit confirmation."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install Snowflake-enabled ingestion package
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[snowflake]"
+
+      - name: Validate successful main-branch CD run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS"):
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+
+          result = subprocess.run(
+              [
+                  "gh", "run", "view", run_id,
+                  "--repo", os.environ["GITHUB_REPOSITORY"],
+                  "--json", "name,status,conclusion,headBranch,headSha,event",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          run = json.loads(result.stdout)
+          expected = {
+              "name": "CD",
+              "status": "completed",
+              "conclusion": "success",
+              "headBranch": "main",
+              "event": "workflow_run",
+          }
+          mismatches = {
+              key: (wanted, run.get(key))
+              for key, wanted in expected.items()
+              if run.get(key) != wanted
+          }
+          if mismatches:
+              raise ValueError(
+                  f"Selected run is not a successful main-branch CD run: {mismatches}"
+              )
+          commit = str(run.get("headSha", ""))
+          if not re.fullmatch(r"[0-9a-f]{40}", commit):
+              raise ValueError("Selected CD run did not return a valid source commit SHA.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={commit}\n")
+          print(f"Verified successful CD run {run_id} on main at {commit}.")
+          PY
+
+      - name: Download the exact validated snapshot bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/snapshot-download
+          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
+            --dir data/snapshot-download
+          test -s "$SNAPSHOT_BUNDLE_PATH"
+
+      - name: Refresh canonical SCD2 tables and verify load metadata
+        run: python scripts/snowflake_refresh_raw.py
