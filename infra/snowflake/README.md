@@ -104,3 +104,107 @@ Snowflake dbt validation has passed, and live Active/Cleared ingestion with
 two identical replays has passed in an isolated schema. Analytical parity,
 migrated-history continuity, and the production cutover/recovery review remain
 separate acceptance steps. These tests have not switched production CI/CD to Snowflake.
+
+
+## Streamlit dashboard reader
+
+The dashboard can use either the published DuckDB database or the Snowflake
+analytics marts. DuckDB remains the default. The public dashboard must not be
+switched to Snowflake until its service-user permissions and live read path
+have been verified.
+
+### 1. Prepare read-only grants
+
+Review `40_dashboard_read_only_role.sql` and execute it deliberately in
+Snowsight as `ACCOUNTADMIN`.
+
+The `TORONTO_DASHBOARD_ROLE` role is intended to have:
+
+- `USAGE` on `TORONTO`, `TORONTO.ANALYTICS`, and `TORONTO_XS_WH`.
+- `SELECT` only on the three dashboard-facing relations listed in Step 4.
+- No access to `TORONTO.RAW` and no privileges to create, update, or delete
+  analytical data.
+
+Run the grants script only after all three relations exist in
+`TORONTO.ANALYTICS`. Recheck these object-level grants after dbt rebuilds and
+reapply them when necessary. The script does not create a login user or
+configure authentication.
+
+### 2. Configure a dedicated dashboard service user
+
+Create or provision a dedicated Snowflake service user using the account's
+approved identity and authentication practices. Assign
+`TORONTO_DASHBOARD_ROLE` as its default role and configure key-pair
+authentication for that user.
+
+Do not reuse the ingestion or dbt service identity merely for convenience.
+
+Keep the private key outside source control. Store it only in the deployment's
+secret manager. If the private key is encrypted, store its passphrase as a
+separate secret as well.
+
+### 3. Configure Streamlit secrets
+
+The dashboard reader expects the following settings. Add them using the
+deployment's secret-management interface, not in a committed file:
+
+```toml
+DASHBOARD_BACKEND = "snowflake"
+
+[snowflake]
+account = "<your Snowflake account identifier>"
+user = "<dedicated dashboard service user>"
+private_key = """-----BEGIN PRIVATE KEY-----
+<private key contents>
+-----END PRIVATE KEY-----"""
+warehouse = "TORONTO_XS_WH"
+role = "TORONTO_DASHBOARD_ROLE"
+database = "TORONTO"
+schema = "ANALYTICS"
+
+# Include this only if the key is encrypted:
+# private_key_password = "<private key passphrase>"
+```
+
+Use the actual account identifier and service-user name provisioned for this
+project. Never commit real credentials or private-key material.
+
+`DASHBOARD_BACKEND` can also be set as a deployment environment variable.
+That environment value takes precedence over the Streamlit secrets value.
+
+Supported values are `duckdb` and `snowflake`. If the setting is omitted,
+the dashboard uses DuckDB.
+
+### 4. Verify access before switching the dashboard
+
+After configuring the service user and role, verify the grants in Snowsight
+or with an authorized administrator.
+
+When ready to test the dashboard identity, run read-only queries that confirm
+access to all three required relations:
+
+- `TORONTO.ANALYTICS.MART_ACTIVE_PERMIT_AGE`
+- `TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE`
+- `TORONTO.ANALYTICS.FCT_CLEARED_PERMIT_REVISION`
+
+For example, verify that `SELECT COUNT(*)` succeeds against each relation.
+These queries can resume the warehouse and incur compute charges, so run
+them deliberately. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE`
+during the test.
+
+The Streamlit reader checks that these relations exist, reads only the
+dashboard-facing marts, and closes its connection after the read. A missing
+relation, denied permission, or connection error is displayed; the app does
+not silently substitute data from DuckDB.
+
+### 5. Switch back to DuckDB
+
+To return to the published DuckDB release, set `DASHBOARD_BACKEND` to
+`duckdb`, or remove the setting to use the default.
+
+No dbt transformation or application-code rewrite is required. Confirm the
+dashboard can load the published release before considering Snowflake access
+retired.
+
+Keep DuckDB as the production default until Snowflake serving has been tested
+successfully and the operational switch-back procedure has been verified.

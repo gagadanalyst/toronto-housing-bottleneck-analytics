@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
@@ -11,6 +14,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from backend_config import resolve_dashboard_backend
+from snowflake_backend import load_snowflake_dashboard_data
+from streamlit.errors import StreamlitSecretNotFoundError
 
 st.set_page_config(
     page_title="Toronto Housing Bottleneck Analytics",
@@ -165,9 +171,51 @@ def download_release_database(destination: Path) -> int:
     return downloaded
 
 
+def selected_dashboard_backend() -> str:
+    """Resolve the explicit backend setting; DuckDB is the default."""
+    environment_backend = os.environ.get("DASHBOARD_BACKEND")
+    if environment_backend is not None:
+        return resolve_dashboard_backend(environment_backend)
+
+    try:
+        secrets_backend = st.secrets.get("DASHBOARD_BACKEND", "duckdb")
+    except StreamlitSecretNotFoundError:
+        secrets_backend = "duckdb"
+
+    return resolve_dashboard_backend(None, secrets_backend)
+
+
+def snowflake_dashboard_settings() -> dict[str, Any]:
+    """Read Snowflake connection settings without exposing them to the UI."""
+    try:
+        settings = st.secrets["snowflake"]
+    except StreamlitSecretNotFoundError as exc:
+        raise RuntimeError(
+            "Snowflake is selected, but Streamlit secrets are unavailable. "
+            "Configure the [snowflake] secrets section before using this backend."
+        ) from exc
+    except KeyError as exc:
+        raise RuntimeError(
+            "Snowflake is selected, but the [snowflake] secrets section is missing."
+        ) from exc
+
+    return dict(settings)
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=1, show_spinner=False)
-def load_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int]]:
-    """Download warehouse-latest once per cache window and query the dbt marts."""
+def load_dashboard_data(
+    backend: str = "duckdb", config_fingerprint: str = ""
+) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int]]:
+    """Load dashboard data from the explicitly selected backend.
+
+    config_fingerprint participates in Streamlit's cache key so a change to
+    Snowflake connection settings cannot reuse results from the prior settings.
+    """
+    if backend == "snowflake":
+        return load_snowflake_dashboard_data(snowflake_dashboard_settings())
+    if backend != "duckdb":
+        raise ValueError("Unsupported dashboard backend.")
+
     with TemporaryDirectory(prefix="toronto-housing-dashboard-") as temp_dir:
         # Keep the filename aligned with the dbt warehouse/catalog name.
         database_path = Path(temp_dir) / "toronto.duckdb"
@@ -324,21 +372,34 @@ def selected_or_all(
     return df[df[column].astype(str).isin(selection)]
 
 
-def report_sidebar() -> tuple[str, Any]:
+def report_sidebar(backend: str) -> tuple[str, Any]:
     with st.sidebar:
         st.markdown("## 🏙️ Toronto Permits")
         st.caption("Understanding permit timelines")
         page = st.radio("Explore", NAV, label_visibility="collapsed")
         st.divider()
         st.markdown("**Where the data comes from**")
-        st.markdown(f"[Latest published database on GitHub ↗]({RELEASE_PAGE_URL})")
-        st.caption(
-            "The dashboard uses Toronto Open Data processed by this project's daily pipeline."
-        )
+        if backend == "snowflake":
+            st.caption(
+                "Reads the dashboard-facing dbt marts in TORONTO.ANALYTICS "
+                "using the configured Snowflake role."
+            )
+        else:
+            st.markdown(
+                f"[Latest published DuckDB database on GitHub ↗]({RELEASE_PAGE_URL})"
+            )
+            st.caption(
+                "The dashboard uses Toronto Open Data processed by this project's daily pipeline."
+            )
         if st.button(
             "Refresh data now",
             width="stretch",
-            help="Fetch the latest published database from GitHub. The file is about 120 MB.",
+            help=(
+                "Re-query the Snowflake dashboard marts."
+                if backend == "snowflake"
+                else "Fetch the latest published database from GitHub. "
+                "The file is about 120 MB."
+            ),
         ):
             load_dashboard_data.clear()
             st.session_state["refresh_published_data"] = True
@@ -911,12 +972,35 @@ def quality_page(
 
 
 def main() -> None:
-    page, loading_slot = report_sidebar()
+    try:
+        backend = selected_dashboard_backend()
+        snowflake_config = (
+            snowflake_dashboard_settings() if backend == "snowflake" else {}
+        )
+        config_fingerprint = (
+            hashlib.sha256(
+                json.dumps(snowflake_config, sort_keys=True, default=str).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if backend == "snowflake"
+            else ""
+        )
+    except Exception as exc:
+        st.error("The dashboard backend configuration could not be loaded.")
+        with st.expander("Technical details"):
+            st.code(f"{type(exc).__name__}: {exc}")
+        st.stop()
+
+    page, loading_slot = report_sidebar(backend)
     force_refresh = bool(st.session_state.pop("refresh_published_data", False))
     last_loaded_at = float(st.session_state.get("_dashboard_loaded_at", 0.0))
     cache_may_have_expired = (time() - last_loaded_at) >= CACHE_TTL_SECONDS
+    backend_key = (backend, config_fingerprint)
+    backend_changed = st.session_state.get("_dashboard_backend_key") != backend_key
     show_loading_status = (
         force_refresh
+        or backend_changed
         or not st.session_state.get("_dashboard_loaded", False)
         or cache_may_have_expired
     )
@@ -924,25 +1008,32 @@ def main() -> None:
     try:
         if show_loading_status:
             status_label = (
-                "Refreshing published data…"
+                "Refreshing dashboard data…"
                 if force_refresh
-                else "Preparing dashboard data…"
+                else f"Preparing {backend} dashboard data…"
             )
             # The placeholder is positioned immediately below the refresh button.
             # This puts the active loader beside the control users just clicked.
             with loading_slot.container():
                 with st.status(status_label, expanded=True) as status:
-                    if force_refresh:
+                    if backend == "snowflake":
                         st.write(
-                            "Downloading the latest published database from GitHub. It is about 120 MB, so this can take a minute."
+                            "Querying the Snowflake dashboard marts using read-only access."
+                        )
+                    elif force_refresh:
+                        st.write(
+                            "Downloading the latest published database from GitHub. "
+                            "It is about 120 MB, so this can take a minute."
                         )
                     else:
                         st.write(
-                            "Checking the published data. The first load may download a database of about 120 MB; later page changes usually use cached results."
+                            "Checking the published data. The first load may download "
+                            "a database of about 120 MB; later page changes usually "
+                            "use cached results."
                         )
                     try:
                         active, summary, cleared_count, cleared_flag_counts = (
-                            load_dashboard_data()
+                            load_dashboard_data(backend, config_fingerprint)
                         )
                     except Exception:
                         status.update(
@@ -959,16 +1050,28 @@ def main() -> None:
         else:
             # Normal filter/navigation reruns use the cache without flashing a
             # loader. A first load and every manual refresh show the status above.
-            active, summary, cleared_count, cleared_flag_counts = load_dashboard_data()
+            active, summary, cleared_count, cleared_flag_counts = load_dashboard_data(
+                backend, config_fingerprint
+            )
         st.session_state["_dashboard_loaded"] = True
+        st.session_state["_dashboard_backend_key"] = backend_key
         if show_loading_status:
             st.session_state["_dashboard_loaded_at"] = time()
     except Exception as exc:
-        st.error("The dashboard could not load the published permit data.")
-        st.markdown(
-            "Check your connection and try **Refresh data now**. The app downloads the latest published database from the public "
-            f"[GitHub release]({RELEASE_PAGE_URL})."
-        )
+        st.error("The dashboard could not load the selected backend's permit data.")
+        if backend == "duckdb":
+            st.markdown(
+                "Check your connection and try **Refresh data now**. The app downloads "
+                "the latest published database from the public "
+                f"[GitHub release]({RELEASE_PAGE_URL})."
+            )
+        else:
+            st.markdown(
+                "Check the Snowflake connection settings, the dashboard role's "
+                "read-only grants, and whether all three required dbt relations "
+                "exist in the configured analytics schema. The app will not silently "
+                "switch to DuckDB when Snowflake fails."
+            )
         with st.expander("Technical details"):
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
