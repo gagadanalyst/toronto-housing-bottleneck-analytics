@@ -214,6 +214,23 @@ def test_validator_rejects_missing_required_column(tmp_path: Path) -> None:
         _validate(bundle_path, tmp_path)
 
 
+def test_connection_options_restore_unescaped_plus_in_base64_private_key(
+    tmp_path: Path,
+) -> None:
+    key_path = tmp_path / "snowflake_key.p8"
+
+    options = refresh._snowflake_connection_options(
+        "snowflake://user@account/?private_key=+w==",
+        key_path,
+    )
+
+    assert key_path.read_bytes() == b"\xfb"
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    assert options["account"] == "account"
+    assert options["user"] == "user"
+    assert options["private_key_file"] == str(key_path)
+
+
 class _FakeCursor:
     def __init__(self, context: tuple[str, str, str]) -> None:
         self.context = context

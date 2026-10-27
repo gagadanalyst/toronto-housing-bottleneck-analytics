@@ -194,8 +194,11 @@ def _snowflake_connection_options(credentials: str, key_path: Path) -> dict[str,
         raise ValueError("SNOWFLAKE_DLT_CONNECTION is not a valid Snowflake URI.")
     if "private_key" not in params:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION has no private_key parameter.")
+    # Query-string parsing treats an unescaped '+' as a space. Base64 uses '+',
+    # so restore it before strict decoding; a Base64 value cannot contain spaces.
+    encoded_key = params["private_key"][0].replace(" ", "+")
     try:
-        key_bytes = base64.b64decode(params["private_key"][0], validate=True)
+        key_bytes = base64.b64decode(encoded_key, validate=True)
     except ValueError as exc:
         raise ValueError("Snowflake private_key is not valid base64.") from exc
     if not key_bytes:
