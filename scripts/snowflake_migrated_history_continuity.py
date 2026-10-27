@@ -83,12 +83,14 @@ def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
             for loader in (load_pem_private_key, load_der_private_key):
                 try:
                     key = loader(raw, password=password)
-                    return key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
-                except (TypeError, ValueError):
+                    return key.private_bytes(
+                        Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+                    )
+                except TypeError, ValueError:
                     pass
         try:
             decoded = base64.b64decode(candidate, validate=False)
-        except (ValueError, base64.binascii.Error):
+        except ValueError, base64.binascii.Error:
             continue
         if decoded in attempted:
             continue
@@ -96,8 +98,10 @@ def _decode_private_key(encoded_key: str, passphrase: str | None) -> bytes:
         for loader in (load_pem_private_key, load_der_private_key):
             try:
                 key = loader(decoded, password=password)
-                return key.private_bytes(Encoding.DER, PrivateFormat.PKCS8, NoEncryption())
-            except (TypeError, ValueError):
+                return key.private_bytes(
+                    Encoding.DER, PrivateFormat.PKCS8, NoEncryption()
+                )
+            except TypeError, ValueError:
                 pass
 
     raise ValueError(
@@ -119,7 +123,9 @@ def _connect(uri: str):
         raise ValueError(f"Expected database {DATABASE}; found {database!r}.")
     if not query.get("warehouse") or not query.get("role"):
         raise ValueError("Snowflake URI must specify warehouse and role.")
-    key_der = _decode_private_key(encoded_key, query.get("private_key_passphrase", [None])[0])
+    key_der = _decode_private_key(
+        encoded_key, query.get("private_key_passphrase", [None])[0]
+    )
     return snowflake.connector.connect(
         account=parts.hostname,
         user=unquote(parts.username),
@@ -192,7 +198,9 @@ def _counts(conn, schema: str, table: str) -> tuple[int, int, int]:
         cursor.close()
     result = tuple(int(value or 0) for value in row)
     if result[0] != result[1] + result[2]:
-        raise AssertionError(f"{schema}.{table}: total/current/expired counts do not reconcile: {result}.")
+        raise AssertionError(
+            f"{schema}.{table}: total/current/expired counts do not reconcile: {result}."
+        )
     return result  # type: ignore[return-value]
 
 
@@ -201,7 +209,11 @@ def _row_count(conn, schema: str, table: str) -> int:
         raise ValueError(f"Unexpected metadata table: {table}")
     cursor = conn.cursor()
     try:
-        return int(cursor.execute(f"SELECT COUNT(*) FROM {DATABASE}.{schema}.{table}").fetchone()[0])
+        return int(
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {DATABASE}.{schema}.{table}"
+            ).fetchone()[0]
+        )
     finally:
         cursor.close()
 
@@ -217,7 +229,11 @@ def _duckdb_counts(db: duckdb.DuckDBPyConnection, table: str) -> tuple[int, int,
 
 def _duckdb_row_count(db: duckdb.DuckDBPyConnection, table: str) -> int:
     table = _safe_identifier(table, "DuckDB metadata table")
-    return int(db.execute(f'SELECT COUNT(*) FROM raw.{_quoted_identifier(table)}').fetchone()[0])
+    return int(
+        db.execute(f"SELECT COUNT(*) FROM raw.{_quoted_identifier(table)}").fetchone()[
+            0
+        ]
+    )
 
 
 def _normalized_key(values: tuple[Any, ...]) -> tuple[str | None, ...]:
@@ -237,11 +253,15 @@ def _key_rows(keys: pa.Table) -> list[tuple[Any, ...]]:
     return rows
 
 
-def _values_relation(keys: pa.Table, target_columns: list[str]) -> tuple[str, tuple[Any, ...]]:
+def _values_relation(
+    keys: pa.Table, target_columns: list[str]
+) -> tuple[str, tuple[Any, ...]]:
     """Build a parameterized Snowflake VALUES relation for selected business keys."""
     rows = _key_rows(keys)
     if len(target_columns) != len(keys.schema.names):
-        raise ValueError("Selected-key column count does not match the configured primary key.")
+        raise ValueError(
+            "Selected-key column count does not match the configured primary key."
+        )
     row_placeholder = "(" + ", ".join(["%s"] * len(target_columns)) + ")"
     values_sql = ", ".join([row_placeholder] * len(rows))
     columns_sql = ", ".join(_quoted_identifier(column) for column in target_columns)
@@ -255,7 +275,9 @@ def _selected_snowflake_key_columns(conn, schema: str, source) -> list[str]:
     by_lower = {column.lower(): column for column in _columns(conn, schema, table)}
     missing = [key for key in source.primary_key if key.lower() not in by_lower]
     if missing:
-        raise RuntimeError(f"{schema}.{table} is missing configured key columns: {missing}")
+        raise RuntimeError(
+            f"{schema}.{table} is missing configured key columns: {missing}"
+        )
     return [by_lower[key.lower()] for key in source.primary_key]
 
 
@@ -283,12 +305,16 @@ def _restrict_clone_to_selected_keys(conn, schema: str, source, keys: pa.Table) 
     )
 
 
-def _snowflake_history_by_key(conn, schema: str, source, keys: pa.Table) -> dict[tuple[str | None, ...], tuple[int, int, int]]:
+def _snowflake_history_by_key(
+    conn, schema: str, source, keys: pa.Table
+) -> dict[tuple[str | None, ...], tuple[int, int, int]]:
     """Return total/current/expired counts for each selected key in the isolated table."""
     table = source.warehouse_table.upper()
     key_columns = _selected_snowflake_key_columns(conn, schema, source)
     relation, params = _values_relation(keys, key_columns)
-    projection = ", ".join(f"target.{_quoted_identifier(column)}" for column in key_columns)
+    projection = ", ".join(
+        f"target.{_quoted_identifier(column)}" for column in key_columns
+    )
     join = " AND ".join(
         f"target.{_quoted_identifier(column)} = selected_keys.{_quoted_identifier(column)}"
         for column in key_columns
@@ -324,17 +350,26 @@ def _snowflake_history_by_key(conn, schema: str, source, keys: pa.Table) -> dict
     return history
 
 
-def _duckdb_history_by_key(source_db: Path, source, keys: pa.Table) -> dict[tuple[str | None, ...], tuple[int, int, int]]:
+def _duckdb_history_by_key(
+    source_db: Path, source, keys: pa.Table
+) -> dict[tuple[str | None, ...], tuple[int, int, int]]:
     """Return full recovered-history counts for each selected business key."""
     table = _safe_identifier(source.warehouse_table, "DuckDB table")
     with duckdb.connect(str(source_db), read_only=True) as db:
-        described = db.execute(f'DESCRIBE SELECT * FROM raw.{_quoted_identifier(table)}').fetchall()
+        described = db.execute(
+            f"DESCRIBE SELECT * FROM raw.{_quoted_identifier(table)}"
+        ).fetchall()
         by_lower = {str(row[0]).lower(): str(row[0]) for row in described}
         key_columns = [by_lower[key.lower()] for key in source.primary_key]
-        key_arrow_columns = [next(name for name in keys.schema.names if name.lower() == col.lower()) for col in key_columns]
+        key_arrow_columns = [
+            next(name for name in keys.schema.names if name.lower() == col.lower())
+            for col in key_columns
+        ]
         registered_keys = keys.select(key_arrow_columns).rename_columns(key_columns)
         db.register("continuity_selected_keys", registered_keys)
-        projection = ", ".join(f"target.{_quoted_identifier(column)}" for column in key_columns)
+        projection = ", ".join(
+            f"target.{_quoted_identifier(column)}" for column in key_columns
+        )
         join = " AND ".join(
             f"target.{_quoted_identifier(column)} = selected_keys.{_quoted_identifier(column)}"
             for column in key_columns
@@ -343,7 +378,7 @@ def _duckdb_history_by_key(source_db: Path, source, keys: pa.Table) -> dict[tupl
             f"SELECT {projection}, COUNT(*), "
             f'COUNT(*) FILTER (WHERE target."_dlt_valid_to" IS NULL), '
             f'COUNT(*) FILTER (WHERE target."_dlt_valid_to" IS NOT NULL) '
-            f'FROM raw.{_quoted_identifier(table)} AS target '
+            f"FROM raw.{_quoted_identifier(table)} AS target "
             f"JOIN continuity_selected_keys AS selected_keys ON {join} "
             f"GROUP BY {projection}"
         ).fetchall()
@@ -361,8 +396,12 @@ def _duckdb_history_by_key(source_db: Path, source, keys: pa.Table) -> dict[tupl
     return history
 
 
-def _history_totals(history: dict[tuple[str | None, ...], tuple[int, int, int]]) -> tuple[int, int, int]:
-    return tuple(sum(counts[index] for counts in history.values()) for index in range(3))  # type: ignore[return-value]
+def _history_totals(
+    history: dict[tuple[str | None, ...], tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    return tuple(
+        sum(counts[index] for counts in history.values()) for index in range(3)
+    )  # type: ignore[return-value]
 
 
 def _export_sample_and_change_one(
@@ -371,7 +410,9 @@ def _export_sample_and_change_one(
     """Export current rows, change one STATUS, and return their unique business keys."""
     table = _safe_identifier(source.warehouse_table, "source warehouse table")
     with duckdb.connect(str(source_db), read_only=True) as db:
-        described = db.execute(f'DESCRIBE SELECT * FROM raw.{_quoted_identifier(table)}').fetchall()
+        described = db.execute(
+            f"DESCRIBE SELECT * FROM raw.{_quoted_identifier(table)}"
+        ).fetchall()
         columns = [str(row[0]) for row in described]
         by_lower = {name.lower(): name for name in columns}
         valid_to = by_lower.get("_dlt_valid_to")
@@ -387,13 +428,23 @@ def _export_sample_and_change_one(
         business_columns = [
             name for name in columns if not name.lower().startswith("_dlt_")
         ]
-        key_columns = [by_lower[key.lower()] for key in source.primary_key if key.lower() in by_lower]
-        missing_keys = [key for key in source.primary_key if key.lower() not in by_lower]
+        key_columns = [
+            by_lower[key.lower()]
+            for key in source.primary_key
+            if key.lower() in by_lower
+        ]
+        missing_keys = [
+            key for key in source.primary_key if key.lower() not in by_lower
+        ]
         if missing_keys:
-            raise RuntimeError(f"raw.{table} is missing configured primary-key columns: {missing_keys}")
+            raise RuntimeError(
+                f"raw.{table} is missing configured primary-key columns: {missing_keys}"
+            )
         projection = ", ".join(_quoted_identifier(name) for name in business_columns)
         order_by = ", ".join(_quoted_identifier(name) for name in key_columns)
-        non_null_keys = " AND ".join(f"{_quoted_identifier(name)} IS NOT NULL" for name in key_columns)
+        non_null_keys = " AND ".join(
+            f"{_quoted_identifier(name)} IS NOT NULL" for name in key_columns
+        )
         arrow_table = db.execute(
             f"SELECT {projection} FROM raw.{_quoted_identifier(table)} "
             f"WHERE {_quoted_identifier(valid_to)} IS NULL AND {non_null_keys} "
@@ -464,7 +515,9 @@ def main() -> None:
     if not credentials:
         raise SystemExit("TORONTO_WAREHOUSE_CREDENTIALS is not configured.")
     dataset = _safe_schema(os.environ.get("TORONTO_WAREHOUSE_DATASET", ""))
-    source_db = Path(os.environ.get("SOURCE_DB", "data/recovery/warehouse-2026-10-23/toronto.duckdb"))
+    source_db = Path(
+        os.environ.get("SOURCE_DB", "data/recovery/warehouse-2026-10-23/toronto.duckdb")
+    )
     if not source_db.is_file():
         raise SystemExit(f"Recovery DuckDB database not found: {source_db}")
 
@@ -482,14 +535,18 @@ def main() -> None:
             ).fetchone()
             print(f"Connected as {role} to {database}.{current_schema}.")
             if database.upper() != DATABASE or role.upper() != "TORONTO_INGEST_ROLE":
-                raise RuntimeError("Unexpected Snowflake database or role; stopping before cloning.")
+                raise RuntimeError(
+                    "Unexpected Snowflake database or role; stopping before cloning."
+                )
         finally:
             cursor.close()
 
         available = _table_inventory(conn, SOURCE_SCHEMA)
         missing = set(REQUIRED_TABLES) - available
         if missing:
-            raise RuntimeError(f"TORONTO.RAW is missing migrated tables: {sorted(missing)}.")
+            raise RuntimeError(
+                f"TORONTO.RAW is missing migrated tables: {sorted(missing)}."
+            )
         migrated_baseline = {
             source_map[name].warehouse_table.upper(): _counts(
                 conn, SOURCE_SCHEMA, source_map[name].warehouse_table.upper()
@@ -503,7 +560,9 @@ def main() -> None:
         }
         state_names = _state_pipeline_names(conn, SOURCE_SCHEMA)
         if not PIPELINE_NAMES.issubset(state_names):
-            raise RuntimeError(f"Missing migrated pipeline state: {sorted(PIPELINE_NAMES - state_names)}")
+            raise RuntimeError(
+                f"Missing migrated pipeline state: {sorted(PIPELINE_NAMES - state_names)}"
+            )
 
         # Verify the supplied recovery DB is exactly the baseline that was migrated.
         with duckdb.connect(str(source_db), read_only=True) as db:
@@ -517,7 +576,9 @@ def main() -> None:
                     )
             for table, count in metadata_prior.items():
                 if _duckdb_row_count(db, table.lower()) != count:
-                    raise AssertionError(f"Recovery metadata count mismatch for {table}.")
+                    raise AssertionError(
+                        f"Recovery metadata count mismatch for {table}."
+                    )
 
         print(f"MIGRATED BASELINE: {migrated_baseline}")
         print(f"MIGRATED METADATA ROWS: {metadata_prior}")
@@ -525,7 +586,9 @@ def main() -> None:
         cursor = conn.cursor()
         try:
             cursor.execute(f"DROP SCHEMA IF EXISTS {DATABASE}.{dataset} CASCADE")
-            cursor.execute(f"CREATE SCHEMA {DATABASE}.{dataset} CLONE {DATABASE}.{SOURCE_SCHEMA}")
+            cursor.execute(
+                f"CREATE SCHEMA {DATABASE}.{dataset} CLONE {DATABASE}.{SOURCE_SCHEMA}"
+            )
             schema_created = True
         finally:
             cursor.close()
@@ -533,21 +596,33 @@ def main() -> None:
 
         cloned_states = _state_pipeline_names(conn, dataset)
         if not PIPELINE_NAMES.issubset(cloned_states):
-            raise RuntimeError(f"Clone is missing pipeline state: {sorted(PIPELINE_NAMES - cloned_states)}")
+            raise RuntimeError(
+                f"Clone is missing pipeline state: {sorted(PIPELINE_NAMES - cloned_states)}"
+            )
         for table, expected in migrated_baseline.items():
             actual = _counts(conn, dataset, table)
             if actual != expected:
-                raise AssertionError(f"Clone mismatch for {table}: expected={expected}; actual={actual}")
-        cloned_metadata = {table: _row_count(conn, dataset, table) for table in metadata_prior}
+                raise AssertionError(
+                    f"Clone mismatch for {table}: expected={expected}; actual={actual}"
+                )
+        cloned_metadata = {
+            table: _row_count(conn, dataset, table) for table in metadata_prior
+        }
         if cloned_metadata != metadata_prior:
-            raise AssertionError(f"Cloned metadata mismatch: expected={metadata_prior}; actual={cloned_metadata}")
-        print(f"CLONE VERIFIED: SCD2 counts={migrated_baseline}; metadata={cloned_metadata}")
+            raise AssertionError(
+                f"Cloned metadata mismatch: expected={metadata_prior}; actual={cloned_metadata}"
+            )
+        print(
+            f"CLONE VERIFIED: SCD2 counts={migrated_baseline}; metadata={cloned_metadata}"
+        )
 
         with TemporaryDirectory(prefix="snowflake-continuity-sample-") as temp_dir:
             temp = Path(temp_dir)
             snapshots: dict[str, Path] = {}
             selected_keys: dict[str, pa.Table] = {}
-            baseline_by_key: dict[str, dict[tuple[str | None, ...], tuple[int, int, int]]] = {}
+            baseline_by_key: dict[
+                str, dict[tuple[str | None, ...], tuple[int, int, int]]
+            ] = {}
             baseline_counts: dict[str, tuple[int, int, int]] = {}
 
             # Build bounded snapshots and keys from the exact migration recovery artifact.
@@ -564,9 +639,15 @@ def main() -> None:
             for name in SOURCE_NAMES:
                 source = source_map[name]
                 table = source.warehouse_table.upper()
-                expected_history = _duckdb_history_by_key(source_db, source, selected_keys[name])
-                _restrict_clone_to_selected_keys(conn, dataset, source, selected_keys[name])
-                actual_history = _snowflake_history_by_key(conn, dataset, source, selected_keys[name])
+                expected_history = _duckdb_history_by_key(
+                    source_db, source, selected_keys[name]
+                )
+                _restrict_clone_to_selected_keys(
+                    conn, dataset, source, selected_keys[name]
+                )
+                actual_history = _snowflake_history_by_key(
+                    conn, dataset, source, selected_keys[name]
+                )
                 if actual_history != expected_history:
                     raise AssertionError(
                         f"{table}: selected-key history differs between recovery artifact and "
@@ -592,12 +673,16 @@ def main() -> None:
                 _load_sample(credentials, dataset, source_map[name], snapshots[name])
 
             conn = _connect(credentials)
-            after_load: dict[str, dict[tuple[str | None, ...], tuple[int, int, int]]] = {}
+            after_load: dict[
+                str, dict[tuple[str | None, ...], tuple[int, int, int]]
+            ] = {}
             for name in SOURCE_NAMES:
                 source = source_map[name]
                 table = source.warehouse_table.upper()
                 before_by_key = baseline_by_key[name]
-                after_by_key = _snowflake_history_by_key(conn, dataset, source, selected_keys[name])
+                after_by_key = _snowflake_history_by_key(
+                    conn, dataset, source, selected_keys[name]
+                )
                 key_rows = _key_rows(selected_keys[name])
                 changed_key = _normalized_key(key_rows[0])
                 expected_by_key = {
@@ -605,12 +690,17 @@ def main() -> None:
                         counts[0] + 1,
                         counts[1],
                         counts[2] + 1,
-                    ) if key == changed_key else counts
+                    )
+                    if key == changed_key
+                    else counts
                     for key, counts in before_by_key.items()
                 }
                 if after_by_key != expected_by_key:
                     differences = {
-                        key: {"expected": expected_by_key.get(key), "actual": after_by_key.get(key)}
+                        key: {
+                            "expected": expected_by_key.get(key),
+                            "actual": after_by_key.get(key),
+                        }
                         for key in set(expected_by_key) | set(after_by_key)
                         if expected_by_key.get(key) != after_by_key.get(key)
                     }
@@ -634,13 +724,19 @@ def main() -> None:
                     "exactly one selected key gained one version."
                 )
 
-            metadata_after = {table: _row_count(conn, dataset, table) for table in metadata_prior}
+            metadata_after = {
+                table: _row_count(conn, dataset, table) for table in metadata_prior
+            }
             for table, count in metadata_prior.items():
                 if metadata_after[table] < count:
-                    raise AssertionError(f"{table}: metadata count decreased from {count} to {metadata_after[table]}.")
+                    raise AssertionError(
+                        f"{table}: metadata count decreased from {count} to {metadata_after[table]}."
+                    )
             state_names_after = _state_pipeline_names(conn, dataset)
             if not PIPELINE_NAMES.issubset(state_names_after):
-                raise AssertionError(f"Pipeline state records missing after load: {sorted(PIPELINE_NAMES - state_names_after)}")
+                raise AssertionError(
+                    f"Pipeline state records missing after load: {sorted(PIPELINE_NAMES - state_names_after)}"
+                )
             print(f"METADATA AFTER LOAD: {metadata_after}")
 
             conn.close()
@@ -652,10 +748,15 @@ def main() -> None:
             for name in SOURCE_NAMES:
                 source = source_map[name]
                 table = source.warehouse_table.upper()
-                replay_history = _snowflake_history_by_key(conn, dataset, source, selected_keys[name])
+                replay_history = _snowflake_history_by_key(
+                    conn, dataset, source, selected_keys[name]
+                )
                 if replay_history != after_load[name]:
                     differences = {
-                        key: {"before replay": after_load[name].get(key), "after replay": replay_history.get(key)}
+                        key: {
+                            "before replay": after_load[name].get(key),
+                            "after replay": replay_history.get(key),
+                        }
                         for key in set(after_load[name]) | set(replay_history)
                         if after_load[name].get(key) != replay_history.get(key)
                     }
@@ -688,12 +789,17 @@ def main() -> None:
                     conn = _connect(credentials)
                 cursor = conn.cursor()
                 try:
-                    cursor.execute(f"DROP SCHEMA IF EXISTS {DATABASE}.{dataset} CASCADE")
+                    cursor.execute(
+                        f"DROP SCHEMA IF EXISTS {DATABASE}.{dataset} CASCADE"
+                    )
                 finally:
                     cursor.close()
                 print(f"Cleaned up isolated schema {DATABASE}.{dataset}.", flush=True)
             except Exception as exc:
-                print(f"WARNING: unable to clean up isolated schema {DATABASE}.{dataset}: {type(exc).__name__}: {exc}", flush=True)
+                print(
+                    f"WARNING: unable to clean up isolated schema {DATABASE}.{dataset}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
         if conn is not None:
             conn.close()
 

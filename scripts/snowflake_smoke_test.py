@@ -117,9 +117,7 @@ def main() -> None:
                 )[0][0]
 
             if int(expired) != 1:
-                raise AssertionError(
-                    f"Expected 1 expired SCD2 version; got {expired}."
-                )
+                raise AssertionError(f"Expected 1 expired SCD2 version; got {expired}.")
 
             print(
                 "SNOWFLAKE SCD2 SMOKE TEST PASSED: "

@@ -102,16 +102,18 @@ def _iter_snapshot_rows(
             yield row
 
 
-_HASH_FLOAT_FIELDS = frozenset({
-    "ASSEMBLY",
-    "BUSINESS_AND_PERSONAL_SERVICES",
-    "DEMOLITION",
-    "INDUSTRIAL",
-    "INSTITUTIONAL",
-    "INTERIOR_ALTERATIONS",
-    "MERCANTILE",
-    "RESIDENTIAL",
-})
+_HASH_FLOAT_FIELDS = frozenset(
+    {
+        "ASSEMBLY",
+        "BUSINESS_AND_PERSONAL_SERVICES",
+        "DEMOLITION",
+        "INDUSTRIAL",
+        "INSTITUTIONAL",
+        "INTERIOR_ALTERATIONS",
+        "MERCANTILE",
+        "RESIDENTIAL",
+    }
+)
 
 
 def _row_hash(row: dict[str, Any]) -> str:

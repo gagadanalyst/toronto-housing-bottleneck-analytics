@@ -130,7 +130,12 @@ def test_fallback_rejects_incomplete_candidate_and_tries_next() -> None:
     class FakeClient:
         def fallback_resources(self, package):
             return [
-                {"id": "dump", "name": "datastore dump", "format": "CSV", "url": "dump"},
+                {
+                    "id": "dump",
+                    "name": "datastore dump",
+                    "format": "CSV",
+                    "url": "dump",
+                },
                 {"id": "csv", "name": "published CSV", "format": "CSV", "url": "csv"},
             ]
 

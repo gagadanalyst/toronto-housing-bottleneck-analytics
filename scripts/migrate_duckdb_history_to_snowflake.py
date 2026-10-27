@@ -70,15 +70,12 @@ def source_counts(db: duckdb.DuckDBPyConnection) -> dict[str, dict[str, int]]:
     """Count source rows and current SCD2 rows in DuckDB."""
     result = {}
     for table in TABLES:
-        total = int(
-            db.execute(f'SELECT COUNT(*) FROM raw."{table}"').fetchone()[0]
-        )
+        total = int(db.execute(f'SELECT COUNT(*) FROM raw."{table}"').fetchone()[0])
         values = {"total": total}
         if table in PERMIT_TABLES:
             values["current"] = int(
                 db.execute(
-                    f'SELECT COUNT(*) FROM raw."{table}" '
-                    "WHERE _dlt_valid_to IS NULL"
+                    f'SELECT COUNT(*) FROM raw."{table}" WHERE _dlt_valid_to IS NULL'
                 ).fetchone()[0]
             )
         result[table] = values
@@ -99,8 +96,7 @@ def snowflake_counts(conn, schema: str) -> dict[str, dict[str, int]]:
             if table in PERMIT_TABLES:
                 values["current"] = int(
                     cursor.execute(
-                        f"SELECT COUNT_IF(_DLT_VALID_TO IS NULL) "
-                        f"FROM {qualified}"
+                        f"SELECT COUNT_IF(_DLT_VALID_TO IS NULL) FROM {qualified}"
                     ).fetchone()[0]
                 )
             result[table] = values
@@ -133,7 +129,10 @@ def main() -> None:
                     "SELECT CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ROLE()"
                 ).fetchone()
                 print(f"Connected to {database}.{schema} using role {role}")
-                if database.upper() != DATABASE or role.upper() != "TORONTO_INGEST_ROLE":
+                if (
+                    database.upper() != DATABASE
+                    or role.upper() != "TORONTO_INGEST_ROLE"
+                ):
                     raise RuntimeError(
                         "Unexpected database or role; stopping before migration."
                     )
@@ -173,9 +172,7 @@ def main() -> None:
                 cursor.execute(
                     f"DROP SCHEMA IF EXISTS {DATABASE}.{STAGE_SCHEMA} CASCADE"
                 )
-                cursor.execute(
-                    f"CREATE SCHEMA {DATABASE}.{STAGE_SCHEMA}"
-                )
+                cursor.execute(f"CREATE SCHEMA {DATABASE}.{STAGE_SCHEMA}")
             finally:
                 cursor.close()
 
@@ -230,21 +227,20 @@ def main() -> None:
             final_counts = snowflake_counts(conn, TARGET_SCHEMA)
             if final_counts != expected:
                 raise RuntimeError(
-                    f"Final count mismatch. Expected {expected}; "
-                    f"found {final_counts}."
+                    f"Final count mismatch. Expected {expected}; found {final_counts}."
                 )
 
             cursor = conn.cursor()
             try:
-                cursor.execute(
-                    f"DROP SCHEMA {DATABASE}.{STAGE_SCHEMA} CASCADE"
-                )
+                cursor.execute(f"DROP SCHEMA {DATABASE}.{STAGE_SCHEMA} CASCADE")
             finally:
                 cursor.close()
 
             print("SNOWFLAKE HISTORY MIGRATION PASSED")
             print("Historical rows, current-version counts and dlt metadata matched.")
-            print("This is a migration test baseline, not a claim of current-source parity.")
+            print(
+                "This is a migration test baseline, not a claim of current-source parity."
+            )
         finally:
             conn.close()
 
