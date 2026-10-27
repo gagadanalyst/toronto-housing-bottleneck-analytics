@@ -102,5 +102,5 @@ jobs:
           print(f"Downloaded snapshot bundle: {path} ({path.stat().st_size:,} bytes)")
           PY
 
-      - name: Initialize or verify the baseline and replay it once
+      - name: Initialize baseline, verify replay, and test controlled SCD2 change
         run: python scripts/snowflake_snapshot_baseline.py

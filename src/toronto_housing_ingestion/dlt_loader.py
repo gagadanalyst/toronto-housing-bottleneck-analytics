@@ -151,6 +151,7 @@ def load_scd2(
     dataset_name: str,
     destination_kind: str,
     preserve_row_hash: bool = False,
+    pipeline_name: str | None = None,
 ) -> LoadResult:
     """Load a full Parquet snapshot using ``source.warehouse_strategy``.
 
@@ -236,7 +237,7 @@ def load_scd2(
     pipeline = dlt.pipeline(
         # Preserve the existing pipeline names for Active/Cleared SCD2. Using
         # a separate name for replacement avoids reusing a failed SCD2 package.
-        pipeline_name=f"toronto_{source.name}_{strategy}",
+        pipeline_name=pipeline_name or f"toronto_{source.name}_{strategy}",
         destination=_destination(destination_kind, credentials),
         dataset_name=dataset,
         dev_mode=False,
