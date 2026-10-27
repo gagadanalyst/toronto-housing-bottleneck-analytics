@@ -1,0 +1,39 @@
+name: Live CKAN Source Checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-live-ckan-checks
+  cancel-in-progress: false
+
+jobs:
+  live-checks:
+    name: Verify live fallback resources and local setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      RUN_LIVE_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Upgrade pip to a patched release
+        run: python -m pip install --upgrade "pip>=26.2.1,<27"
+
+      - name: Install project and test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Check configured CSV and JSON fallback downloads
+        run: python -m pytest -s tests/test_live_fallbacks.py
+
+      - name: Check live extraction and local DuckDB setup
+        run: python -m pytest -q tests/test_local_setup.py

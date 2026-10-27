@@ -52,18 +52,14 @@ jobs:
           --cov-report=term-missing
           --ignore=tests/integration
           --ignore=tests/test_warehouse_load.py
+          --ignore=tests/test_live_fallbacks.py
+          --ignore=tests/test_local_setup.py
 
       - name: Run SCD2 integration tests
         run: >-
           python -m pytest -s
           tests/test_dlt_integration.py
           tests/integration/test_dlt_scd2_row_hash.py
-
-      - name: Run live fallback integration tests
-        if: github.event_name != 'pull_request'
-        env:
-          RUN_LIVE_TESTS: "1"
-        run: python -m pytest -s tests/test_live_fallbacks.py
 
       - run: pip-audit
       - run: python -m build
