@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import UTC
 from pathlib import Path
 
 import dlt
@@ -92,23 +93,29 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
     import pyarrow.parquet as pq
 
     if tuple(key.lower() for key in source.primary_key) != (
-        "permit_num", "revision_num", "permit_type"
+        "permit_num",
+        "revision_num",
+        "permit_type",
     ):
         raise ValueError(
             "Diagnostic capture currently expects the Active/Cleared permit key."
         )
 
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
-    db_path = Path(os.environ.get(
-        "HASH_MISMATCH_DIAGNOSTICS_PATH",
-        "data/diagnostics/hash_mismatch_diagnostics.duckdb",
-    ))
+    db_path = Path(
+        os.environ.get(
+            "HASH_MISMATCH_DIAGNOSTICS_PATH",
+            "data/diagnostics/hash_mismatch_diagnostics.duckdb",
+        )
+    )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     fresh_path = _latest_parquet_snapshot(Path("data/raw"), source.name)
-    historical_root = Path(os.environ.get(
-        "TORONTO_HISTORICAL_PARQUET_ROOT",
-        "data/recovery/parquet-2026-10-23",
-    ))
+    historical_root = Path(
+        os.environ.get(
+            "TORONTO_HISTORICAL_PARQUET_ROOT",
+            "data/recovery/parquet-2026-10-23",
+        )
+    )
     historical_path = _latest_parquet_snapshot(historical_root, source.name)
 
     with duckdb.connect(str(db_path)) as db:
@@ -169,8 +176,11 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
         """)
 
         for table in (
-            "hash_mismatches", "diagnostic_runs", "snapshot_schemas",
-            "duplicate_keys", "field_diff_summary",
+            "hash_mismatches",
+            "diagnostic_runs",
+            "snapshot_schemas",
+            "duplicate_keys",
+            "field_diff_summary",
         ):
             db.execute(
                 f"DELETE FROM {table} WHERE run_id = ? AND source_name = ?",
@@ -180,9 +190,11 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
         # Each row returned from Snowflake is: three key values, fresh hash, migrated hash.
         mismatch_values = [
             (
-                run_id, source.name,
+                run_id,
+                source.name,
                 *(None if value is None else str(value) for value in row[:3]),
-                str(row[3]), str(row[4]),
+                str(row[3]),
+                str(row[4]),
                 str(fresh_path) if fresh_path else None,
                 str(historical_path) if historical_path else None,
             )
@@ -194,20 +206,25 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
         )
 
         distinct_keys = len({tuple(row[:3]) for row in mismatch_rows})
-        from datetime import datetime, timezone
+        from datetime import datetime
+
         db.execute(
             "INSERT INTO diagnostic_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
-                run_id, source.name, len(mismatch_rows), distinct_keys,
+                run_id,
+                source.name,
+                len(mismatch_rows),
+                distinct_keys,
                 str(fresh_path) if fresh_path else None,
                 str(historical_path) if historical_path else None,
-                datetime.now(timezone.utc).replace(tzinfo=None),
+                datetime.now(UTC).replace(tzinfo=None),
             ],
         )
 
         snapshot_tables: dict[str, tuple[str, Path]] = {}
         for snapshot_kind, path in (
-            ("fresh", fresh_path), ("historical", historical_path)
+            ("fresh", fresh_path),
+            ("historical", historical_path),
         ):
             if path is None:
                 print(
@@ -227,17 +244,25 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
             db.executemany(
                 "INSERT INTO snapshot_schemas VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (run_id, source.name, snapshot_kind, field.name,
-                     str(field.type), bool(field.nullable))
+                    (
+                        run_id,
+                        source.name,
+                        snapshot_kind,
+                        field.name,
+                        str(field.type),
+                        bool(field.nullable),
+                    )
                     for field in schema
                 ],
             )
 
             key_map = {name.lower(): name for name in schema.names}
-            if all(key in key_map for key in ("permit_num", "revision_num", "permit_type")):
+            if all(
+                key in key_map for key in ("permit_num", "revision_num", "permit_type")
+            ):
                 qkeys = ", ".join(
-                    f'"{key_map[key]}"' for key in
-                    ("permit_num", "revision_num", "permit_type")
+                    f'"{key_map[key]}"'
+                    for key in ("permit_num", "revision_num", "permit_type")
                 )
                 duplicate_rows = db.execute(
                     f"SELECT {qkeys}, COUNT(*) FROM read_parquet(?) "
@@ -248,9 +273,16 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
                     db.executemany(
                         "INSERT INTO duplicate_keys VALUES (?, ?, ?, ?, ?, ?, ?)",
                         [
-                            (run_id, source.name, snapshot_kind,
-                             *(None if value is None else str(value) for value in row[:3]),
-                             int(row[3]))
+                            (
+                                run_id,
+                                source.name,
+                                snapshot_kind,
+                                *(
+                                    None if value is None else str(value)
+                                    for value in row[:3]
+                                ),
+                                int(row[3]),
+                            )
                             for row in duplicate_rows
                         ],
                     )
@@ -265,7 +297,8 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
             fresh_map = {name.lower(): name for name in fresh_schema.names}
             historical_map = {name.lower(): name for name in historical_schema.names}
             common = sorted(
-                lower for lower in set(fresh_map) & set(historical_map)
+                lower
+                for lower in set(fresh_map) & set(historical_map)
                 if lower != "_id" and not lower.startswith("_dlt_")
             )
             key_names = ("permit_num", "revision_num", "permit_type")
@@ -275,21 +308,18 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
             for index, lower in enumerate(common):
                 hname = historical_map[lower]
                 fname = fresh_map[lower]
-                selected_fields.extend([
-                    f'h."{hname}" AS hist_{index}',
-                    f'f."{fname}" AS fresh_{index}',
-                ])
+                selected_fields.extend(
+                    [
+                        f'h."{hname}" AS hist_{index}',
+                        f'f."{fname}" AS fresh_{index}',
+                    ]
+                )
                 value_tuples.append(
                     f"('{lower.upper()}', "
                     f"CAST(to_json(hist_{index}) AS VARCHAR), typeof(hist_{index}), "
                     f"CAST(to_json(fresh_{index}) AS VARCHAR), typeof(fresh_{index}))"
                 )
 
-            join_keys = " AND ".join(
-                f'h."{historical_map[key]}" = m.{key}' for key in key_names
-            ) + " AND " + " AND ".join(
-                f'f."{fresh_map[key]}" = m.{key}' for key in key_names
-            )
             if selected_fields and value_tuples:
                 analysis_sql = f"""
                     WITH mismatch_keys AS (
@@ -298,21 +328,21 @@ def _save_hash_mismatch_diagnostics(source, mismatch_rows: list[tuple]) -> Path:
                         WHERE run_id = ? AND source_name = ?
                     ), matched_rows AS (
                         SELECT m.permit_num, m.revision_num, m.permit_type,
-                               {', '.join(selected_fields)}
+                               {", ".join(selected_fields)}
                         FROM mismatch_keys m
                         JOIN "{historical_table}" h ON
-                            h."{historical_map['permit_num']}" = m.permit_num AND
-                            h."{historical_map['revision_num']}" = m.revision_num AND
-                            h."{historical_map['permit_type']}" = m.permit_type
+                            h."{historical_map["permit_num"]}" = m.permit_num AND
+                            h."{historical_map["revision_num"]}" = m.revision_num AND
+                            h."{historical_map["permit_type"]}" = m.permit_type
                         JOIN "{fresh_table}" f ON
-                            f."{fresh_map['permit_num']}" = m.permit_num AND
-                            f."{fresh_map['revision_num']}" = m.revision_num AND
-                            f."{fresh_map['permit_type']}" = m.permit_type
+                            f."{fresh_map["permit_num"]}" = m.permit_num AND
+                            f."{fresh_map["revision_num"]}" = m.revision_num AND
+                            f."{fresh_map["permit_type"]}" = m.permit_type
                     ), field_values AS (
                         SELECT d.column_name, d.historical_json, d.historical_type,
                                d.fresh_json, d.fresh_type
                         FROM matched_rows
-                        CROSS JOIN LATERAL (VALUES {', '.join(value_tuples)}) AS d(
+                        CROSS JOIN LATERAL (VALUES {", ".join(value_tuples)}) AS d(
                             column_name, historical_json, historical_type,
                             fresh_json, fresh_type
                         )
@@ -358,7 +388,11 @@ def _verify_fresh_hash_compatibility(
         fresh_map = {column.lower(): column for column in fresh_columns}
         migrated_map = {column.lower(): column for column in migrated_columns}
 
-        required = {"row_hash", "_dlt_valid_to", *[key.lower() for key in source.primary_key]}
+        required = {
+            "row_hash",
+            "_dlt_valid_to",
+            *[key.lower() for key in source.primary_key],
+        }
         for label, column_map in (("fresh", fresh_map), ("migrated", migrated_map)):
             missing = sorted(required - set(column_map))
             if missing:
@@ -371,8 +405,7 @@ def _verify_fresh_hash_compatibility(
             return {
                 lower: actual
                 for lower, actual in column_map.items()
-                if lower not in {"_id", "row_hash"}
-                and not lower.startswith("_dlt_")
+                if lower not in {"_id", "row_hash"} and not lower.startswith("_dlt_")
             }
 
         fresh_tracked = tracked_columns(fresh_map)
@@ -406,7 +439,9 @@ def _verify_fresh_hash_compatibility(
         fresh_hash = f"fresh.{_quote_identifier(fresh_map['row_hash'])}"
         migrated_hash = f"migrated.{_quote_identifier(migrated_map['row_hash'])}"
         fresh_valid_to = f"fresh.{_quote_identifier(fresh_map['_dlt_valid_to'])}"
-        migrated_valid_to = f"migrated.{_quote_identifier(migrated_map['_dlt_valid_to'])}"
+        migrated_valid_to = (
+            f"migrated.{_quote_identifier(migrated_map['_dlt_valid_to'])}"
+        )
         join_and_filter = (
             f"FROM TORONTO.{dataset}.{table} AS fresh "
             f"JOIN TORONTO.RAW.{table} AS migrated ON {key_join} "
@@ -475,8 +510,14 @@ def main() -> None:
     selected = ("active_permits", "cleared_permits")
     for name in selected:
         source = sources.get(name)
-        if source is None or not source.warehouse_load or source.warehouse_strategy != "scd2":
-            raise RuntimeError(f"{name}: expected an enabled SCD2 source configuration.")
+        if (
+            source is None
+            or not source.warehouse_load
+            or source.warehouse_strategy != "scd2"
+        ):
+            raise RuntimeError(
+                f"{name}: expected an enabled SCD2 source configuration."
+            )
 
     # This probe pipeline only supplies a Snowflake SQL client. It does not run
     # any resources, and all queries are scoped to the isolated per-run schema.
@@ -497,7 +538,9 @@ def main() -> None:
             source = sources[name]
             counts = _count_rows(probe, source.warehouse_table)
             if counts[0] == 0 or counts[1] == 0:
-                raise AssertionError(f"{name}: first load produced no SCD2 rows: {counts}")
+                raise AssertionError(
+                    f"{name}: first load produced no SCD2 rows: {counts}"
+                )
             if counts[0] != counts[1] + counts[2]:
                 raise AssertionError(f"{name}: SCD2 totals do not reconcile: {counts}")
             baseline[name] = counts

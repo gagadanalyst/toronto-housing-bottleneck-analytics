@@ -40,7 +40,8 @@ def test_selects_csv_before_json_and_skips_datastore_dump() -> None:
         ]
     }
     assert [resource["id"] for resource in c.fallback_resources(package)] == [
-        "csv", "json"
+        "csv",
+        "json",
     ]
     c.close()
 
@@ -466,7 +467,6 @@ def test_completed_checkpoint_mismatch_restarts_extraction(
     assert not checkpoint_dir.exists()
 
 
-
 def _full_source_schema_test_records():
     first = {
         "_id": 101,
@@ -550,7 +550,9 @@ def _assert_full_source_schema_table(table):
         elif declared_type == "float8":
             assert actual == "double", (column, declared_type, actual)
         elif declared_type in {"int2", "int4", "int8"}:
-            expected_integer_type = {"int2": "int16", "int4": "int32", "int8": "int64"}[declared_type]
+            expected_integer_type = {"int2": "int16", "int4": "int32", "int8": "int64"}[
+                declared_type
+            ]
             assert actual == expected_integer_type, (column, declared_type, actual)
 
 
@@ -559,7 +561,8 @@ def test_source_type_map_covers_all_32_current_columns():
 
     assert len(ckan_client_module._SOURCE_FIELD_TYPES) == 32
     assert set(ckan_client_module._SOURCE_TEXT_COLUMNS) == {
-        name for name, field_type in ckan_client_module._SOURCE_FIELD_TYPES.items()
+        name
+        for name, field_type in ckan_client_module._SOURCE_FIELD_TYPES.items()
         if field_type in {"text", "date"}
     }
     assert ckan_client_module._SOURCE_FIELD_TYPES["GEO_ID"] == "text"
@@ -576,6 +579,7 @@ def test_all_extraction_routes_normalize_complete_source_schema(
     import csv as csv_module
     import io
     import json as json_module
+
     import pyarrow.parquet as pq
 
     records = _full_source_schema_test_records()
@@ -589,9 +593,13 @@ def test_all_extraction_routes_normalize_complete_source_schema(
     writer = csv_module.DictWriter(csv_buffer, fieldnames=headers, lineterminator="\n")
     writer.writeheader()
     for record in records:
-        writer.writerow({key: "" if value is None else value for key, value in record.items()})
+        writer.writerow(
+            {key: "" if value is None else value for key, value in record.items()}
+        )
     csv_payload = csv_buffer.getvalue().encode("utf-8")
-    json_payload = json_module.dumps({"result": {"records": json_records}}).encode("utf-8")
+    json_payload = json_module.dumps({"result": {"records": json_records}}).encode(
+        "utf-8"
+    )
 
     class FakeResponse:
         def __init__(self, payload):
@@ -643,7 +651,7 @@ def test_all_extraction_routes_normalize_complete_source_schema(
             monkeypatch.setattr(
                 c.session,
                 "get",
-                lambda url, **kwargs: FakeResponse(payload),
+                lambda url, payload=payload, **kwargs: FakeResponse(payload),
             )
             row_count = c.download_fallback(
                 resource={
@@ -678,7 +686,6 @@ def test_all_extraction_routes_normalize_complete_source_schema(
 
     assert output_tables[0].to_pylist() == output_tables[1].to_pylist()
     assert output_tables[0].to_pylist() == output_tables[2].to_pylist()
-
 
 
 def test_source_text_field_rejects_numeric_json_values() -> None:

@@ -19,7 +19,6 @@ from urllib3.util.retry import Retry
 
 from . import utils
 
-
 _SOURCE_FIELD_TYPES: dict[str, str] = {
     "_id": "int4",
     "PERMIT_NUM": "text",
@@ -55,14 +54,16 @@ _SOURCE_FIELD_TYPES: dict[str, str] = {
     "BUILDER_NAME": "text",
 }
 _SOURCE_TEXT_COLUMNS = frozenset(
-    name for name, field_type in _SOURCE_FIELD_TYPES.items()
+    name
+    for name, field_type in _SOURCE_FIELD_TYPES.items()
     if field_type in {"text", "date"}
 )
 _SOURCE_FLOAT_COLUMNS = frozenset(
     name for name, field_type in _SOURCE_FIELD_TYPES.items() if field_type == "float8"
 )
 _SOURCE_INTEGER_COLUMNS = frozenset(
-    name for name, field_type in _SOURCE_FIELD_TYPES.items()
+    name
+    for name, field_type in _SOURCE_FIELD_TYPES.items()
     if field_type in {"int2", "int4", "int8"}
 )
 
@@ -79,7 +80,7 @@ def _source_text_value(value: object, column: str, declared_type: str) -> object
     try:
         if pd.isna(value):
             return pd.NA
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         pass
     if isinstance(value, str):
         return pd.NA if value == "" else value
@@ -128,7 +129,9 @@ def _normalize_source_schema(frame: pd.DataFrame) -> pd.DataFrame:
                 raise ValueError(
                     f"CKAN field {column!r} is declared {declared_type} but contains fractional values."
                 )
-            integer_dtype = {"int2": "Int16", "int4": "Int32", "int8": "Int64"}[declared_type]
+            integer_dtype = {"int2": "Int16", "int4": "Int32", "int8": "Int64"}[
+                declared_type
+            ]
             frame[column] = converted.astype(integer_dtype)
 
     # Input resource order may differ even when the source schema is identical.
@@ -139,7 +142,9 @@ def _normalize_source_schema(frame: pd.DataFrame) -> pd.DataFrame:
         if name.upper() in actual_columns
     ]
     known_names = {name.upper() for name in _SOURCE_FIELD_TYPES}
-    unknown = [column for column in frame.columns if str(column).upper() not in known_names]
+    unknown = [
+        column for column in frame.columns if str(column).upper() not in known_names
+    ]
     return frame.loc[:, canonical + unknown]
 
 
@@ -556,7 +561,8 @@ class TorontoCKANClient:
                 pd.read_csv(
                     temp_path,
                     chunksize=10_000,
-                    dtype=_source_csv_dtypes(), keep_default_na=False,
+                    dtype=_source_csv_dtypes(),
+                    keep_default_na=False,
                 )
                 if fmt == "csv"
                 else self._iter_json_frames(temp_path)

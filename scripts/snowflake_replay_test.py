@@ -21,7 +21,6 @@ import pyarrow.parquet as pq
 from toronto_housing_ingestion.config import load_config
 from toronto_housing_ingestion.dlt_loader import load_scd2
 
-
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -59,8 +58,7 @@ def _export_current_snapshot(
         business_columns = [
             column
             for column in columns
-            if not column.lower().startswith("_dlt_")
-            and column.lower() != "row_hash"
+            if not column.lower().startswith("_dlt_") and column.lower() != "row_hash"
         ]
         if not business_columns:
             raise RuntimeError(f"raw.{table} has no business columns to replay.")
@@ -68,7 +66,7 @@ def _export_current_snapshot(
         projection = ", ".join(_quoted_identifier(c) for c in business_columns)
         arrow_table = connection.execute(
             f'SELECT {projection} FROM "raw".{_quoted_identifier(table)} '
-            f'WHERE {_quoted_identifier(valid_to)} IS NULL'
+            f"WHERE {_quoted_identifier(valid_to)} IS NULL"
         ).to_arrow_table()
 
     if arrow_table.num_rows == 0:
@@ -134,8 +132,7 @@ def _load_twice(
         first_counts = _counts(pipeline, table_name)
         if first_counts[0] == 0 or first_counts[1] == 0:
             raise AssertionError(
-                f"{base_source.name}: first load produced no SCD2 rows: "
-                f"{first_counts}."
+                f"{base_source.name}: first load produced no SCD2 rows: {first_counts}."
             )
 
         second = load_scd2(
