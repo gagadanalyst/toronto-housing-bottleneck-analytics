@@ -1,33 +1,36 @@
-name: Snowflake Live Ingestion Smoke
+name: Snowflake Snapshot Baseline and Replay
 
-# This is the full live CKAN extraction test. Run it deliberately rather than
-# repeating two large source extracts on every code change; migrated-history
-# continuity uses a bounded sample from the exact migration baseline.
+# Consume a completed main-branch CD run's exact Parquet bundle. This workflow
+# does not call CKAN and never writes to TORONTO.RAW.
 on:
   workflow_dispatch:
+    inputs:
+      snapshot_run_id:
+        description: Successful main-branch CD run ID that published the snapshot bundle
+        required: true
+        type: string
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: toronto-snowflake-live-ingestion-smoke
+  group: toronto-snowflake-snapshot-baseline-${{ inputs.snapshot_run_id }}
   cancel-in-progress: false
 
 jobs:
-  live-ingestion:
-    name: Extract and replay real Active/Cleared snapshots in an isolated schema
+  baseline:
+    name: Load and replay an exact validated source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_INGEST_SMOKE_${{ github.run_id }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id }}
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
+      SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
-      AWS_REGION: ca-central-1
-      AWS_EC2_METADATA_DISABLED: "true"
-      TORONTO_HISTORICAL_PARQUET_ROOT: data/recovery/parquet-2026-10-23
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,38 +45,62 @@ jobs:
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -e ".[snowflake]"
 
-      - name: Check required configuration
-        run: |
-          test -n "$TORONTO_WAREHOUSE_CREDENTIALS" || {
-            echo "Missing repository secret: SNOWFLAKE_DLT_CONNECTION"
-            exit 1
-          }
-          case "$TORONTO_WAREHOUSE_DATASET" in
-            SNOWFLAKE_INGEST_SMOKE_*) ;;
-            *) echo "Refusing to run outside the isolated test schema"; exit 1 ;;
-          esac
-
-      - name: Download original migration Parquet for diagnostics
-        continue-on-error: true
+      - name: Validate source CD run and required settings
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          mkdir -p "$TORONTO_HISTORICAL_PARQUET_ROOT"
-          gh run download 40001052104 \
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS"):
+              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
+
+          result = subprocess.run(
+              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
+               "--json", "name,status,conclusion,headBranch,headSha,event"],
+              check=True, capture_output=True, text=True,
+          )
+          run = json.loads(result.stdout)
+          expected = {
+              "name": "CD", "status": "completed", "conclusion": "success",
+              "headBranch": "main", "event": "workflow_run",
+          }
+          mismatches = {
+              key: (expected_value, run.get(key))
+              for key, expected_value in expected.items()
+              if run.get(key) != expected_value
+          }
+          if mismatches:
+              raise ValueError(f"Selected run is not a successful main-branch CD run: {mismatches}")
+          if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("headSha", ""))):
+              raise ValueError("Selected CD run did not return a valid source commit SHA.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={run['headSha']}\n")
+          print(f"Verified successful CD run {run_id} on main at {run['headSha']}.")
+          PY
+
+      - name: Download the exact validated snapshot bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/snapshot-download
+          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name toronto-parquet-40001052104 \
-            --dir "$TORONTO_HISTORICAL_PARQUET_ROOT"
-          find "$TORONTO_HISTORICAL_PARQUET_ROOT" -type f -name data.parquet -print
+            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
+            --dir data/snapshot-download
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("data/snapshot-download/toronto-snapshot-bundle.zip")
+          if not path.is_file() or path.stat().st_size == 0:
+              raise ValueError(f"Snapshot bundle was not downloaded: {path}")
+          print(f"Downloaded snapshot bundle: {path} ({path.stat().st_size:,} bytes)")
+          PY
 
-      - name: Run live ingestion and idempotent replay checks
-        run: python scripts/snowflake_live_ingestion_smoke.py
-
-      - name: Upload hash mismatch diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: hash-mismatch-diagnostics-${{ github.run_id }}
-          path: data/diagnostics/hash_mismatch_diagnostics.duckdb
-          if-no-files-found: warn
-          retention-days: 14
+      - name: Initialize or verify the baseline and replay it once
+        run: python scripts/snowflake_snapshot_baseline.py

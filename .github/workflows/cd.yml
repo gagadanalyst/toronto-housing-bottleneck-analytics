@@ -57,6 +57,9 @@ jobs:
               --clobber
           fi
 
+      - name: Record snapshot extraction start
+        run: echo "SNAPSHOT_EXTRACTION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - name: Extract Active and Cleared Permits only
         run: >-
           toronto-ingest
@@ -240,15 +243,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Upload Parquet assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: toronto-parquet-${{ github.run_id }}
-          path: data/raw/**/*.parquet
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
       - name: Upload DuckDB asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -272,6 +266,20 @@ jobs:
           test -s data-assets/toronto-active-permits.parquet
           test -s data-assets/toronto-cleared-permits.parquet
           ls -lh data-assets/*.parquet
+
+      - name: Package validated snapshot bundle
+        env:
+          SNAPSHOT_SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: python scripts/package_snapshot_bundle.py --output data-assets/toronto-snapshot-bundle.zip
+
+      - name: Upload validated snapshot bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-snapshot-bundle-${{ github.run_id }}
+          path: data-assets/toronto-snapshot-bundle.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
       - name: Publish durable data assets
         id: publish_assets

@@ -1,12 +1,6 @@
 name: Snowflake dbt Validation
 
 on:
-  push:
-    branches:
-      - feat/snowflake-ingestion-smoke
-    paths:
-      - "dbt/**"
-      - ".github/workflows/snowflake-dbt.yml"
   workflow_dispatch:
 
 permissions:
