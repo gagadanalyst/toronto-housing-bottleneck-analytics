@@ -349,7 +349,16 @@ def main() -> None:
     run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
     if not re.fullmatch(r"[0-9]+", run_id):
         raise ValueError("Snapshot source run ID must contain digits only.")
-    schema = f"ANALYTICS_BASELINE_{run_id}"
+    schema = os.environ.get("TORONTO_DBT_TARGET_SCHEMA", "")
+    if not re.fullmatch(r"ANALYTICS_PARITY_[0-9]+_[0-9]+", schema):
+        raise ValueError(
+            "TORONTO_DBT_TARGET_SCHEMA must name this run's isolated parity schema."
+        )
+    source_schema = os.environ.get("TORONTO_DBT_SOURCE_SCHEMA", "")
+    if source_schema != f"SNOWFLAKE_BASELINE_{run_id}":
+        raise ValueError(
+            "TORONTO_DBT_SOURCE_SCHEMA must match the selected snapshot run."
+        )
     database_path = os.environ["DBT_DUCKDB_PATH"]
     connection_uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
     if not connection_uri:
@@ -358,6 +367,7 @@ def main() -> None:
     report: dict[str, Any] = {
         "snapshot_source_run_id": run_id,
         "snowflake_database": "TORONTO",
+        "snowflake_source_schema": source_schema,
         "snowflake_target_schema": schema,
         "duckdb_target_schema": "analytics",
         "as_of_date": os.environ.get("TORONTO_DBT_AS_OF_DATE"),

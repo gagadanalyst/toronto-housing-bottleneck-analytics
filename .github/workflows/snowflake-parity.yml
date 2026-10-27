@@ -13,6 +13,10 @@ on:
       - ".github/workflows/snowflake-parity.yml"
       - "scripts/prepare_duckdb_parity_baseline.py"
       - "scripts/compare_duckdb_snowflake_parity.py"
+      - "dbt/**"
+      - "pyproject.toml"
+      - "open_data_config.yml"
+      - "src/toronto_housing_ingestion/**"
 
 permissions:
   contents: read
@@ -145,6 +149,95 @@ jobs:
                   env.write(f"{key}={value}\n")
           PY
 
+      - name: Prepare isolated Snowflake parity target and grant dbt access
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import snowflake.connector
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          workflow_run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot source run ID must contain digits only.")
+          if not re.fullmatch(r"[0-9]+", workflow_run_id):
+              raise ValueError("GitHub workflow run ID must contain digits only.")
+          if not re.fullmatch(r"[0-9]+", attempt):
+              raise ValueError("GitHub workflow attempt must contain digits only.")
+
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}"
+          target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
+
+          values = {
+              "TORONTO_DBT_SOURCE_SCHEMA": source_schema,
+              "TORONTO_DBT_TARGET_SCHEMA": target_schema,
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              for key, value in values.items():
+                  env.write(f"{key}={value}\n")
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_INGEST_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  "SELECT TABLE_NAME FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+                  "WHERE TABLE_SCHEMA = %s",
+                  (source_schema,),
+              )
+              existing = {str(row[0]).upper() for row in cursor.fetchall()}
+              required = {"RAW_ACTIVE_PERMITS", "RAW_CLEARED_PERMITS"}
+              missing = sorted(required - existing)
+              if missing:
+                  raise ValueError(
+                      f"Source baseline TORONTO.{source_schema} "
+                      f"is missing tables: {missing}"
+                  )
+
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{source_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT SELECT ON ALL TABLES IN SCHEMA TORONTO.{source_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"CREATE SCHEMA IF NOT EXISTS TORONTO.{target_schema}"
+              )
+              cursor.execute(
+                  f"GRANT USAGE ON SCHEMA TORONTO.{target_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+              cursor.execute(
+                  f"GRANT CREATE TABLE, CREATE VIEW ON SCHEMA TORONTO.{target_schema} "
+                  "TO ROLE TORONTO_DBT_ROLE"
+              )
+          finally:
+              cursor.close()
+              connection.close()
+
+          print(f"Snowflake source schema: TORONTO.{source_schema}")
+          print(f"Isolated Snowflake target schema: TORONTO.{target_schema}")
+          PY
+
+      - name: Build Snowflake dbt models from the same PR code and snapshot
+        working-directory: dbt
+        run: |
+          vars_json="$(printf '{"as_of_date":"%s"}' "$TORONTO_DBT_AS_OF_DATE")"
+          dbt build \
+            --profiles-dir . \
+            --target snowflake \
+            --vars "$vars_json"
+
       - name: Compare model schemas, grains, row values, and dashboard metrics
         run: python scripts/compare_duckdb_snowflake_parity.py
 
@@ -158,3 +251,36 @@ jobs:
             duckdb-parity-baseline.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Clean up isolated Snowflake parity target
+        if: ${{ always() }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          target_schema = os.environ.get("TORONTO_DBT_TARGET_SCHEMA")
+          if not target_schema:
+              print("No parity target schema was registered; skipping cleanup.")
+              raise SystemExit(0)
+
+          if not re.fullmatch(r"ANALYTICS_PARITY_[0-9]+_[0-9]+", target_schema):
+              raise ValueError("Unexpected Snowflake parity target schema.")
+
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_INGEST_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(f"DROP SCHEMA IF EXISTS TORONTO.{target_schema}")
+          finally:
+              cursor.close()
+              connection.close()
+          PY
