@@ -63,7 +63,7 @@ def current_theme_type() -> str:
         theme_type = getattr(st.context.theme, "type", None)
         if theme_type in {"light", "dark"}:
             return theme_type
-    except (AttributeError, RuntimeError):
+    except AttributeError, RuntimeError:
         pass
     try:
         theme_base = st.get_option("theme.base")
