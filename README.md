@@ -136,9 +136,22 @@ For a trial-end or planned shutdown, set `SNOWFLAKE_OPERATIONS_ENABLED` to `fals
 
 **Gate-off validation completed on October 28, 2026.** With `SNOWFLAKE_OPERATIONS_ENABLED=false`, the manual CI run and subsequent DuckDB CD publication succeeded, while the automatically triggered Snowflake RAW refresh and serving build skipped. The project owner also confirmed that the public dashboard loaded successfully after changing `DASHBOARD_BACKEND` to `duckdb`. This demonstrates that Snowflake can be disabled without changing the DuckDB publication path. For a future planned shutdown, still check for already-running Snowflake jobs and verify the exact account trial end in Snowsight; trial expiry and resource monitors are not substitutes for the workflow gate.
 
+## Repository security and local credentials
+
+The `secret-scan.yml` workflow runs Gitleaks on pull requests, pushes to `main`, manual dispatches, and a weekly schedule. Local Streamlit secrets (`.streamlit/secrets.toml`) and common private-key file extensions are ignored by Git. The ignore rules do not remove files already committed.
+
+For a deliberate local file and full-history audit, install Gitleaks and run:
+
+```bash
+gitleaks dir . --redact
+gitleaks git . --redact --log-opts="--all"
+```
+
+If a real credential is detected, treat it as exposed and rotate/revoke it; deleting the line from the latest revision is not enough to make a historical secret safe.
+
 ## Live dashboard
 
-**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. As verified on October 28, 2026, the public deployment is currently configured to query the published DuckDB release; a local run also defaults to DuckDB if `DASHBOARD_BACKEND` is omitted. The optional Snowflake backend remains available by explicitly setting `DASHBOARD_BACKEND` to `snowflake` and configuring its read-only credentials. Both paths query analytics relations rather than calling Toronto CKAN directly. Results are cached for 24 hours, with a manual refresh option. The dashboard has four sections:
+**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. As verified on October 28, 2026, the public deployment is currently configured to query the published DuckDB release; a local run also defaults to DuckDB if `DASHBOARD_BACKEND` is omitted. The optional Snowflake backend remains available by explicitly setting `DASHBOARD_BACKEND` to `snowflake` and configuring its read-only credentials. Both paths query analytics relations rather than calling Toronto CKAN directly. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successfully published DuckDB artifact or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections:
 
 - **Overview** — high-level active-age and closed-permit lifecycle summaries.
 - **Active permits** — age distributions and comparisons by permit type, including record-level detail.
@@ -209,6 +222,7 @@ The local dashboard downloads the published DuckDB asset and therefore needs net
 | `dbt/models/marts/`, `dbt/macros/` | Facts, dimensions, marts, tests, and minimal adapter-specific SQL. |
 | `.github/workflows/ci.yml`, `cd.yml` | Validation, production extraction, dbt builds, rolling publication, and docs deployment. |
 | `.github/workflows/snowflake*.yml` | Optional gated Snowflake baseline, refresh, serving, smoke, and parity workflows. |
+| `.github/workflows/secret-scan.yml` | Gitleaks checks for secrets on PRs, main pushes, manual dispatch, and weekly schedule. |
 | `dashboard/app.py` | Streamlit data product with explicit backend selection. |
 | `infra/snowflake/` | Snowflake setup SQL and operating guide. |
 | `docs/decisions/0001-dataset-scope.md` | Dataset-selection rationale and gates for expanding source scope. |

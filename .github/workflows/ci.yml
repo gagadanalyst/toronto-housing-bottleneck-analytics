@@ -62,7 +62,15 @@ jobs:
           tests/test_dlt_integration.py
           tests/integration/test_dlt_scd2_row_hash.py
 
-      - run: pip-audit
+      - name: Audit root environment dependencies
+        run: pip-audit
+
+      - name: Audit dashboard dependency requirements
+        run: pip-audit -r dashboard/requirements.txt
+
+      - name: Audit dbt dependency requirements
+        run: pip-audit -r dbt/requirements.txt
+
       - run: python -m build
 
   dbt-validation:
