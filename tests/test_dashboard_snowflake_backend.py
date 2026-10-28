@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -166,7 +166,7 @@ def test_missing_relations_fail_and_close_connection(
 def test_successful_read_returns_dashboard_contract_and_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=timezone.utc)
+    refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
     cursor = FakeCursor(
         set(backend.REQUIRED_RELATIONS) | {"DASHBOARD_REFRESH_METADATA"},
         refresh_timestamp,
