@@ -1,175 +1,155 @@
 # Toronto Housing Bottleneck Analytics
 
-An end-to-end Analytics Engineering portfolio project built around City of Toronto building-permit data. It demonstrates how to turn evolving public source data into version-aware warehouse tables, documented and tested dbt models, repeatable published data assets, and an interactive analytical dashboard.
+An end-to-end Analytics Engineering project using City of Toronto building-permit data. I built the pipeline from source extraction through warehouse modeling and validation to a deployed dashboard, with DuckDB as the default backend and Snowflake as an optional second backend.
 
-**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[Live dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[GitHub repository](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics)** · **[Published data assets](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
+**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Source code](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
-## The analytical questions
+## What the project demonstrates
 
-- **Active-permit aging:** How long have permit revisions that are still marked active been open, and how does the observed age vary by permit type?
-- **Observed lifecycle durations:** For permits marked `Closed`, how much calendar time elapsed between the application, issue, and completion dates available in the source?
-- **Source-data reliability:** How much duplication, missing information, or disagreement exists in the published rows, and how should those issues affect the analytical population?
-
-These are descriptive questions. A snapshot of permit data does not, on its own, establish why a permit took a particular amount of time.
-
-## Project at a glance
-
-| Area | Implementation |
+| Area | What is implemented |
 |---|---|
-| Sources | City of Toronto Open Data: Active Permits and Cleared Permits |
-| Ingestion and history | Python, Toronto CKAN APIs, dlt SCD2, full-source Parquet snapshots |
-| Warehouse | DuckDB; raw source tables plus dbt-built relations in the `analytics` schema |
-| Transformation | dbt staging views, revision-level fact models, dimensions, analytical marts |
-| Data quality | Pytest coverage for ingestion and SCD2 behaviour; dbt unit, schema, relationship, and uniqueness tests; strict static analysis by default; explicit conflict flags and duration exclusions |
-| Automation | Separate GitHub Actions workflows: CI validates code and dependencies; CD publishes production assets and deploys dbt docs after successful eligible CI runs on `main` |
-| Delivery | Rolling GitHub Release assets, hosted dbt documentation, and a Streamlit dashboard |
+| Ingestion | Python, dlt, Toronto CKAN API extraction, retries, explicit source types, validation, and Parquet snapshots. |
+| Warehouse history | SCD Type 2 tracking for source changes observed between ingestion runs. |
+| Analytics engineering | One dbt project for DuckDB and Snowflake, with staging models, revision-level facts, dimensions, marts, contracts, tests, and documentation. |
+| Reliability | Regression tests, freshness and completeness checks, a verified rolling-release publication with recovery safeguards, and separate CI/CD workflows. |
+| Data product | A deployed Streamlit dashboard with explicit backend selection and read-only Snowflake access. |
 
-## End-to-end architecture
+The analysis is descriptive, not causal. It examines observed active-permit ages and dates recorded for permits marked `Closed`; it does not claim to explain why a permit took a given amount of time.
+
+## Architecture
 
 ```mermaid
-flowchart TD
-    A["City of Toronto Open Data<br/>Active Permits"] --> X["Python + dlt ingestion<br/>CKAN extraction and validation"]
-    B["City of Toronto Open Data<br/>Cleared Permits"] --> X
-    X --> P[Full-source Parquet snapshots]
-    X --> R["DuckDB raw tables<br/>SCD2 source history"]
-    R --> S["dbt staging views<br/>Typing, normalization, source metadata"]
-    S --> FA[fct_active_permit_revision]
-    S --> FC[fct_cleared_permit_revision]
-    FA --> MA[mart_active_permit_age]
-    FC --> MC[mart_cleared_lifecycle_by_year_type]
-    FC --> D[dim_date and dim_permit_type]
-    MA --> W[Published DuckDB warehouse]
-    MC --> W
-    D --> W
-    P --> G[Rolling warehouse-latest GitHub Release]
-    W --> G
-    MA --> DOCS[Generated dbt documentation]
-    MC --> DOCS
-    D --> DOCS
-    DOCS --> G
-    DOCS --> Pages[GitHub Pages site]
-    G --> ST[Streamlit dashboard]
+flowchart TB
+    A[City of Toronto: Active Permits]
+    C[City of Toronto: Cleared Permits]
+    E[Python + dlt: extract, type, validate]
+    P[Validated Active and Cleared Parquet snapshots + manifest]
+    D[DuckDB RAW: SCD2 history]
+    S[Snowflake RAW: SCD2 history, optional and gated]
+    TD[Shared dbt project: DuckDB target]
+    TS[Shared dbt project: Snowflake target]
+    W[DuckDB warehouse: RAW + dbt relations]
+    SM[Snowflake analytics serving schema]
+    R[Rolling warehouse-latest release]
+    DOCS[Generated dbt documentation]
+    APP[Streamlit dashboard<br/>DASHBOARD_BACKEND selects the source]
+
+    A --> E
+    C --> E
+    E --> P
+    P --> D
+    P -->|Exact CD-run snapshot bundle, as a workflow artifact| S
+    D --> TD
+    S --> TS
+    TD --> W
+    TS --> SM
+    W -->|DuckDB warehouse| R
+    P -->|Active and Cleared Parquet snapshots| R
+    TD --> DOCS
+    DOCS -->|dbt documentation ZIP| R
+    DOCS --> Pages[GitHub Pages]
+    R -->|DASHBOARD_BACKEND=duckdb| APP
+    SM -->|DASHBOARD_BACKEND=snowflake| APP
 ```
 
-The dimensions are separately modeled and tested; the current serving marts are purpose-built outputs and do not imply that every dimension is joined into every mart.
+Each refresh extracts the two configured sources once and validates the resulting snapshots. DuckDB publication remains the routine CI/CD path. After an eligible successful main-branch CD run, the optional Snowflake chain can consume the exact snapshot bundle from that run, refresh `TORONTO.RAW`, and then build the analytics serving schema. Snowflake RAW was initialized from a baseline snapshot; subsequent refreshes extend observed SCD2 history rather than recreate a fresh baseline. `DASHBOARD_BACKEND` selects which backend the same dashboard reads; a connection failure is shown rather than silently substituting results from the other warehouse.
 
-## Scope and source data
+## Source scope and analytical design
 
-The configured ingestion scope contains exactly two datasets:
+The current ingestion scope is limited to two City of Toronto datasets: [Active Permits](https://open.toronto.ca/dataset/building-permits-active-permits/) and [Cleared Permits](https://open.toronto.ca/dataset/building-permits-cleared-permits/). Both source configurations use `warehouse_since: 2020-01-01` on `APPLICATION_DATE`; full-source Parquet snapshots are retained independently of that warehouse cutoff.
 
-- [Active Permits](https://open.toronto.ca/dataset/building-permits-active-permits/) — the current active population used for aging analysis.
-- [Cleared Permits](https://open.toronto.ca/dataset/building-permits-cleared-permits/) — permits with cleared outcomes and lifecycle dates used for elapsed-time analysis.
+The project deliberately does not ingest Development Applications, Preliminary Zoning Reviews, or Address Points. Those were considered during discovery but remain deferred until profiling shows that their grain, identifiers, linkage coverage, and join cardinality support reliable analysis. The [dataset-scope decision record](docs/decisions/0001-dataset-scope.md) explains the trade-offs.
 
-CKAN extraction prefers paginated DataStore API retrieval and supports CSV/JSON fallback resources. Full-source Parquet snapshots are preserved independently of the analytical warehouse cutoff. The warehouse load applies `APPLICATION_DATE >= 2020-01-01` to both configured sources.
+| Model | Grain and purpose |
+|---|---|
+| `stg_active_permits`, `stg_cleared_permits` | One row per raw SCD2 source version; casts source fields while retaining selected raw values and version metadata. |
+| `fct_active_permit_revision` | One row per current logical revision keyed by `permit_num`, `revision_num`, and `permit_type`; consolidates duplicate physical rows and surfaces disagreements. |
+| `fct_cleared_permit_revision` | Same logical key; preserves signed lifecycle intervals and exposes analysis durations only when non-negative. |
+| `dim_date` | Continuous calendar date dimension for dates observed in the Cleared fact. |
+| `dim_permit_type` | Distinct permit types observed in either source fact, tested against both revision facts. |
+| `mart_active_permit_age` | Current Active revisions with age, an eligibility flag, and a reason-coded exclusion. |
+| `mart_cleared_lifecycle_by_year_type` | Calendar-day lifecycle summaries by application year, permit type, and date pair; reports median, 90th percentile, maximum, counts, and negative intervals. |
 
-Additional datasets were considered during discovery but are not part of the current ingestion scope. The [dataset-selection decision record](docs/decisions/0001-dataset-scope.md) documents the evidence, trade-offs, and validation gates for reconsidering Development Applications, Preliminary Zoning Reviews, and Address Points. These candidates are not treated as integrated sources.
+The dimensions are separately modeled and tested; the serving marts are purpose-built outputs and do not imply that every dimension is joined into every mart. Strict dbt static analysis is enabled by default. The Cleared staging model keeps a documented baseline exception because the analyzer cannot resolve DuckDB's timezone expression without a verified semantics-safe alternative.
 
-## Analytics engineering and model design
+**Metric rules.** Active age is calendar days from `application_date` to dbt's `as_of_date` (normally derived from the run start, with a variable for reproducible comparisons). Missing or conflicting status/application dates, and terminal or exceptional statuses (`abandoned`, `cancelled`, `closed`), are excluded from the age cohort with reason codes. Cleared lifecycle measures compare application, issue, and completion dates for records marked `Closed`; negative intervals remain available for diagnosis but are excluded from published duration statistics. Measures are calendar days, not business days.
 
-The models make their grain and data-quality handling explicit rather than silently selecting one row when source values disagree.
+## Important findings and decisions
 
-| Model | Grain / role | Important behaviour |
-|---|---|---|
-| `stg_active_permits` | One row per raw SCD2 source version | Casts dates and numeric values, retains selected raw values alongside casts, and carries source-version metadata into dbt. |
-| `stg_cleared_permits` | One row per raw SCD2 source version | Applies corresponding typing and normalizes the completion timestamp to its UTC calendar date. |
-| `fct_active_permit_revision` | One row per current logical revision, keyed by `permit_num`, `revision_num`, and `permit_type` | Consolidates duplicate current source rows; publishes key attributes only when the observed values agree; retains diagnostic values and conflict flags. |
-| `fct_cleared_permit_revision` | One row per current logical revision using the same three-column key | Consolidates duplicate current rows, retains signed raw lifecycle intervals, and exposes analysis-facing durations only when the interval is non-negative. |
-| `dim_permit_type` | One row per distinct permit type represented in the Cleared fact | The fact-to-dimension relationship is tested for both revision facts. |
-| `dim_date` | One row per calendar date across lifecycle dates observed in the Cleared fact | Provides calendar attributes and a continuous date spine. |
-| `mart_active_permit_age` | One row per logical current Active revision | Computes elapsed calendar days from application date to a configurable `as_of_date` and carries an explicit eligibility flag and exclusion reason. |
-| `mart_cleared_lifecycle_by_year_type` | One row per application year, permit type, and lifecycle measure | Summarizes non-negative durations using median, 90th percentile, and maximum, while separately reporting date-pair counts and negative intervals. |
-
-### Metric and eligibility rules
-
-**Active-permit age** is elapsed calendar days from `application_date` to the model's `as_of_date`. The default as-of date comes from the dbt run start time and can be overridden with the `as_of_date` variable. The age cohort excludes revisions with conflicting or missing status, status values classified as terminal or exceptional (`abandoned`, `cancelled`, or `closed`), conflicting application dates, or missing application dates. Exclusions are reason-coded instead of being silently dropped.
-
-**Cleared-permit lifecycle durations** are elapsed calendar days between application, issue, and completion dates. The summary uses records marked `Closed`, grouped by application year and permit type. Negative intervals remain visible in raw duration fields and quality flags but are excluded from published duration statistics. These are calendar-day measures, not business-day measures.
-
-Selected staging fields preserve their raw source values beside typed values. Current physical rows are grouped to a logical revision only after current SCD2 versions are selected; missing-versus-present values and conflicting values are surfaced through diagnostics instead of being arbitrarily resolved.
+- **CKAN is not a stable row-count endpoint.** Observed source totals have changed between requests, and the JSON resource has returned HTTP 502; HTTP 409 and 500 responses have also been observed. Extraction retries and restarts a changing paginated pull, validates required columns and completed row counts, and fails safely rather than accepting an incomplete snapshot.
+- **Source types are part of the data contract.** Explicit source-declared types and type hints protect identifiers and numeric-looking text—including values with leading zeros—from accidental conversion. Raw values are retained beside selected typed fields for inspection.
+- **SCD2 versions should represent meaningful changes.** The logical revision key is `permit_num` + `revision_num` + `permit_type`. The tracked-row hash excludes CKAN's `_id` and normalizes selected numeric fields to avoid false versions caused by source identity or representation. Regression checks cover unchanged replay and a controlled tracked-attribute change ([SCD2 test PR](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/pull/76)).
+- **Snowflake starts from a fresh baseline.** The new `TORONTO.RAW` history was initialized from a complete validated snapshot. Old DuckDB SCD2 history was not migrated, and missed days were not reconstructed. Snowflake history records changes observed from this baseline forward; validity windows are bounded by ingestion observations and do not prove exact real-world transition times.
+- **One extraction feeds both backends.** The same validated snapshot bundle is used for DuckDB and Snowflake. Both targets use the same dbt model definitions and business rules; only necessary warehouse-specific SQL is isolated. There are no parallel model trees or duplicated extraction pipelines.
+- **A Snowflake failure must not take down DuckDB publication.** DuckDB, Parquet, and dbt documentation publication remain the normal CI/CD path. Snowflake work runs in separate, gated workflows. The release publisher verifies the assets, keeps a backup of the last-known-good publication, and attempts rollback if replacement fails; a recovery artifact is preserved if rollback also fails.
+- **The dashboard and workflow gate are separate controls.** `DASHBOARD_BACKEND` chooses the dashboard's data source. The GitHub repository variable `SNOWFLAKE_OPERATIONS_ENABLED` controls whether Snowflake workflow jobs may run. Switching the dashboard to DuckDB alone does not disable GitHub Actions compute.
 
 ## Data-quality snapshot
 
-The following values describe the published warehouse observed on **October 18, 2026**. They are a point-in-time illustration of the checks, not permanent totals; the release is refreshed and these values may change.
+These source and model counts describe the published DuckDB warehouse observed on **October 18, 2026**. They are a dated illustration of the checks, not expected permanent totals.
 
-| Check | Observed value | Interpretation |
+| Check | Observed value | Meaning |
 |---|---:|---|
-| Active source rows across SCD2 history | 101,598 | Includes historical versions, not just the current source snapshot. |
-| Current physical Active source rows | 99,149 | Current SCD2 rows before consolidating duplicate physical rows. |
-| Logical current Active revisions | 99,145 | One row per `permit_num` + `revision_num` + `permit_type`; four physical rows are excess duplicates. |
-| Active revisions eligible for age analysis | 99,074 | Eligible records after the documented status and application-date checks. |
-| Active revisions excluded from age analysis | 71 | Two have missing status; 69 have terminal or exceptional status in this snapshot. |
-| Active builder-name conflict groups | 4 | Current physical rows disagree on builder name within the logical revision. |
-| Current physical Cleared source rows | 186,430 | Current SCD2 rows before consolidation. |
-| Logical current Cleared revisions | 186,425 | One row per logical revision; five physical rows are excess duplicates. |
-| Cleared builder-name conflict groups | 5 | Builder-name disagreements are identified rather than silently resolved. |
-| Cleared lifecycle-date conflict groups | 0 observed | No disagreements were observed across current source rows for the modeled lifecycle-date fields in this snapshot. |
+| Active source rows across SCD2 history | 101,598 | Includes current and expired versions. |
+| Current physical Active rows | 99,149 | Before consolidating duplicate physical rows. |
+| Logical current Active revisions | 99,145 | One per logical revision key. |
+| Active revisions eligible for age analysis | 99,074 | After the published status/date rules. |
+| Active revisions excluded from age analysis | 71 | 2 missing status; 69 terminal or exceptional status. |
+| Active builder-name conflict groups | 4 | Conflicting values retained as diagnostics. |
+| Current physical / logical Cleared revisions | 186,430 / 186,425 | Five excess physical rows after consolidation. |
+| Cleared builder-name conflict groups | 5 | Conflicts are surfaced rather than arbitrarily resolved. |
+| Cleared lifecycle-date conflict groups | 0 observed | No conflict found for the modeled lifecycle-date fields in that snapshot. |
 
-The fact that source rows or attributes conflict does not automatically mean the entire ingestion run is discarded. The pipeline retains quality signals; dbt models then apply explicit eligibility and publication rules appropriate to each analysis.
+## Validation evidence
 
-## Testing, automation, and publication
+The following results are tied to specific workflow runs and inputs; they are not guarantees about later refreshes.
 
-GitHub Actions was added **after the initial ingestion pipeline and its core checks were established**. Automation evolved with the project rather than being presented as the starting point.
+| Validation | Evidence |
+|---|---|
+| Fresh-baseline SCD2 behaviour | The [successful Snapshot Baseline and Replay run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40491637116), added in [PR #76](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/pull/76), verified that an unchanged replay added no versions and a controlled `STATUS` change created the expected version. |
+| DuckDB/Snowflake parity | [Run 40482009588](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40482009588), using `as_of_date=2026-10-27`: compared dimensions, facts, and marts had zero row-value mismatches, and dashboard summary metrics matched. Staging was compared on schema, grain/count, and semantic types rather than row by row. |
+| Automatic refresh chain | On commit [`e8bb994`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/e8bb994c8ec664d2da7d12d1c296a1b15da3dc49), [CI](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622105661), [CD/publication](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622186735), [canonical RAW refresh](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622867433), and [serving build](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40623059248) all succeeded on **October 27, 2026, Toronto time**. RAW and serving runs triggered automatically in sequence. |
+| Gate-off / DuckDB fallback | On October 28, 2026, the GitHub variable was set to `false`. [Manual CI](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40630130221) and [the resulting CD publication](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40630228426) succeeded on the same commit. The automatically triggered [RAW refresh](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40631433875) and [serving build](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40631450406) skipped as intended. The project owner confirmed the public dashboard loaded successfully after switching `DASHBOARD_BACKEND` to `duckdb`. |
 
-### Pull-request validation
+For the parity run, `MART_ACTIVE_PERMIT_AGE` had 98,869 rows (98,798 eligible and 71 excluded), `FCT_CLEARED_PERMIT_REVISION` had 188,819 rows, and the lifecycle mart had 300 summary groups. The comparison covered 481,927 lifecycle date pairs before excluding three negative intervals from duration statistics. These counts belong to that isolated parity baseline, not a later canonical RAW refresh. The parity job on PR #82 was skipped because the Snowflake workflow gate was off during that PR; the separately linked parity run provides the comparison evidence.
 
-The workflow validates Python linting and formatting, runs automated tests, audits Python dependencies, and builds the package. It also validates dashboard dependencies. The dbt validation job downloads the latest published warehouse and runs `dbt debug`, `dbt parse`, `dbt build`, and documentation generation/package checks against it. That checks transformation changes against a real published dataset without requiring every pull request to run a full live-source extraction.
+## Automation, publication, and operating controls
 
-### Main-branch publication and scheduled refresh
-
-CI and CD are separate workflows. `ci.yml` runs the core test/build and dashboard-dependency jobs for pull requests and main-branch runs; its dbt-validation job runs on pull requests against the latest published warehouse, including model tests and documentation-packaging checks. CI is scheduled daily at **10:00 America/Toronto** and also supports pushes to `main` and manual dispatches. The separate `cd.yml` workflow listens for CI completion. Its production jobs run only when CI concludes successfully, the originating branch is `main`, and the triggering event was not a pull request. CD checks out the exact commit reported by the completed CI run, then extracts the two configured sources, runs ingestion/SCD2 and warehouse validations, builds and tests dbt models, generates documentation, and publishes the assets. GitHub Pages deployment is a downstream job that starts only after data publication succeeds.
+The architecture diagram above describes the data path; this separate view shows the automated GitHub Actions path from validation through DuckDB publication to the optional Snowflake refresh. Separate manually dispatched baseline/replay, Snowflake dbt validation, and smoke workflows, plus gated pull-request parity, are described below but not drawn here.
 
 ```mermaid
-flowchart TD
-    PR["Pull request"] --> PYCHECK["CI: Python tests, lint/format, package build"]
-    PR --> DBTCHECK["CI dbt validation: build/tests and docs packaging against published warehouse"]
-    PR --> DEPCHECK["CI: dashboard dependency check"]
-    MAIN["Push to main, daily schedule, or manual dispatch"] --> CI["CI: core tests/build and dashboard dependency check"]
-    CI -->|successful CI completion on main| CD["CD checks out the exact validated commit"]
-    CD --> INGEST["Extract Active and Cleared Permits"]
-    INGEST --> VALIDATE["Ingestion/SCD2 and warehouse validation"]
-    VALIDATE --> DBT["dbt build/tests and docs generation"]
-    DBT --> PUB["Publish Active/Cleared Parquet, DuckDB, and dbt docs ZIP"]
-    PUB --> PAGES["Deploy dbt docs to GitHub Pages"]
-    PUB --> APP["Streamlit dashboard reads published DuckDB"]
+flowchart TB
+    PR[Pull request] --> CI[CI checks, tests, security and packaging]
+    TRIG[Path-eligible main push / daily 23:00 America/Toronto / manual dispatch] --> CI
+    CI -->|Successful non-PR CI run on main| CD[CD: extract, validate, test dbt and publish DuckDB assets]
+    CD --> DOCS[Deploy dbt docs after successful data publication]
+    CD -->|Successful CD run and Snowflake gate enabled| RAW[Refresh Snowflake RAW from the matching run snapshot]
+    RAW -->|RAW refresh succeeded and gate remains enabled| SERVE[Build Snowflake analytics serving schema]
 ```
 
-Strict dbt static analysis is enabled by default. The cleared staging model has a documented baseline exception for a DuckDB timezone expression that the analyzer cannot resolve; the exception is retained until a semantics-safe alternative is verified.
+- **CI** validates Python linting/formatting, tests, dependency security, packaging, and dashboard dependencies. Pull requests also build and test dbt against the latest published DuckDB warehouse and check documentation packaging. The daily CI schedule is **23:00 America/Toronto** so the subsequent CD source refresh runs in the late-night Toronto window, reducing exposure to observed CKAN API instability. The schedule uses the `America/Toronto` IANA timezone to follow local time across daylight-saving changes. Main-branch push triggers are path-filtered, and manual dispatch is available. Late-night timing does not replace retries, completeness checks, or snapshot validation; it cannot guarantee upstream API availability.
+- **CD** runs only after successful eligible CI on `main` and checks out that exact commit. It extracts and validates both sources, runs SCD2/warehouse checks and dbt tests, and publishes the rolling assets. Hosted dbt documentation deploys only after successful data publication. The Snowflake refresh consumes the validated snapshot bundle from that CD run, rather than extracting the sources again.
+- **Rolling release** `warehouse-latest` contains the DuckDB warehouse, Active and Cleared Parquet snapshots, and a dbt documentation ZIP. It is a replaceable latest release—not a versioned history of immutable warehouse states. The validated snapshot bundle used by automatic Snowflake refresh is a workflow artifact, not an additional release asset.
+- **Snowflake gate.** The exact repository variable value `SNOWFLAKE_OPERATIONS_ENABLED=true` enables the guarded jobs in `snowflake-canonical-raw-refresh.yml`, `snowflake-serving-schema.yml`, `snowflake-dbt.yml`, `snowflake-live-ingestion-smoke.yml`, `snowflake-parity.yml`, and `snowflake.yml`. If false or unset, the guarded jobs skip before connecting; a workflow record marked `skipped` is expected. The gate does not cancel a job already running. Pull-request parity can consume Snowflake compute when the gate is enabled.
 
-The `warehouse-latest` release is a **rolling asset publication**, not a semantic-version release or a history of immutable warehouse snapshots. Its assets are:
+For a trial-end or planned shutdown, set `SNOWFLAKE_OPERATIONS_ENABLED` to `false` or remove it; separately set the deployed Streamlit `DASHBOARD_BACKEND` to `duckdb`; verify the public dashboard loads the published DuckDB asset and a fresh DuckDB publication succeeds; inspect and stop/wait for any already-running Snowflake jobs; then remove unused Snowflake credentials. Trial expiry and resource monitors are not substitutes for disabling the workflow gate. See the [Snowflake operations guide](infra/snowflake/README.md) for account setup, role grants, manual workflow conditions, secrets, and verification steps.
 
-- [DuckDB warehouse](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto.duckdb) — source tables plus dbt-built relations.
-- [Active Permits Parquet snapshot](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-active-permits.parquet) — full-source snapshot.
-- [Cleared Permits Parquet snapshot](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-cleared-permits.parquet) — full-source snapshot.
-- [dbt documentation archive](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-dbt-docs.zip) — downloadable copy of the generated static site, including its assets and local viewing instructions.
-
-The [hosted dbt documentation site](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/) is deployed to GitHub Pages after successful main-branch data publication. The archive remains available for offline review.
-
-## Published dbt documentation
-
-**[Browse the generated dbt documentation site](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)**
-
-The hosted site exposes the generated dbt model documentation and project metadata. GitHub Actions publishes the static site after a successful main-branch data refresh and dbt build. For offline review, download the [dbt documentation ZIP](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto-dbt-docs.zip), extract it, and run `python3 -m http.server 8000` from the extracted directory before opening `http://localhost:8000/`.
+**Gate-off validation completed on October 28, 2026.** With `SNOWFLAKE_OPERATIONS_ENABLED=false`, the manual CI run and subsequent DuckDB CD publication succeeded, while the automatically triggered Snowflake RAW refresh and serving build skipped. The project owner also confirmed that the public dashboard loaded successfully after changing `DASHBOARD_BACKEND` to `duckdb`. This demonstrates that Snowflake can be disabled without changing the DuckDB publication path. For a future planned shutdown, still check for already-running Snowflake jobs and verify the exact account trial end in Snowsight; trial expiry and resource monitors are not substitutes for the workflow gate.
 
 ## Live dashboard
 
-**[Explore Toronto Housing Bottleneck Analytics](https://toronto-housing-bottleneck.streamlit.app/)**
+**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. As verified on October 28, 2026, the public deployment is currently configured to query the published DuckDB release; a local run also defaults to DuckDB if `DASHBOARD_BACKEND` is omitted. The optional Snowflake backend remains available by explicitly setting `DASHBOARD_BACKEND` to `snowflake` and configuring its read-only credentials. Both paths query analytics relations rather than calling Toronto CKAN directly. Results are cached for 24 hours, with a manual refresh option. The dashboard has four sections:
 
-The Streamlit app downloads the published `toronto.duckdb` asset from GitHub and queries the `analytics` models read-only. It does not connect live to Toronto's CKAN endpoints. Query results are cached for 24 hours, with a manual refresh option.
+- **Overview** — high-level active-age and closed-permit lifecycle summaries.
+- **Active permits** — age distributions and comparisons by permit type, including record-level detail.
+- **Permits marked Closed** — lifecycle date-pair comparisons by application year and permit type.
+- **Data & definitions** — eligibility, exclusions, data-quality checks, metric definitions, and caveats.
 
-The four sections are:
+The dashboard distinguishes within-group summary statistics from statistics across individual revisions; a median of group medians is not presented as the median of all permits.
 
-- **Overview** — high-level view of active aging and closed-permit lifecycle measures.
-- **Active permits** — age distributions and comparisons by permit type, with record-level details.
-- **Permits marked Closed** — date-pair duration comparisons by application year and permit type.
-- **Data & definitions** — eligibility and exclusion counts, data-quality checks, metric definitions, and caveats.
+## Review the project locally
 
-The dashboard's summaries intentionally distinguish statistics calculated within each year/type group from statistics over individual permit revisions. This avoids presenting a median of group medians as though it were a median across all underlying permits.
-
-## Review or run the project locally
-
-### 1. Set up Python and run the offline tests
-
-Use Python 3.14.x. From the repository root:
+Python **3.14.x** is used for ingestion and tests. From the repository root:
 
 ```bash
 git clone https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics.git
@@ -183,11 +163,9 @@ python -m pytest -q \
   --ignore=tests/integration/test_scd2_active_permits.py
 ```
 
-This test command is intended to run without a previously extracted Toronto dataset or a local warehouse. Other tests need captured ingestion data, a warehouse, or network access; see the [test guide](tests/README.md). The end-to-end setup test downloads a full Active Permits source and should be run deliberately.
+That test command is intended to run without a locally extracted Toronto dataset or warehouse. Other tests may require captured data, a warehouse, or network access; see the [test guide](tests/README.md). The full end-to-end setup test downloads a source dataset and should be run deliberately.
 
-### 2. Build dbt models against the latest published warehouse
-
-This route lets a reviewer validate the transformation layer without re-running the full ingestion first. Use a **separate dbt virtual environment** to match CI's isolation and keep dbt dependencies separate from the ingestion package. Run from the repository root:
+To build dbt against the latest published warehouse, use a **separate dbt virtual environment** and a copy of the database so you do not modify the downloaded release asset:
 
 ```bash
 mkdir -p data/warehouse "$HOME/.venvs"
@@ -208,63 +186,49 @@ dbt docs generate --profiles-dir . --output-dir target/docs-site
 cd ..
 ```
 
-The copied database is used so a local dbt build does not modify the downloaded release file. To view the generated documentation locally, serve the generated `dbt/target/docs-site` directory with a static HTTP server, for example `python3 -m http.server 8000` from inside that directory, and open `http://localhost:8000/`.
+Serve `dbt/target/docs-site` with `python3 -m http.server 8000` from that directory to view the generated docs at `http://localhost:8000/`.
 
-### 3. Run the dashboard locally (optional)
-
-The dashboard pins its own dependency set, including a newer pandas release than the ingestion package, so install it in a **separate virtual environment** rather than mixing dashboard and ingestion dependencies:
+To run the dashboard locally, create a separate environment for its pinned dependencies:
 
 ```bash
-mkdir -p "$HOME/.venvs"
 python3.14 -m venv "$HOME/.venvs/toronto-housing-dashboard"
 source "$HOME/.venvs/toronto-housing-dashboard/bin/activate"
 python -m pip install -r dashboard/requirements.txt
 streamlit run dashboard/app.py
 ```
 
-The app loads the rolling published DuckDB asset from GitHub. It does not require local ingestion data, but it does require network access to download the release asset. The example keeps this virtual environment outside the repository.
+The local dashboard downloads the published DuckDB asset and therefore needs network access. To use Snowflake locally, configure `DASHBOARD_BACKEND` and the `[snowflake]` values in Streamlit secrets; never commit private keys or passphrases.
 
 ## Repository guide
 
 | Path | Purpose |
 |---|---|
-| `src/toronto_housing_ingestion/` | Python ingestion, extraction, validation, and warehouse-loading code. |
-| `open_data_config.yml` | Configured source definitions and ingestion settings. |
-| `tests/` | Unit, integration, source-fallback, warehouse, and SCD2 regression tests. |
-| `dbt/models/staging/` | Source staging views and column documentation/tests. |
-| `dbt/models/marts/` | Revision facts, dimensions, analysis marts, model documentation, and unit tests. |
-| `dbt/macros/` | Adapter-dispatched date and aggregation macros. DuckDB is the tested execution target; Snowflake is not an end-to-end configured deployment. |
-| `.github/workflows/ci.yml` | Core tests and package build; pull-request dbt validation against the published warehouse; dashboard dependency checks; daily schedule and manual trigger. |
-| `.github/workflows/cd.yml` | Post-CI production ingestion and validation, dbt build/tests, rolling asset publication, and gated GitHub Pages deployment. |
-| `dashboard/app.py` | Streamlit application. |
-| `docs/decisions/0001-dataset-scope.md` | Dataset-selection decision record, evidence, trade-offs, and gates for future expansion. |
+| `src/toronto_housing_ingestion/`, `open_data_config.yml` | Extraction, validation, source typing, and warehouse loading. |
+| `tests/` | Unit/integration tests, source-fallback tests, warehouse checks, and SCD2 regressions. |
+| `dbt/models/staging/` | Source staging, type normalization, metadata, docs, and tests. |
+| `dbt/models/marts/`, `dbt/macros/` | Facts, dimensions, marts, tests, and minimal adapter-specific SQL. |
+| `.github/workflows/ci.yml`, `cd.yml` | Validation, production extraction, dbt builds, rolling publication, and docs deployment. |
+| `.github/workflows/snowflake*.yml` | Optional gated Snowflake baseline, refresh, serving, smoke, and parity workflows. |
+| `dashboard/app.py` | Streamlit data product with explicit backend selection. |
+| `infra/snowflake/` | Snowflake setup SQL and operating guide. |
+| `docs/decisions/0001-dataset-scope.md` | Dataset-selection rationale and gates for expanding source scope. |
 
-## Limitations and interpretation guardrails
+## Limitations and deliberate non-goals
 
-- **Active ages are right-censored observations.** The permit is still marked active in the current source; its final issue or completion time is not yet known from that record.
-- **The Closed cohort is selected by its recorded status.** It should not be treated as a complete or unbiased representation of all permit applications, and recent application years are especially affected by closure-selection bias.
-- **2026 is a partial year.** Comparisons with complete years need caution.
-- **Durations are calendar days, not business days.** Negative date intervals are retained for diagnosis and excluded from published duration statistics.
-- **Source history is not a complete event ledger.** SCD2 preserves changes observed across ingestion runs; it cannot reconstruct status transitions that were never present in the source snapshots.
-- **Source quality varies.** Repeated physical rows, missing attributes, special statuses, and conflicting values may affect the eligible cohort. These cases are counted or flagged explicitly.
-- **The latest data assets roll forward.** The current release is not a point-in-time archive of every prior warehouse state; dashboard outputs can change after refreshes.
-- **This is descriptive analysis, not causal inference.** The data alone do not identify why an application or permit took longer.
+- **Active ages are right-censored:** the final issue or completion date is not yet known from an active record.
+- **The `Closed` cohort is selected by recorded status:** it is not a complete or unbiased sample of all applications, especially for recent application years. 2026 is partial.
+- **Durations are calendar days:** negative intervals remain diagnostic but are excluded from summaries.
+- **SCD2 is observed history, not a complete event ledger:** changes between snapshots and exact real-world status-transition times cannot be inferred.
+- **The release rolls forward:** it does not preserve every previous warehouse version as an immutable archive.
+- **No causal claims:** the available fields do not establish why a permit took longer.
+- **Deferred work:** additional datasets, historical DuckDB-to-Snowflake SCD2 reconciliation, a new orchestration framework, parallel dbt model trees, and a dbt Semantic Layer are outside the current scope. A semantic layer may be considered once metric definitions and consumption needs are stable.
 
 ## Project timeline and development practice
 
-- **By September 27, 2026 UTC:** earliest preserved project artifacts show that exploratory and ingestion work was already underway.
-- **October 4, 2026 UTC:** first public Git commit in the repository history.
-- **October 16, 2026:** GitHub Actions validation and data-asset publication were introduced after the initial ingestion workflow and core checks had been established.
-- **October 18, 2026 (Toronto time):** dbt warehouse validation and documentation-packaging checks were added to pull-request CI; the Streamlit dashboard and hosted dbt documentation were deployed. The CI/CD split was also merged and verified end to end: [post-merge CI run #35](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/39179649087) and [CD run #1](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/39179772013) both succeeded, and all four rolling release assets were refreshed.
+The earliest preserved artifacts date to **September 27, 2026 (UTC)**; the first public Git commit was **October 4**. Ingestion and core checks came first. GitHub Actions publication was added in mid-October; dbt pull-request validation, the Streamlit dashboard, hosted docs, and the CI/CD split followed on October 18 ([CI run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/39179649087), [CD run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/39179772013)). Late October brought the fresh Snowflake baseline, same-snapshot parity validation, explicit dashboard backend selection, and automatic RAW/serving refresh. The progression from preserved artifact to deployed dashboard was about three calendar weeks, not a claim about hands-on hours.
 
-The preserved-artifact date and the start of public Git history are deliberately distinguished. From the earliest preserved artifacts to the deployed dashboard was roughly a three-week calendar progression; that is not a measure of hands-on hours.
+### AI-assisted development and ownership
 
-## Use of AI-assisted development
+I owned the project requirements, scope, acceptance criteria, and final decisions on architecture and technical trade-offs across ingestion, SCD2 history, dbt, CI/CD, and the optional Snowflake path. I used LLMs as development aids to research unfamiliar concepts and APIs, compare implementation options, draft and refine code and documentation, and troubleshoot failures.
 
-I used large language models as development aids to explore implementation options, explain concepts, draft or refine code and documentation, and troubleshoot issues. I evaluated suggestions, made scope and implementation decisions, and ran the relevant validation workflows. Analytical definitions and published interpretations are grounded in source documentation, SQL/dbt model logic, tests, and observed outputs; model-generated suggestions were not treated as evidence on their own. I am responsible for the final implementation and claims.
-
-## Potential next steps
-
-- Add dbt Semantic Layer assets—semantic models, metrics, and MetricFlow—after the underlying metric definitions and consumption needs are sufficiently stable.
-- Consider additional datasets only after profiling demonstrates acceptable grain, key quality, linkage coverage, and join cardinality.
-- Evaluate a Snowflake target as a separate portability exercise; current end-to-end validation and publication use DuckDB.
+I reviewed and adapted AI-generated suggestions rather than treating them as authoritative. I verified behaviour through tests, dbt and data-validation queries, GitHub Actions results, and checks of the deployed dashboard and workflow outcomes. The final implementation decisions, validation, and documented limitations remain my responsibility.
