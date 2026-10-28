@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -38,8 +39,13 @@ class FakeConnection:
 
 
 class FakeCursor:
-    def __init__(self, relations: set[str]) -> None:
+    def __init__(
+        self,
+        relations: set[str],
+        refresh_timestamp: datetime | None = None,
+    ) -> None:
         self.relations = relations
+        self.refresh_timestamp = refresh_timestamp
         self.description: list[tuple[str]] | None = None
         self.rows: list[tuple[Any, ...]] = []
         self.closed = False
@@ -47,6 +53,14 @@ class FakeCursor:
     def execute(self, query: str, params: object = None) -> None:
         if "INFORMATION_SCHEMA.TABLES" in query:
             self.rows = [(name,) for name in sorted(self.relations)]
+        elif "DASHBOARD_REFRESH_METADATA" in query:
+            self.description = [("LAST_SUCCESSFUL_REFRESH_UTC",)]
+            self.rows = (
+                [(self.refresh_timestamp,)]
+                if "DASHBOARD_REFRESH_METADATA" in self.relations
+                and self.refresh_timestamp is not None
+                else []
+            )
         elif "MART_ACTIVE_PERMIT_AGE" in query:
             self.description = [("PERMIT_NUM",), ("IS_AGE_ELIGIBLE",)]
             self.rows = [("00123", True)]
@@ -152,18 +166,23 @@ def test_missing_relations_fail_and_close_connection(
 def test_successful_read_returns_dashboard_contract_and_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = FakeCursor(set(backend.REQUIRED_RELATIONS))
+    refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
+    cursor = FakeCursor(
+        set(backend.REQUIRED_RELATIONS) | {"DASHBOARD_REFRESH_METADATA"},
+        refresh_timestamp,
+    )
     connection = FakeConnection(cursor)
     connection_args = install_snowflake_stubs(monkeypatch, connection)
 
-    active, summary, cleared_count, flags = backend.load_snowflake_dashboard_data(
-        CONFIG
+    active, summary, cleared_count, flags, actual_refresh_timestamp = (
+        backend.load_snowflake_dashboard_data(CONFIG)
     )
 
     assert active.loc[0, "permit_num"] == "00123"
     assert bool(active.loc[0, "is_age_eligible"])
     assert summary.loc[0, "permit_type"] == "Residential"
     assert cleared_count == 3
+    assert actual_refresh_timestamp == refresh_timestamp
     assert flags["builder_name_conflict"] == 1
     assert all(
         flags[field] == 0
@@ -173,5 +192,19 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     assert connection_args["role"] == "TORONTO_DASHBOARD_ROLE"
     assert connection_args["warehouse"] == "TORONTO_XS_WH"
     assert connection_args["database"] == "TORONTO"
+    assert cursor.closed
+    assert connection.closed
+
+
+def test_refresh_timestamp_is_optional_before_first_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cursor = FakeCursor(set(backend.REQUIRED_RELATIONS))
+    connection = FakeConnection(cursor)
+    install_snowflake_stubs(monkeypatch, connection)
+
+    result = backend.load_snowflake_dashboard_data(CONFIG)
+
+    assert result[4] is None
     assert cursor.closed
     assert connection.closed

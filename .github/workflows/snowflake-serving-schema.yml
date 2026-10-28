@@ -220,6 +220,7 @@ jobs:
                   "DIM_PERMIT_TYPE",
                   "MART_ACTIVE_PERMIT_AGE",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "DASHBOARD_REFRESH_METADATA",
               }
               cursor.execute(
                   "SELECT TABLE_NAME "
@@ -269,6 +270,37 @@ jobs:
             --target snowflake \
             --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
 
+      - name: Ensure dashboard refresh metadata table exists
+        run: |
+          python - <<'PYMETA'
+          import os
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_DBT_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+              schema="ANALYTICS",
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  """CREATE TABLE IF NOT EXISTS TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA (
+                      REFRESH_ID NUMBER(1,0) NOT NULL,
+                      LAST_SUCCESSFUL_REFRESH_UTC TIMESTAMP_TZ NOT NULL,
+                      SOURCE_COMMIT VARCHAR NOT NULL,
+                      WORKFLOW_RUN_ID VARCHAR NOT NULL
+                  )"""
+              )
+              print("Dashboard refresh metadata table is ready.")
+          finally:
+              cursor.close()
+              connection.close()
+          PYMETA
+
       - name: Regrant dashboard read-only access after dbt rebuild
         run: |
           python - <<'PYGRANT'
@@ -291,6 +323,7 @@ jobs:
                   "MART_ACTIVE_PERMIT_AGE",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
                   "FCT_CLEARED_PERMIT_REVISION",
+                  "DASHBOARD_REFRESH_METADATA",
               )
               for table in tables:
                   cursor.execute(
@@ -332,6 +365,8 @@ jobs:
                   ("ANALYTICS",),
               )
               available = {str(row[0]).upper() for row in cursor.fetchall()}
+              if "DASHBOARD_REFRESH_METADATA" not in available:
+                  raise ValueError("Dashboard refresh metadata table is missing.")
               missing = set(required) - available
               if missing:
                   raise ValueError(f"Serving relations are missing: {sorted(missing)}")
@@ -347,3 +382,62 @@ jobs:
               cursor.close()
               connection.close()
           PY
+
+      - name: Record successful dashboard refresh timestamp
+        env:
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PYREFRESH'
+          import os
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_DBT_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+              schema="ANALYTICS",
+              autocommit=False,
+          )
+          cursor = connection.cursor()
+          try:
+              cursor.execute(
+                  """MERGE INTO TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA AS target
+                  USING (
+                      SELECT 1 AS REFRESH_ID,
+                             CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()) AS LAST_SUCCESSFUL_REFRESH_UTC,
+                             %s AS SOURCE_COMMIT,
+                             %s AS WORKFLOW_RUN_ID
+                  ) AS source
+                  ON target.REFRESH_ID = source.REFRESH_ID
+                  WHEN MATCHED THEN UPDATE SET
+                      LAST_SUCCESSFUL_REFRESH_UTC = source.LAST_SUCCESSFUL_REFRESH_UTC,
+                      SOURCE_COMMIT = source.SOURCE_COMMIT,
+                      WORKFLOW_RUN_ID = source.WORKFLOW_RUN_ID
+                  WHEN NOT MATCHED THEN INSERT (
+                      REFRESH_ID, LAST_SUCCESSFUL_REFRESH_UTC, SOURCE_COMMIT, WORKFLOW_RUN_ID
+                  ) VALUES (
+                      source.REFRESH_ID, source.LAST_SUCCESSFUL_REFRESH_UTC,
+                      source.SOURCE_COMMIT, source.WORKFLOW_RUN_ID
+                  )""",
+                  (os.environ["SOURCE_COMMIT"], os.environ["SOURCE_RUN_ID"]),
+              )
+              cursor.execute(
+                  "SELECT LAST_SUCCESSFUL_REFRESH_UTC "
+                  "FROM TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA WHERE REFRESH_ID = 1"
+              )
+              row = cursor.fetchone()
+              if not row or row[0] is None:
+                  raise RuntimeError("Snowflake refresh timestamp could not be verified.")
+              connection.commit()
+              print(f"Recorded successful Snowflake refresh at {row[0]}.")
+          except Exception:
+              connection.rollback()
+              raise
+          finally:
+              cursor.close()
+              connection.close()
+          PYREFRESH

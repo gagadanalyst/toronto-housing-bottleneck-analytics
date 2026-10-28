@@ -185,6 +185,51 @@ jobs:
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
 
+      - name: Record successful refresh metadata in DuckDB
+        env:
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          from datetime import datetime, timezone
+          import os
+          import duckdb
+
+          database_path = "data/warehouse/dbt-ci/toronto.duckdb"
+          timestamp = datetime.now(timezone.utc)
+          with duckdb.connect(database_path) as connection:
+              connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
+              connection.execute(
+                  """CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
+                      refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
+                      last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
+                      source_commit VARCHAR NOT NULL,
+                      workflow_run_id VARCHAR NOT NULL
+                  )"""
+              )
+              connection.execute(
+                  "DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
+              )
+              connection.execute(
+                  "INSERT INTO metadata.dashboard_refresh_metadata "
+                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id) "
+                  "VALUES (?, ?, ?, ?)",
+                  (
+                      1,
+                      timestamp,
+                      os.environ["SOURCE_COMMIT"],
+                      os.environ["WORKFLOW_RUN_ID"],
+                  ),
+              )
+              row = connection.execute(
+                  "SELECT last_successful_refresh_utc "
+                  "FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
+              ).fetchone()
+              if not row or row[0] is None:
+                  raise RuntimeError("DuckDB refresh timestamp could not be verified.")
+              print(f"Recorded successful DuckDB refresh at {row[0]} UTC.")
+          PY
+
       - name: Promote dbt-built warehouse for publication
         run: |
           set -euo pipefail
