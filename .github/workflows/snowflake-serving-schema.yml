@@ -74,7 +74,15 @@ jobs:
               raise ValueError("Snowflake connection URI has no private_key parameter.")
 
           key_path = Path(os.environ["RUNNER_TEMP"]) / "snowflake_key.p8"
-          key_path.write_bytes(base64.b64decode(params["private_key"][0]))
+          # Query-string parsing turns an unescaped '+' into a space.
+          encoded_key = params["private_key"][0].replace(" ", "+")
+          try:
+              key_bytes = base64.b64decode(encoded_key, validate=True)
+          except ValueError as exc:
+              raise ValueError("Snowflake private_key is not valid base64.") from exc
+          if not key_bytes:
+              raise ValueError("Snowflake private_key decoded to an empty value.")
+          key_path.write_bytes(key_bytes)
           key_path.chmod(0o600)
 
           values = {
