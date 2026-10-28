@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   baseline:
+    # Keep isolated Snowflake replay tests disabled unless explicitly enabled.
+    if: vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' && github.ref == 'refs/heads/main'
     name: Load and replay an exact validated source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
