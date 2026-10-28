@@ -16,11 +16,21 @@ import requests
 import streamlit as st
 from backend_config import resolve_dashboard_backend
 from snowflake_backend import load_snowflake_dashboard_data
+from refresh_metadata import format_refresh_timestamp
 from streamlit.errors import StreamlitSecretNotFoundError
+
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24">'
+    '<path d="M3.5 21V5.5L13 2v19M13 9h7.5v12" fill="none" '
+    'stroke="#21B6E8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<path d="M6.5 8h2M6.5 11.5h2M6.5 15h2M16 12h2M16 15.5h2" fill="none" '
+    'stroke="#21B6E8" stroke-width="1.5" stroke-linecap="round"/>'
+    '</svg>'
+)
 
 st.set_page_config(
     page_title="Toronto Housing Bottleneck Analytics",
-    page_icon="🏙️",
+    page_icon=FAVICON_SVG,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -39,7 +49,7 @@ RELEASE_PAGE_URL = (
 )
 DBT_SCHEMA = "analytics"
 CACHE_TTL_SECONDS = 24 * 60 * 60
-NAV = ["Overview", "Active permits", "Permits marked Closed", "Data & definitions"]
+NAV = ["The story", "Active permits", "Closed-permit timelines", "Data quality & definitions"]
 
 
 def current_theme_type() -> str:
@@ -59,7 +69,7 @@ def current_theme_type() -> str:
     return "light"
 
 
-THEME_TYPE = current_theme_type()
+THEME_TYPE = "light"  # Use the Tableau-inspired light palette consistently
 if THEME_TYPE == "dark":
     NAVY = "#e8eef7"
     TEAL = "#45c4c8"
@@ -80,23 +90,23 @@ if THEME_TYPE == "dark":
     SCALE_LOW = "#294758"
     PLOTLY_TEMPLATE = "plotly_dark"
 else:
-    NAVY = "#17283d"
-    TEAL = "#087e8b"
-    BLUE = "#4d78a8"
-    GOLD = "#c18421"
-    RED = "#c65d55"
-    MUTED = "#62738a"
-    PAGE_BG = "#f4f7fb"
-    SIDEBAR_BG = "#eaf0f7"
-    PANEL_BG = "#ffffff"
-    PLOT_BG = "#f4f7fb"
-    TEXT_COLOR = "#17283d"
-    GRID_COLOR = "#e3eaf2"
-    BORDER_COLOR = "#d8e1eb"
-    LINK_COLOR = "#066e78"
-    HOVER_BG = "#ffffff"
-    HOVER_TEXT = "#17283d"
-    SCALE_LOW = "#c6e3e8"
+    NAVY = "#28343E"
+    TEAL = "#21B6E8"
+    BLUE = "#168DB8"
+    GOLD = "#4F91A8"
+    RED = "#D96B68"
+    MUTED = "#687783"
+    PAGE_BG = "#E2E7ED"
+    SIDEBAR_BG = "#303B46"
+    PANEL_BG = "#FFFFFF"
+    PLOT_BG = "#FFFFFF"
+    TEXT_COLOR = "#28343E"
+    GRID_COLOR = "#E1E7ED"
+    BORDER_COLOR = "#DCE3E9"
+    LINK_COLOR = "#21B6E8"
+    HOVER_BG = "#FFFFFF"
+    HOVER_TEXT = "#28343E"
+    SCALE_LOW = "#BFE8F4"
     PLOTLY_TEMPLATE = "plotly_white"
 
 st.markdown(
@@ -110,10 +120,27 @@ st.markdown(
   --app-muted: {MUTED};
   --app-border: {BORDER_COLOR};
   --app-link: {LINK_COLOR};
+  --app-sidebar-text: #F4F7FA;
+  --app-sidebar-muted: #C0CAD3;
+  --app-sidebar-link: #28B8E8;
 }}
-.block-container {{ padding-top: 1.5rem; padding-bottom: 2.5rem; max-width: 1500px; }}
+html, body, button, input, textarea, select,
+[data-testid="stAppViewContainer"], [data-testid="stSidebar"] {{
+  font-family: "Inter", "Segoe UI", "Aptos", "Helvetica Neue", Arial, sans-serif !important;
+}}
+header[data-testid="stHeader"] {{
+  background: transparent !important;
+}}
+.stDeployButton, .stAppDeployButton {{
+  display: none !important;
+}}
+.block-container {{ padding-top: 3.5rem; padding-bottom: 2rem; max-width: 1600px; }}
 [data-testid="stAppViewContainer"] {{ background: var(--app-page-bg); color: var(--app-text); }}
-[data-testid="stSidebar"] {{ background: var(--app-sidebar-bg) !important; border-right: 1px solid var(--app-border); color: var(--app-text) !important; }}
+[data-testid="stSidebar"] {{
+  background: var(--app-sidebar-bg) !important;
+  border-right: 1px solid #46515C;
+  color: var(--app-sidebar-text) !important;
+}}
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
@@ -121,21 +148,214 @@ st.markdown(
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
-[data-testid="stSidebar"] label {{ color: var(--app-text) !important; }}
-[data-testid="stSidebar"] a {{ color: var(--app-link) !important; }}
-.hero {{ background: linear-gradient(115deg,#10263f 0%,#174c66 65%,#087e8b 100%);
-        padding: 1.45rem 1.7rem; border-radius: 18px; color: white; margin-bottom: 1rem; }}
-.hero h1 {{ color: white; margin: 0 0 .35rem 0; font-size: 2rem; letter-spacing: -.025em; }}
-.hero p {{ color: #e0edf4; margin: 0; font-size: 1rem; }}
-.eyebrow {{ text-transform: uppercase; letter-spacing: .12em; font-size: .72rem; font-weight: 700; color: #b9d9e5; margin-bottom: .45rem; }}
-.section-note {{ color: var(--app-muted); font-size: .92rem; margin-top: -.25rem; margin-bottom: 1rem; }}
-.metric-card {{ border: 1px solid var(--app-border); background: var(--app-panel-bg); border-radius: 14px; padding: 1rem 1.1rem; min-height: 105px; }}
-.metric-label {{ color: var(--app-muted); font-size: .83rem; font-weight: 600; margin-bottom: .45rem; }}
-.metric-value {{ color: var(--app-text); font-size: 1.8rem; font-weight: 750; letter-spacing: -.035em; }}
-.metric-foot {{ color: var(--app-muted); font-size: .76rem; margin-top: .25rem; }}
-.callout {{ border-left: 4px solid {TEAL}; background: var(--app-panel-bg); padding: .85rem 1rem; border-radius: 0 10px 10px 0; color: var(--app-text); }}
-.small-muted {{ color: var(--app-muted); font-size: .82rem; }}
-div[data-testid="stPlotlyChart"] {{ border: 1px solid var(--app-border); border-radius: 14px; padding: .4rem; background: var(--app-panel-bg); }}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {{
+  color: var(--app-sidebar-text) !important;
+}}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+  color: var(--app-sidebar-muted) !important;
+}}
+[data-testid="stSidebar"] a {{
+  color: var(--app-sidebar-link) !important;
+  font-weight: 600;
+}}
+[data-testid="stSidebar"] [role="radiogroup"] label {{ color: var(--app-sidebar-text) !important; }}
+.hero {{
+  background: linear-gradient(120deg, #FFFFFF 0%, #EAF4F8 100%);
+  border: 1px solid #E1E7ED;
+  padding: 1.35rem 1.8rem 1.45rem;
+  border-radius: 15px;
+  color: #28343E;
+  margin-bottom: .8rem;
+  text-align: center;
+}}
+.hero h1 {{
+  color: #28343E !important;
+  margin: 0 auto .55rem auto;
+  font-size: 1.9rem;
+  font-weight: 750;
+  line-height: 1.22;
+  letter-spacing: -.02em;
+  text-align: center;
+}}
+.hero p {{
+  color: #566573 !important;
+  margin: 0 auto;
+  font-size: 1.02rem;
+  line-height: 1.55;
+  max-width: 1120px;
+  text-align: center;
+}}
+.eyebrow {{
+  text-transform: uppercase;
+  letter-spacing: .115em;
+  font-size: .88rem;
+  line-height: 1.45;
+  font-weight: 750;
+  color: #168DB8;
+  margin: 0 auto .58rem auto;
+  text-align: center;
+}}
+.section-note {{ color: var(--app-muted); font-size: .94rem; line-height: 1.55; margin-top: -.25rem; margin-bottom: 1rem; }}
+.metric-card {{
+  border: 1px solid #DFE6EC;
+  border-top: 3px solid #21B6E8;
+  background: #FFFFFF;
+  border-radius: 12px;
+  padding: 1.1rem 1rem;
+  min-height: 132px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  box-shadow: 0 3px 12px rgba(38, 52, 62, .055);
+}}
+.metric-label {{ color: #667582; font-size: .94rem; line-height: 1.35; font-weight: 650; margin-bottom: .52rem; text-align: center; }}
+.metric-value {{ color: #26343E; font-size: 2.2rem; line-height: 1.12; font-weight: 800; letter-spacing: -.035em; text-align: center; }}
+.metric-foot {{ color: #687783; font-size: .88rem; line-height: 1.45; margin-top: .55rem; text-align: center; max-width: 100%; }}
+.callout {{ border-left: 4px solid {TEAL}; background: var(--app-panel-bg); padding: .9rem 1rem; border-radius: 0 10px 10px 0; color: var(--app-text); }}
+.small-muted {{ color: var(--app-muted); font-size: .85rem; }}
+div[data-testid="stPlotlyChart"] {{ border: 1px solid var(--app-border); border-radius: 12px; padding: .45rem; background: var(--app-panel-bg); }}
+/* Sidebar brand, supporting line and action-control contrast. */
+.sidebar-brand {{
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  color: var(--app-sidebar-text, #F4F7FA);
+  font-size: 1.08rem;
+  font-weight: 750;
+  line-height: 1.25;
+  margin: .15rem 0 .2rem;
+}}
+.sidebar-brand svg {{ flex: 0 0 auto; }}
+.sidebar-tagline {{
+  color: var(--app-sidebar-muted, #C0CAD3) !important;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.45;
+  margin: .2rem 0 .55rem;
+}}
+.st-key-story_data_context [data-testid="stMarkdownContainer"],
+.st-key-story_data_context [data-testid="stCaptionContainer"] {{
+  text-align: center !important;
+}}
+.st-key-story_data_context [data-testid="stMarkdownContainer"] p,
+.st-key-story_data_context [data-testid="stCaptionContainer"] p {{
+  text-align: center !important;
+}}
+/* V13: one consistent sidebar/button palette and a visible slider surface. */
+/* All sidebar buttons share graphite default/disabled/loading colors. */
+[data-testid="stSidebar"] button,
+[data-testid="stSidebar"] button:disabled,
+[data-testid="stSidebar"] button[disabled],
+[data-testid="stSidebar"] .st-key-refresh_data_button button {{
+  appearance: none !important;
+  background: #303B46 !important;
+  background-color: #303B46 !important;
+  background-image: none !important;
+  color: #F3F6F9 !important;
+  -webkit-text-fill-color: #F3F6F9 !important;
+  border: 1px solid #687782 !important;
+  box-shadow: none !important;
+  opacity: 1 !important;
+  filter: none !important;
+  font-weight: 700 !important;
+  transition: background-color .15s ease, color .15s ease, border-color .15s ease;
+}}
+[data-testid="stSidebar"] button *,
+[data-testid="stSidebar"] .st-key-refresh_data_button button * {{
+  background: transparent !important;
+  background-color: transparent !important;
+  color: #F3F6F9 !important;
+  -webkit-text-fill-color: #F3F6F9 !important;
+  opacity: 1 !important;
+}}
+[data-testid="stSidebar"] button:hover:not(:disabled),
+[data-testid="stSidebar"] .st-key-refresh_data_button button:hover:not(:disabled) {{
+  background: #F3F6F9 !important;
+  background-color: #F3F6F9 !important;
+  background-image: none !important;
+  color: #303B46 !important;
+  -webkit-text-fill-color: #303B46 !important;
+  border-color: #21B6E8 !important;
+  box-shadow: 0 0 0 1px rgba(33, 182, 232, .14) !important;
+}}
+[data-testid="stSidebar"] button:hover:not(:disabled) *,
+[data-testid="stSidebar"] .st-key-refresh_data_button button:hover:not(:disabled) * {{
+  background: transparent !important;
+  background-color: transparent !important;
+  color: #303B46 !important;
+  -webkit-text-fill-color: #303B46 !important;
+}}
+[data-testid="stSidebar"] button:focus-visible {{
+  outline: 2px solid #21B6E8 !important;
+  outline-offset: 2px !important;
+}}
+
+/* Fallback styling for any Streamlit status component still used elsewhere. */
+[data-testid="stStatusWidget"],
+[data-testid="stStatusWidget"] *,
+div.stStatusWidget,
+div.stStatusWidget * {{
+  background-color: #303B46 !important;
+  color: #F3F6F9 !important;
+  -webkit-text-fill-color: #F3F6F9 !important;
+  border-color: #687782 !important;
+  opacity: 1 !important;
+  filter: none !important;
+}}
+[data-testid="stStatusWidget"] svg,
+div.stStatusWidget svg {{ color: #21B6E8 !important; }}
+
+/* Slightly shaded input/select surfaces. */
+div[data-testid="stNumberInput"] [data-baseweb="input"] > div,
+div[data-testid="stDateInput"] [data-baseweb="input"] > div,
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
+  background-color: #E9EEF3 !important;
+  border-color: #D0DAE4 !important;
+}}
+div[data-testid="stMultiSelect"] [data-baseweb="tag"] {{
+  background-color: #DCE6EE !important;
+  color: #28343E !important;
+}}
+
+/* Keep slider labels on the page canvas; draw a separate panel behind the control. */
+div[data-testid="stSlider"] label,
+.stSlider label {{
+  background: transparent !important;
+  background-color: transparent !important;
+}}
+div[data-testid="stSlider"],
+.stSlider {{
+  background: transparent !important;
+  background-color: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}}
+div[data-testid="stSlider"] [data-baseweb="slider"],
+.stSlider [data-baseweb="slider"] {{
+  position: relative !important;
+  z-index: 0 !important;
+  isolation: isolate !important;
+  overflow: visible !important;
+  box-sizing: border-box !important;
+  padding: .42rem .8rem .35rem !important;
+  border-radius: 10px !important;
+}}
+div[data-testid="stSlider"] [data-baseweb="slider"]::before,
+.stSlider [data-baseweb="slider"]::before {{
+  content: "" !important;
+  position: absolute !important;
+  inset: -.25rem -.55rem -.55rem !important;
+  background: #E9EEF3 !important;
+  background-color: #E9EEF3 !important;
+  border: 1px solid #D9E1E9 !important;
+  border-radius: 10px !important;
+  z-index: -1 !important;
+  pointer-events: none !important;
+}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -205,7 +425,7 @@ def snowflake_dashboard_settings() -> dict[str, Any]:
 @st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=1, show_spinner=False)
 def load_dashboard_data(
     backend: str = "duckdb", config_fingerprint: str = ""
-) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int], Any | None]:
     """Load dashboard data from the explicitly selected backend.
 
     config_fingerprint participates in Streamlit's cache key so a change to
@@ -279,6 +499,18 @@ def load_dashboard_data(
             cleared_flag_counts = {
                 key: int(value or 0) for key, value in totals.items()
             }
+
+            # The refresh timestamp is written by CD only after a successful
+            # dbt build/test run, then published as part of this DuckDB release.
+            last_successful_refresh_utc = None
+            refresh_metadata_relation = ("metadata", "dashboard_refresh_metadata")
+            if refresh_metadata_relation in available:
+                refresh_row = connection.execute(
+                    "SELECT last_successful_refresh_utc "
+                    "FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
+                ).fetchone()
+                if refresh_row:
+                    last_successful_refresh_utc = refresh_row[0]
         finally:
             connection.close()
 
@@ -288,7 +520,7 @@ def load_dashboard_data(
         raise RuntimeError(
             f"{DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type returned no records."
         )
-    return active, summary, cleared_revision_count, cleared_flag_counts
+    return active, summary, cleared_revision_count, cleared_flag_counts, last_successful_refresh_utc
 
 
 def normalize_bool(series: pd.Series) -> pd.Series:
@@ -355,6 +587,8 @@ def chart_layout(fig: go.Figure, height: int = 360) -> go.Figure:
         font=dict(family="Inter, Arial, sans-serif", color=TEXT_COLOR, size=12),
         title_font=dict(size=15, color=TEXT_COLOR),
         legend_title_text="",
+        bargap=0.22,
+        bargroupgap=0.08,
         hoverlabel=dict(bgcolor=HOVER_BG, font_color=HOVER_TEXT, font_size=12),
     )
     fig.update_xaxes(
@@ -372,10 +606,19 @@ def selected_or_all(
     return df[df[column].astype(str).isin(selection)]
 
 
-def report_sidebar(backend: str) -> tuple[str, Any]:
+def report_sidebar(backend: str) -> tuple[str, Any, Any]:
     with st.sidebar:
-        st.markdown("## 🏙️ Toronto Permits")
-        st.caption("Understanding permit timelines")
+        st.markdown(
+            '<div class="sidebar-brand">'
+            '<svg viewBox="0 0 24 24" width="25" height="25" aria-hidden="true" '
+            'focusable="false"><path d="M3.5 21V5.5L13 2v19M13 9h7.5v12" '
+            'fill="none" stroke="#21B6E8" stroke-width="1.8" stroke-linecap="round" '
+            'stroke-linejoin="round"/><path d="M6.5 8h2M6.5 11.5h2M6.5 15h2M16 12h2M16 15.5h2" '
+            'fill="none" stroke="#21B6E8" stroke-width="1.5" stroke-linecap="round"/>'
+            '</svg><span>Toronto Permits</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="sidebar-tagline">Follow the permit timeline story</div>', unsafe_allow_html=True)
         page = st.radio("Explore", NAV, label_visibility="collapsed")
         st.divider()
         st.markdown("**Where the data comes from**")
@@ -391,8 +634,10 @@ def report_sidebar(backend: str) -> tuple[str, Any]:
             st.caption(
                 "The dashboard uses Toronto Open Data processed by this project's daily pipeline."
             )
+        last_successful_refresh_slot = st.empty()
         if st.button(
             "Refresh data now",
+            key="refresh_data_button",
             width="stretch",
             help=(
                 "Re-query the Snowflake dashboard marts."
@@ -415,137 +660,166 @@ def report_sidebar(backend: str) -> tuple[str, Any]:
         st.markdown(
             "[Project repository ↗](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics)"
         )
-    return page, loading_slot
+    return page, loading_slot, last_successful_refresh_slot
 
 
-def overview(active: pd.DataFrame, summary: pd.DataFrame) -> None:
+def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
     hero(
-        "TORONTO OPEN DATA PROJECT",
-        "Toronto Housing Bottleneck Analytics",
-        "A clearer view of how long permits stay active, how long permits marked Closed took between key dates, and where the data needs a closer look.",
+        "TORONTO OPEN DATA · BUILDING PERMITS",
+        "What can permit records tell us about time?",
+        "Explore how long current Active records have been open, compare historical timelines for permits marked Closed, and see where the source data needs a closer look.",
     )
-    st.subheader("What is this project for?")
-    st.markdown("""
-    Toronto publishes building-permit records, but it can be hard to see the overall timeline or tell when records are incomplete. This project brings the data into a consistent, checked view. The goal is to make timelines easier to explore and highlight patterns worth a closer look—not to claim that the data proves what caused a delay.
-
-    You can use it to:
-
-    - see how long permits that are still active have been open;
-    - compare the time between application, issue and completion dates for permits marked **Closed**;
-    - spot missing dates, conflicting information and dates that appear out of order.
-
-    It helps describe patterns in the records. It **does not prove why a permit took longer** or show that any one factor caused a delay.
-    """)
 
     active["is_age_eligible"] = normalize_bool(active["is_age_eligible"])
-    eligible = active[active["is_age_eligible"]]
-    eligible_count = len(eligible)
+    eligible = active[active["is_age_eligible"]].copy()
+    eligible_ages = number(eligible["age_since_application_days"]).dropna()
     total_active = len(active)
+    eligible_count = len(eligible)
+    asof_values = (
+        pd.to_datetime(active["as_of_date"], errors="coerce").dropna()
+        if "as_of_date" in active
+        else pd.Series(dtype="datetime64[ns]")
+    )
     asof = (
-        str(active["as_of_date"].dropna().iloc[0])
-        if "as_of_date" in active and active["as_of_date"].notna().any()
+        asof_values.iloc[0].strftime("%d %b %Y")
+        if not asof_values.empty
         else "Not available"
     )
+
     summary["eligible_date_pairs"] = number(summary["eligible_date_pairs"])
     summary["median_days"] = number(summary["median_days"])
     summary["p90_days"] = number(summary["p90_days"])
-    years = summary["application_year"].dropna()
-    year_range = f"{int(years.min())}–{int(years.max())}" if not years.empty else "—"
+    years = number(summary["application_year"]).dropna()
+    year_range = (
+        f"{int(years.min())}–{int(years.max())}"
+        if not years.empty
+        else "Not available"
+    )
+    backend_label = (
+        "Snowflake warehouse"
+        if backend == "snowflake"
+        else "Published DuckDB snapshot"
+    )
 
+    # Compact provenance row: only show metadata supported by the loaded data/config.
+    with st.container(key="story_data_context"):
+        meta = st.columns([1, 1.25, 1.25], gap="medium")
+        with meta[0]:
+            st.markdown("**Data source**")
+            st.caption("City of Toronto Open Data")
+        with meta[1]:
+            st.markdown("**Dashboard backend**")
+            st.caption(backend_label)
+        with meta[2]:
+            st.markdown("**Active age measured through**")
+            st.caption(asof)
+
+    st.write("")
     cols = st.columns(4, gap="medium")
     with cols[0]:
         metric_card(
-            "Active permit records", fmt_int(total_active), f"Age measured as of {asof}"
+            "Active permit records",
+            fmt_int(total_active),
+            "Currently marked Active",
         )
     with cols[1]:
         metric_card(
-            "Records included in age charts",
+            "Eligible for age analysis",
             fmt_int(eligible_count),
-            f"{eligible_count / total_active:.2%} of Active records"
+            f"{eligible_count / total_active:.1%} of Active records"
             if total_active
             else "No records",
         )
     with cols[2]:
         metric_card(
-            "Closed-permit summary groups",
-            fmt_int(len(summary)),
-            "Grouped by year, permit type and date pair",
+            "Median active age",
+            fmt_days(eligible_ages.median()),
+            "Elapsed time so far for eligible records",
         )
     with cols[3]:
         metric_card(
-            "Application years covered",
-            year_range,
-            "The latest year is still in progress",
+            "90th-percentile active age",
+            fmt_days(eligible_ages.quantile(0.9)),
+            "9 in 10 eligible records are at or below this age",
         )
 
     st.write("")
-    left, right = st.columns([1.3, 1], gap="large")
+    left, right = st.columns([1, 1], gap="large")
     with left:
-        st.subheader("How long active permits have been open")
-        if "age_since_application_days" in eligible:
-            ages = number(eligible["age_since_application_days"]).dropna()
-            hist = pd.DataFrame({"Age (days)": ages})
+        st.subheader("What's still open?")
+        st.markdown(
+            '<div class="section-note">The age profile of records currently marked Active. '
+            "These are ongoing timelines, not estimates of how long permits will take to finish.</div>",
+            unsafe_allow_html=True,
+        )
+        if not eligible_ages.empty:
+            hist = pd.DataFrame({"Age (days)": eligible_ages})
             fig = px.histogram(
                 hist,
                 x="Age (days)",
-                nbins=28,
+                nbins=30,
                 color_discrete_sequence=[TEAL],
-                title="Age of active permit records included in the analysis",
+                title="Age of eligible Active permit records",
             )
             fig.update_traces(
                 hovertemplate="Age: %{x:.0f} days<br>Records: %{y:,}<extra></extra>"
             )
             fig.update_xaxes(title="Days since application")
             fig.update_yaxes(title="Permit records")
-            st.plotly_chart(chart_layout(fig, 390), width="stretch")
+            st.plotly_chart(chart_layout(fig, 410), width="stretch")
         else:
-            st.info("The age field is not available in this data release.")
+            st.info("No eligible Active records have a usable age value.")
+
     with right:
-        st.subheader("Time between key dates for permits marked Closed")
+        st.subheader("What do closed records show?")
+        st.markdown(
+            f'<div class="section-note">Historical intervals for application years {year_range}. '
+            "The bars compare typical and higher-end values within year/type groups.</div>",
+            unsafe_allow_html=True,
+        )
         if not summary.empty:
             measures = summary.groupby("measure", as_index=False).agg(
-                middle_of_group_medians=("median_days", "median"),
-                middle_of_group_p90s=("p90_days", "median"),
+                typical_time=("median_days", "median"),
+                higher_end_time=("p90_days", "median"),
             )
             fig = go.Figure()
             fig.add_trace(
                 go.Bar(
-                    name="Typical time across groups",
+                    name="Median of group medians",
                     x=measures["measure"],
-                    y=measures["middle_of_group_medians"],
+                    y=measures["typical_time"],
                     marker_color=TEAL,
                 )
             )
             fig.add_trace(
                 go.Bar(
-                    name="Higher-end time across groups",
+                    name="Median of group 90th percentiles",
                     x=measures["measure"],
-                    y=measures["middle_of_group_p90s"],
-                    marker_color=GOLD,
+                    y=measures["higher_end_time"],
+                    marker_color=RED,
                 )
             )
             fig.update_layout(
-                barmode="group", title="Typical and higher-end times (days)"
+                barmode="group",
+                title="Typical and higher-end times",
             )
-            fig.update_xaxes(title="Date range")
+            fig.update_xaxes(title="Date interval")
             fig.update_yaxes(title="Days")
-            st.plotly_chart(chart_layout(fig, 390), width="stretch")
-            st.caption(
-                "The bars summarize typical and higher-end times within year/type groups. They are not calculations across every permit combined."
-            )
+            st.plotly_chart(chart_layout(fig, 410), width="stretch")
+        else:
+            st.info("No closed-permit lifecycle summaries are available.")
 
     st.markdown(
-        '<div class="callout"><b>Important:</b> An active permit’s age is how long it has been open so far, not how long it will take to finish. The closed-permit results describe past records and do not explain what caused delays.</div>',
+        '<div class="callout"><b>How to read this:</b> Active ages are elapsed time so far. '
+        "Closed-permit summaries describe historical records and compare year/type groups; "
+        "they are not pooled permit-level averages and do not identify causes of delay.</div>",
         unsafe_allow_html=True,
     )
-    st.write("")
-    st.subheader("How the project works")
-    st.markdown("""
-    - Collect Toronto's published permit data on a repeatable daily schedule.
-    - Keep a history of changes to source records.
-    - Apply the same rules when calculating ages and time between dates.
-    - Flag missing information, conflicting values and unusual date order instead of hiding them.
-    """)
+
+    st.caption(
+        "The latest application year may be incomplete. Records with missing or conflicting "
+        "information are handled by the documented eligibility and data-quality rules."
+    )
 
 
 def active_page(active: pd.DataFrame) -> None:
@@ -576,25 +850,40 @@ def active_page(active: pd.DataFrame) -> None:
         selected_types = st.multiselect(
             "Permit type",
             types,
-            default=types[: min(8, len(types))],
-            help="Choose permit types to compare. Clear all to show all types.",
+            default=[],
+            help="Leave empty to include all permit types; select one or more to narrow the view.",
         )
     with c2:
-        age_cap = st.slider("Maximum age to show (days)", 90, 3650, 1825, step=90)
+        age_values = number(eligible["age_since_application_days"]).dropna()
+        observed_max_age = max(0, int(age_values.max())) if not age_values.empty else 0
+        # Keep the default slider at the full observed age range. A restriction
+        # is applied only when the viewer moves the slider below this maximum.
+        slider_max = max(3690, ((observed_max_age + 89) // 90) * 90)
+        age_cap = st.slider(
+            "Maximum age to show (days)",
+            min_value=90,
+            max_value=slider_max,
+            value=slider_max,
+            step=90,
+            help="Defaults to all eligible ages. Move the slider left to apply an age cap.",
+        )
     with c3:
         st.caption(
             f"Records included: **{len(eligible):,} of {len(active):,}**. Some records are left out when key dates or status information is missing or conflicting."
         )
     view = selected_or_all(eligible, "permit_type", selected_types)
-    view = view[
-        view["age_since_application_days"].between(0, age_cap, inclusive="both")
-    ]
+    if age_cap < slider_max:
+        view = view[
+            view["age_since_application_days"].between(
+                0, age_cap, inclusive="both"
+            )
+        ]
     a, b, c = st.columns(3)
     with a:
         metric_card(
             "Records in this view",
             fmt_int(len(view)),
-            f"Open for up to {age_cap:,} days",
+            f"Age between 0 and {age_cap:,} days" if age_cap < slider_max else "All eligible ages",
         )
     with b:
         metric_card(
@@ -608,6 +897,7 @@ def active_page(active: pd.DataFrame) -> None:
             fmt_days(view["age_since_application_days"].quantile(0.9)),
             "9 out of 10 are at or below this age",
         )
+    st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
     left, right = st.columns([1.15, 1], gap="large")
     with left:
         hist = px.histogram(
@@ -714,7 +1004,7 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
     c1, c2, c3 = st.columns([1, 1, 1.2])
     with c1:
         chosen_measure = st.selectbox(
-            "Time period to compare",
+            "Date interval to analyse",
             sorted(summary["measure"].unique()),
             index=(
                 sorted(summary["measure"].unique()).index("Application to completion")
@@ -726,8 +1016,8 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
         chosen_types = st.multiselect(
             "Permit type",
             types,
-            default=types[: min(10, len(types))],
-            help="Choose types to compare. Clear the selection to include every type.",
+            default=[],
+            help="Leave empty to include all permit types; select one or more to narrow the view.",
         )
     with c3:
         if years:
@@ -758,16 +1048,17 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
         )
     with c:
         metric_card(
-            "Typical time across groups",
+            "Median of group medians",
             fmt_days(view["median_days"].median()),
             "Summarized by year and type",
         )
     with d:
         metric_card(
-            "Higher-end time across groups",
+            "Median of group 90th percentiles",
             fmt_days(view["p90_days"].median()),
             "Summarized by year and type",
         )
+    st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
     left, right = st.columns([1.2, 1], gap="large")
     with left:
         trend = view.groupby("application_year", as_index=False).agg(
@@ -779,7 +1070,7 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
                 x=trend["application_year"],
                 y=trend["median_days"],
                 mode="lines+markers",
-                name="Typical time across groups",
+                name="Median of group medians",
                 line=dict(color=TEAL, width=3),
             )
         )
@@ -788,8 +1079,8 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
                 x=trend["application_year"],
                 y=trend["p90_days"],
                 mode="lines+markers",
-                name="Higher-end time across groups",
-                line=dict(color=GOLD, width=3),
+                name="Median of group 90th percentiles",
+                line=dict(color=RED, width=3),
             )
         )
         fig.update_layout(title="How times have changed by application year")
@@ -992,7 +1283,7 @@ def main() -> None:
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
 
-    page, loading_slot = report_sidebar(backend)
+    page, loading_slot, last_successful_refresh_slot = report_sidebar(backend)
     force_refresh = bool(st.session_state.pop("refresh_published_data", False))
     last_loaded_at = float(st.session_state.get("_dashboard_loaded_at", 0.0))
     cache_may_have_expired = (time() - last_loaded_at) >= CACHE_TTL_SECONDS
@@ -1015,42 +1306,53 @@ def main() -> None:
             # The placeholder is positioned immediately below the refresh button.
             # This puts the active loader beside the control users just clicked.
             with loading_slot.container():
-                with st.status(status_label, expanded=True) as status:
-                    if backend == "snowflake":
-                        st.write(
-                            "Querying the Snowflake dashboard marts using read-only access."
-                        )
-                    elif force_refresh:
-                        st.write(
-                            "Downloading the latest published database from GitHub. "
-                            "It is about 120 MB, so this can take a minute."
-                        )
-                    else:
-                        st.write(
-                            "Checking the published data. The first load may download "
-                            "a database of about 120 MB; later page changes usually "
-                            "use cached results."
-                        )
-                    try:
-                        active, summary, cleared_count, cleared_flag_counts = (
-                            load_dashboard_data(backend, config_fingerprint)
-                        )
-                    except Exception:
-                        status.update(
-                            label="Could not load dashboard data",
-                            state="error",
-                            expanded=True,
-                        )
-                        raise
-                    status.update(
-                        label="Dashboard data is ready",
-                        state="complete",
-                        expanded=False,
+                # Use a styled HTML panel for deterministic colors in all Streamlit themes.
+                loading_panel = st.empty()
+                if backend == "snowflake":
+                    loading_detail = (
+                        "Querying the Snowflake dashboard marts using read-only access."
                     )
+                elif force_refresh:
+                    loading_detail = (
+                        "Downloading the latest published database from GitHub. "
+                        "It is about 120 MB, so this can take a minute."
+                    )
+                else:
+                    loading_detail = (
+                        "Checking the published data. The first load may download "
+                        "a database of about 120 MB; later page changes usually "
+                        "use cached results."
+                    )
+                loading_panel.markdown(
+                    f"""
+                    <div class="dashboard-loading-panel" role="status"
+                         style="background:#303B46 !important; background-color:#303B46 !important; color:#F3F6F9 !important; padding:.8rem .85rem; border:1px solid #687782; border-radius:10px;">
+                      <div style="background:transparent !important; color:#F3F6F9 !important; -webkit-text-fill-color:#F3F6F9 !important; font-weight:700;">{status_label}</div>
+                      <div style="background:transparent !important; color:#F3F6F9 !important; -webkit-text-fill-color:#F3F6F9 !important; font-size:.82rem; line-height:1.4; margin-top:.35rem;">{loading_detail}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                try:
+                    active, summary, cleared_count, cleared_flag_counts, last_successful_refresh_utc = (
+                        load_dashboard_data(backend, config_fingerprint)
+                    )
+                except Exception:
+                    loading_panel.markdown(
+                        """
+                        <div role="status" style="background:#303B46 !important; background-color:#303B46 !important; color:#F3F6F9 !important; padding:.8rem .85rem; border:1px solid #687782; border-radius:10px;">
+                          <div style="color:#F3F6F9 !important; -webkit-text-fill-color:#F3F6F9 !important; font-weight:700;">Could not load dashboard data</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    raise
+                else:
+                    loading_panel.empty()
         else:
             # Normal filter/navigation reruns use the cache without flashing a
             # loader. A first load and every manual refresh show the status above.
-            active, summary, cleared_count, cleared_flag_counts = load_dashboard_data(
+            active, summary, cleared_count, cleared_flag_counts, last_successful_refresh_utc = load_dashboard_data(
                 backend, config_fingerprint
             )
         st.session_state["_dashboard_loaded"] = True
@@ -1076,11 +1378,42 @@ def main() -> None:
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
 
-    if page == "Overview":
-        overview(active.copy(), summary.copy())
+    last_refresh_display = format_refresh_timestamp(last_successful_refresh_utc)
+    with last_successful_refresh_slot.container():
+        st.divider()
+        st.markdown(
+            f'''<div style="padding-top:.15rem;padding-bottom:.65rem;">
+              <div style="font-size:.70rem;font-weight:750;letter-spacing:.10em;
+                          color:#C0CAD3;margin-bottom:.55rem;">
+                LAST SUCCESSFUL DATA REFRESH
+              </div>
+              <div style="display:flex;align-items:center;gap:.55rem;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21"
+                     viewBox="0 0 24 24" fill="none" stroke="#21B6E8"
+                     stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                     aria-hidden="true" style="flex:0 0 auto;">
+                  <rect x="3" y="4" width="18" height="17" rx="2"></rect>
+                  <path d="M8 2v4M16 2v4M3 10h12"></path>
+                  <circle cx="17" cy="17" r="4"></circle>
+                  <path d="M17 15v2l1.3 1"></path>
+                </svg>
+                <span style="font-weight:700;color:#F4F7FA;font-size:.92rem;
+                             line-height:1.35;">Date and time of completed refresh</span>
+              </div>
+              <div style="font-weight:750;color:#F4F7FA;font-size:1rem;
+                          line-height:1.35;margin-top:.4rem;">{last_refresh_display}</div>
+              <div style="font-size:.75rem;color:#C0CAD3;margin-top:.4rem;">
+                Displayed in Toronto local time (ET).
+              </div>
+            </div>''',
+            unsafe_allow_html=True,
+        )
+
+    if page == "The story":
+        overview(active.copy(), summary.copy(), backend)
     elif page == "Active permits":
         active_page(active.copy())
-    elif page == "Permits marked Closed":
+    elif page == "Closed-permit timelines":
         lifecycle_page(summary.copy())
     else:
         quality_page(active.copy(), cleared_count, cleared_flag_counts, summary.copy())

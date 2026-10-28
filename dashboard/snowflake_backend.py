@@ -44,7 +44,7 @@ def _fetch_dataframe(cursor: Any, query: str) -> pd.DataFrame:
 
 def load_snowflake_dashboard_data(
     config: Mapping[str, Any],
-) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int], Any | None]:
     """Read the three dashboard relations using a dedicated read-only role.
 
     Expected configuration keys:
@@ -134,6 +134,19 @@ def load_snowflake_dashboard_data(
                 "Build and validate the dbt models in the configured schema."
             )
 
+        last_successful_refresh_utc = None
+        if "DASHBOARD_REFRESH_METADATA" in available:
+            refresh_frame = _fetch_dataframe(
+                cursor,
+                f"SELECT LAST_SUCCESSFUL_REFRESH_UTC "
+                f"FROM {qualified_schema}.DASHBOARD_REFRESH_METADATA "
+                "WHERE REFRESH_ID = 1",
+            )
+            if not refresh_frame.empty:
+                last_successful_refresh_utc = refresh_frame.iloc[0][
+                    "last_successful_refresh_utc"
+                ]
+
         active = _fetch_dataframe(
             cursor,
             f"SELECT * FROM {qualified_schema}.MART_ACTIVE_PERMIT_AGE",
@@ -170,7 +183,7 @@ def load_snowflake_dashboard_data(
             field: int(totals.get(field) or 0) for field in FLAG_FIELDS
         }
 
-        return active, summary, cleared_revision_count, cleared_flag_counts
+        return active, summary, cleared_revision_count, cleared_flag_counts, last_successful_refresh_utc
     finally:
         if cursor is not None:
             cursor.close()
