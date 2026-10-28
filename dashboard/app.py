@@ -74,7 +74,7 @@ def current_theme_type() -> str:
     return "light"
 
 
-THEME_TYPE = "light"  # Use the Tableau-inspired light palette consistently
+THEME_TYPE = current_theme_type()  # Palette for Python-rendered Plotly figures
 if THEME_TYPE == "dark":
     NAVY = "#e8eef7"
     TEAL = "#45c4c8"
@@ -118,16 +118,18 @@ st.markdown(
     f"""
 <style>
 :root {{
-  --app-page-bg: {PAGE_BG};
   --app-sidebar-bg: {SIDEBAR_BG};
-  --app-panel-bg: {PANEL_BG};
-  --app-text: {TEXT_COLOR};
-  --app-muted: {MUTED};
-  --app-border: {BORDER_COLOR};
-  --app-link: {LINK_COLOR};
   --app-sidebar-text: #F4F7FA;
   --app-sidebar-muted: #C0CAD3;
   --app-sidebar-link: #28B8E8;
+}}
+[data-testid="stAppViewContainer"] {{
+  --app-page-bg: var(--background-color, {PAGE_BG});
+  --app-panel-bg: var(--secondary-background-color, {PANEL_BG});
+  --app-text: var(--text-color, {TEXT_COLOR});
+  --app-muted: color-mix(in srgb, var(--app-text) 68%, transparent);
+  --app-border: var(--secondary-background-color, {BORDER_COLOR});
+  --app-link: var(--primary-color, {LINK_COLOR});
 }}
 html, body, button, input, textarea, select,
 [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {{
@@ -141,6 +143,22 @@ header[data-testid="stHeader"] {{
 }}
 .block-container {{ padding-top: 3.5rem; padding-bottom: 2rem; max-width: 1600px; }}
 [data-testid="stAppViewContainer"] {{ background: var(--app-page-bg); color: var(--app-text); }}
+/* Main-pane widget labels follow Streamlit's active Light/Dark theme variables. */
+[data-testid="stMain"] [data-testid="stWidgetLabel"],
+[data-testid="stMain"] [data-testid="stWidgetLabel"] *,
+[data-testid="stMain"] [data-testid="stSlider"] label,
+[data-testid="stMain"] [data-testid="stRadio"] label,
+[data-testid="stMain"] [data-testid="stRadio"] label *,
+[data-testid="stMain"] [data-testid="stCheckbox"] label,
+[data-testid="stMain"] [data-testid="stCheckbox"] label *,
+[data-testid="stMain"] [data-testid="stSelectbox"] label,
+[data-testid="stMain"] [data-testid="stMultiSelect"] label,
+[data-testid="stMain"] [data-testid="stNumberInput"] label,
+[data-testid="stMain"] [data-testid="stDateInput"] label,
+[data-testid="stMain"] [data-testid="stTextInput"] label {{
+  color: var(--app-text) !important;
+  -webkit-text-fill-color: var(--app-text) !important;
+}}
 [data-testid="stSidebar"] {{
   background: var(--app-sidebar-bg) !important;
   border-right: 1px solid #46515C;
@@ -166,16 +184,16 @@ header[data-testid="stHeader"] {{
 }}
 [data-testid="stSidebar"] [role="radiogroup"] label {{ color: var(--app-sidebar-text) !important; }}
 .hero {{
-  background: linear-gradient(120deg, #FFFFFF 0%, #EAF4F8 100%);
-  border: 1px solid #E1E7ED;
+  background: var(--app-panel-bg);
+  border: 1px solid var(--app-border);
   padding: 1.35rem 1.8rem 1.45rem;
   border-radius: 15px;
-  color: #28343E;
+  color: var(--app-text);
   margin-bottom: .8rem;
   text-align: center;
 }}
 .hero h1 {{
-  color: #28343E !important;
+  color: var(--app-text) !important;
   margin: 0 auto .55rem auto;
   font-size: 1.9rem;
   font-weight: 750;
@@ -184,7 +202,7 @@ header[data-testid="stHeader"] {{
   text-align: center;
 }}
 .hero p {{
-  color: #566573 !important;
+  color: var(--app-muted) !important;
   margin: 0 auto;
   font-size: 1.02rem;
   line-height: 1.55;
@@ -197,15 +215,15 @@ header[data-testid="stHeader"] {{
   font-size: .88rem;
   line-height: 1.45;
   font-weight: 750;
-  color: #168DB8;
+  color: var(--app-link);
   margin: 0 auto .58rem auto;
   text-align: center;
 }}
 .section-note {{ color: var(--app-muted); font-size: .94rem; line-height: 1.55; margin-top: -.25rem; margin-bottom: 1rem; }}
 .metric-card {{
-  border: 1px solid #DFE6EC;
-  border-top: 3px solid #21B6E8;
-  background: #FFFFFF;
+  border: 1px solid var(--app-border);
+  border-top: 3px solid var(--app-link);
+  background: var(--app-panel-bg);
   border-radius: 12px;
   padding: 1.1rem 1rem;
   min-height: 132px;
@@ -216,9 +234,9 @@ header[data-testid="stHeader"] {{
   text-align: center;
   box-shadow: 0 3px 12px rgba(38, 52, 62, .055);
 }}
-.metric-label {{ color: #667582; font-size: .94rem; line-height: 1.35; font-weight: 650; margin-bottom: .52rem; text-align: center; }}
-.metric-value {{ color: #26343E; font-size: 2.2rem; line-height: 1.12; font-weight: 800; letter-spacing: -.035em; text-align: center; }}
-.metric-foot {{ color: #687783; font-size: .88rem; line-height: 1.45; margin-top: .55rem; text-align: center; max-width: 100%; }}
+.metric-label {{ color: var(--app-muted); font-size: .94rem; line-height: 1.35; font-weight: 650; margin-bottom: .52rem; text-align: center; }}
+.metric-value {{ color: var(--app-text); font-size: 2.2rem; line-height: 1.12; font-weight: 800; letter-spacing: -.035em; text-align: center; }}
+.metric-foot {{ color: var(--app-muted); font-size: .88rem; line-height: 1.45; margin-top: .55rem; text-align: center; max-width: 100%; }}
 .callout {{ border-left: 4px solid {TEAL}; background: var(--app-panel-bg); padding: .9rem 1rem; border-radius: 0 10px 10px 0; color: var(--app-text); }}
 .small-muted {{ color: var(--app-muted); font-size: .85rem; }}
 div[data-testid="stPlotlyChart"] {{ border: 1px solid var(--app-border); border-radius: 12px; padding: .45rem; background: var(--app-panel-bg); }}
@@ -318,12 +336,19 @@ div[data-testid="stNumberInput"] [data-baseweb="input"] > div,
 div[data-testid="stDateInput"] [data-baseweb="input"] > div,
 div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
 div[data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
-  background-color: #E9EEF3 !important;
-  border-color: #D0DAE4 !important;
+  background-color: var(--app-panel-bg) !important;
+  border-color: var(--app-border) !important;
+}}
+div[data-testid="stNumberInput"] input,
+div[data-testid="stDateInput"] input,
+div[data-testid="stSelectbox"] [data-baseweb="select"] *,
+div[data-testid="stMultiSelect"] [data-baseweb="select"] * {{
+  color: var(--app-text) !important;
+  -webkit-text-fill-color: var(--app-text) !important;
 }}
 div[data-testid="stMultiSelect"] [data-baseweb="tag"] {{
-  background-color: #DCE6EE !important;
-  color: #28343E !important;
+  background-color: var(--app-panel-bg) !important;
+  color: var(--app-text) !important;
 }}
 
 /* Keep slider labels on the page canvas; draw a separate panel behind the control. */
@@ -354,9 +379,9 @@ div[data-testid="stSlider"] [data-baseweb="slider"]::before,
   content: "" !important;
   position: absolute !important;
   inset: -.25rem -.55rem -.55rem !important;
-  background: #E9EEF3 !important;
-  background-color: #E9EEF3 !important;
-  border: 1px solid #D9E1E9 !important;
+  background: var(--app-panel-bg) !important;
+  background-color: var(--app-panel-bg) !important;
+  border: 1px solid var(--app-border) !important;
   border-radius: 10px !important;
   z-index: -1 !important;
   pointer-events: none !important;

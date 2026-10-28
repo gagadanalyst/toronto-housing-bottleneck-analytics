@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+/.streamlit/secrets.toml
+*.pem
+*.p8
+*.key
 .dlt/
 
 # Local ingestion data and runtime state

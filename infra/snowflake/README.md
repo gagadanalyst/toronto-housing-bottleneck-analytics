@@ -109,7 +109,7 @@ Do not rely on trial expiry or resource-monitor actions to prevent GitHub Action
 
 ### Freshness and dashboard lag
 
-The Snowflake serving workflow checks source freshness before building the marts. A successful DuckDB publication does not prove that the Snowflake serving models have refreshed: the dashboard can temporarily lag while the RAW and serving workflows run, or if either workflow fails. For the Snowflake path, check the latest successful canonical RAW refresh and its downstream serving build.
+The Snowflake serving workflow checks source freshness before building the marts. It records the successful refresh time, source commit, and workflow run in `TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA` after its serving checks complete. A successful DuckDB publication does not prove that the Snowflake serving models have refreshed: the dashboard can temporarily lag while the RAW and serving workflows run, or if either workflow fails. For the Snowflake path, check the latest successful canonical RAW refresh and its downstream serving build.
 
 ## Configure the Streamlit Snowflake reader
 
@@ -117,7 +117,7 @@ As verified on October 28, 2026, the public deployment selects DuckDB while Snow
 
 ### 1. Grant read-only access
 
-Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the three serving relations exist in `TORONTO.ANALYTICS`.
+Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the three dbt serving relations and `DASHBOARD_REFRESH_METADATA` exist in `TORONTO.ANALYTICS`.
 
 `TORONTO_DASHBOARD_ROLE` should have:
 
@@ -126,6 +126,7 @@ Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsigh
   - `TORONTO.ANALYTICS.MART_ACTIVE_PERMIT_AGE`
   - `TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE`
   - `TORONTO.ANALYTICS.FCT_CLEARED_PERMIT_REVISION`
+  - `TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA` (refresh timestamp only)
 - No access to `TORONTO.RAW` and no privileges to create, update, or delete analytical data.
 
 Recheck object-level grants after dbt rebuilds and reapply them if needed. This script does not create a user or configure authentication.
@@ -162,7 +163,7 @@ schema = "ANALYTICS"
 
 ### 4. Verify dashboard access
 
-After changing credentials, roles, or serving relations, verify access to all three relations in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
+After changing credentials, roles, or serving relations, verify access to all three data relations and, when present, `DASHBOARD_REFRESH_METADATA` in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
 
 The reader checks that required relations exist, reads dashboard-facing data, and closes the connection after the read. Missing relations, denied permissions, or connection errors are shown to the user; no silent fallback to DuckDB takes place.
 
