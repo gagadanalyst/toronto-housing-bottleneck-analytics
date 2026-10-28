@@ -12,6 +12,8 @@ concurrency:
 
 jobs:
   smoke:
+    # Keep the manual Snowflake smoke test behind the same global switch.
+    if: vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' && github.ref == 'refs/heads/main'
     name: Controlled Snowflake SCD2 validation
     runs-on: ubuntu-latest
     timeout-minutes: 15

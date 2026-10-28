@@ -1,6 +1,9 @@
 name: Snowflake Canonical RAW Refresh
 
 on:
+  workflow_run:
+    workflows: ["CD"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       snapshot_run_id:
@@ -17,13 +20,24 @@ permissions:
   contents: read
   actions: read
 
+# Queue up to 100 pending refreshes instead of replacing the prior pending run.
 concurrency:
   group: toronto-snowflake-canonical-raw-refresh
   cancel-in-progress: false
+  queue: max
 
 jobs:
   refresh:
-    if: github.ref == 'refs/heads/main'
+    # Fail closed: only the explicit repository variable enables Snowflake compute.
+    if: >-
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      (
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'main') ||
+        (github.event_name == 'workflow_dispatch' &&
+         github.ref == 'refs/heads/main')
+      )
     name: Refresh and verify canonical Snowflake RAW
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -31,7 +45,8 @@ jobs:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       TORONTO_WAREHOUSE_DATASET: RAW
-      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
+      # Automatic runs consume the exact CD run that triggered this workflow.
+      SNAPSHOT_SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.snapshot_run_id }}
       SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
@@ -40,6 +55,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Require explicit canonical RAW confirmation
+        if: github.event_name == 'workflow_dispatch'
         env:
           CONFIRM_CANONICAL_RAW: ${{ inputs.confirm_canonical_raw }}
         run: |

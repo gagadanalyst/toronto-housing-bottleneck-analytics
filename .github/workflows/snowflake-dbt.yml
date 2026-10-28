@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   validate:
-    if: github.ref == 'refs/heads/main'
+    # Snowflake compute remains off unless the repository variable is explicitly true.
+    if: vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' && github.ref == 'refs/heads/main'
     name: Build and test dbt against an isolated Snowflake baseline
     runs-on: ubuntu-latest
     timeout-minutes: 45

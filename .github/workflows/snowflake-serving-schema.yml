@@ -1,6 +1,9 @@
 name: Snowflake Serving Schema Build
 
 on:
+  workflow_run:
+    workflows: ["Snowflake Canonical RAW Refresh"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       confirm_serving_schema:
@@ -10,15 +13,28 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   contents: read
 
+# Queue up to 100 pending serving builds instead of replacing the prior pending run.
 concurrency:
   group: toronto-snowflake-serving-schema
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main'
+    # Trigger automatically only after a successful main-branch RAW workflow.
+    # Manual runs are still limited to main; the following step requires confirmation.
+    if: >-
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      (
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'main') ||
+        (github.event_name == 'workflow_dispatch' &&
+         github.ref == 'refs/heads/main')
+      )
     name: Build and verify Snowflake dashboard models
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -32,6 +48,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Require explicit serving-schema confirmation
+        if: github.event_name == 'workflow_dispatch'
         env:
           CONFIRM_SERVING_SCHEMA: ${{ inputs.confirm_serving_schema }}
         run: |
@@ -39,6 +56,57 @@ jobs:
             echo "Refusing to build into TORONTO.ANALYTICS without explicit confirmation."
             exit 1
           fi
+
+      - name: Verify upstream canonical RAW refresh succeeded
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_REFRESH_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          run_id = os.environ["RAW_REFRESH_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("RAW refresh run ID must contain digits only.")
+
+          result = subprocess.run(
+              [
+                  "gh", "run", "view", run_id,
+                  "--repo", os.environ["GITHUB_REPOSITORY"],
+                  "--json", "name,status,conclusion,headBranch,jobs",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          run = json.loads(result.stdout)
+          if (
+              run.get("name") != "Snowflake Canonical RAW Refresh"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("headBranch") != "main"
+          ):
+              raise ValueError("Upstream RAW workflow was not a successful main-branch run.")
+
+          refresh_job = next(
+              (
+                  job for job in run.get("jobs", [])
+                  if job.get("name") == "Refresh and verify canonical Snowflake RAW"
+              ),
+              None,
+          )
+          if not refresh_job or refresh_job.get("conclusion") != "success":
+              raise ValueError(
+                  "Canonical RAW refresh job did not succeed; "
+                  "refusing to build TORONTO.ANALYTICS."
+              )
+
+          print(f"Verified successful canonical RAW refresh run {run_id}.")
+          PY
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

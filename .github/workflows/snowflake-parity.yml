@@ -28,9 +28,13 @@ concurrency:
 
 jobs:
   compare:
+    # This parity workflow uses Snowflake compute, including on pull requests.
     if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+      )
     name: Compare equivalent DuckDB and Snowflake dbt outputs
     runs-on: ubuntu-latest
     timeout-minutes: 45
