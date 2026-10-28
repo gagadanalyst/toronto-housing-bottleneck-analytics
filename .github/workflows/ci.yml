@@ -194,6 +194,9 @@ jobs:
           cache: pip
           cache-dependency-path: dashboard/requirements.txt
 
+      - name: Validate dashboard Python syntax
+        run: python -m compileall -q dashboard
+
       - name: Upgrade pip to a patched release
         run: python -m pip install --upgrade "pip>=26.2.1,<27"
 

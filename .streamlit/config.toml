@@ -8,8 +8,5 @@ backgroundColor = "#E2E7ED"
 secondaryBackgroundColor = "#E9EEF3"
 textColor = "#28343E"
 
-[theme.dark]
-primaryColor = "#21B6E8"
-backgroundColor = "#0B1220"
-secondaryBackgroundColor = "#192538"
-textColor = "#E8EEF7"
+[client]
+toolbarMode = "minimal"
