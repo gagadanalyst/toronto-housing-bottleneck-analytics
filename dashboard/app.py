@@ -15,8 +15,8 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from backend_config import resolve_dashboard_backend
-from snowflake_backend import load_snowflake_dashboard_data
 from refresh_metadata import format_refresh_timestamp
+from snowflake_backend import load_snowflake_dashboard_data
 from streamlit.errors import StreamlitSecretNotFoundError
 
 FAVICON_SVG = (
@@ -25,7 +25,7 @@ FAVICON_SVG = (
     'stroke="#21B6E8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
     '<path d="M6.5 8h2M6.5 11.5h2M6.5 15h2M16 12h2M16 15.5h2" fill="none" '
     'stroke="#21B6E8" stroke-width="1.5" stroke-linecap="round"/>'
-    '</svg>'
+    "</svg>"
 )
 
 st.set_page_config(
@@ -49,7 +49,12 @@ RELEASE_PAGE_URL = (
 )
 DBT_SCHEMA = "analytics"
 CACHE_TTL_SECONDS = 24 * 60 * 60
-NAV = ["The story", "Active permits", "Closed-permit timelines", "Data quality & definitions"]
+NAV = [
+    "The story",
+    "Active permits",
+    "Closed-permit timelines",
+    "Data quality & definitions",
+]
 
 
 def current_theme_type() -> str:
@@ -520,7 +525,13 @@ def load_dashboard_data(
         raise RuntimeError(
             f"{DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type returned no records."
         )
-    return active, summary, cleared_revision_count, cleared_flag_counts, last_successful_refresh_utc
+    return (
+        active,
+        summary,
+        cleared_revision_count,
+        cleared_flag_counts,
+        last_successful_refresh_utc,
+    )
 
 
 def normalize_bool(series: pd.Series) -> pd.Series:
@@ -615,10 +626,13 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
             'fill="none" stroke="#21B6E8" stroke-width="1.8" stroke-linecap="round" '
             'stroke-linejoin="round"/><path d="M6.5 8h2M6.5 11.5h2M6.5 15h2M16 12h2M16 15.5h2" '
             'fill="none" stroke="#21B6E8" stroke-width="1.5" stroke-linecap="round"/>'
-            '</svg><span>Toronto Permits</span></div>',
+            "</svg><span>Toronto Permits</span></div>",
             unsafe_allow_html=True,
         )
-        st.markdown('<div class="sidebar-tagline">Follow the permit timeline story</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-tagline">Follow the permit timeline story</div>',
+            unsafe_allow_html=True,
+        )
         page = st.radio("Explore", NAV, label_visibility="collapsed")
         st.divider()
         st.markdown("**Where the data comes from**")
@@ -691,14 +705,10 @@ def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
     summary["p90_days"] = number(summary["p90_days"])
     years = number(summary["application_year"]).dropna()
     year_range = (
-        f"{int(years.min())}–{int(years.max())}"
-        if not years.empty
-        else "Not available"
+        f"{int(years.min())}–{int(years.max())}" if not years.empty else "Not available"
     )
     backend_label = (
-        "Snowflake warehouse"
-        if backend == "snowflake"
-        else "Published DuckDB snapshot"
+        "Snowflake warehouse" if backend == "snowflake" else "Published DuckDB snapshot"
     )
 
     # Compact provenance row: only show metadata supported by the loaded data/config.
@@ -874,16 +884,16 @@ def active_page(active: pd.DataFrame) -> None:
     view = selected_or_all(eligible, "permit_type", selected_types)
     if age_cap < slider_max:
         view = view[
-            view["age_since_application_days"].between(
-                0, age_cap, inclusive="both"
-            )
+            view["age_since_application_days"].between(0, age_cap, inclusive="both")
         ]
     a, b, c = st.columns(3)
     with a:
         metric_card(
             "Records in this view",
             fmt_int(len(view)),
-            f"Age between 0 and {age_cap:,} days" if age_cap < slider_max else "All eligible ages",
+            f"Age between 0 and {age_cap:,} days"
+            if age_cap < slider_max
+            else "All eligible ages",
         )
     with b:
         metric_card(
@@ -1334,9 +1344,13 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
                 try:
-                    active, summary, cleared_count, cleared_flag_counts, last_successful_refresh_utc = (
-                        load_dashboard_data(backend, config_fingerprint)
-                    )
+                    (
+                        active,
+                        summary,
+                        cleared_count,
+                        cleared_flag_counts,
+                        last_successful_refresh_utc,
+                    ) = load_dashboard_data(backend, config_fingerprint)
                 except Exception:
                     loading_panel.markdown(
                         """
@@ -1352,9 +1366,13 @@ def main() -> None:
         else:
             # Normal filter/navigation reruns use the cache without flashing a
             # loader. A first load and every manual refresh show the status above.
-            active, summary, cleared_count, cleared_flag_counts, last_successful_refresh_utc = load_dashboard_data(
-                backend, config_fingerprint
-            )
+            (
+                active,
+                summary,
+                cleared_count,
+                cleared_flag_counts,
+                last_successful_refresh_utc,
+            ) = load_dashboard_data(backend, config_fingerprint)
         st.session_state["_dashboard_loaded"] = True
         st.session_state["_dashboard_backend_key"] = backend_key
         if show_loading_status:
@@ -1382,7 +1400,7 @@ def main() -> None:
     with last_successful_refresh_slot.container():
         st.divider()
         st.markdown(
-            f'''<div style="padding-top:.15rem;padding-bottom:.65rem;">
+            f"""<div style="padding-top:.15rem;padding-bottom:.65rem;">
               <div style="font-size:.70rem;font-weight:750;letter-spacing:.10em;
                           color:#C0CAD3;margin-bottom:.55rem;">
                 LAST SUCCESSFUL DATA REFRESH
@@ -1405,7 +1423,7 @@ def main() -> None:
               <div style="font-size:.75rem;color:#C0CAD3;margin-top:.4rem;">
                 Displayed in Toronto local time (ET).
               </div>
-            </div>''',
+            </div>""",
             unsafe_allow_html=True,
         )
 

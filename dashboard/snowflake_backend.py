@@ -183,7 +183,13 @@ def load_snowflake_dashboard_data(
             field: int(totals.get(field) or 0) for field in FLAG_FIELDS
         }
 
-        return active, summary, cleared_revision_count, cleared_flag_counts, last_successful_refresh_utc
+        return (
+            active,
+            summary,
+            cleared_revision_count,
+            cleared_flag_counts,
+            last_successful_refresh_utc,
+        )
     finally:
         if cursor is not None:
             cursor.close()

@@ -196,7 +196,6 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     assert connection.closed
 
 
-
 def test_refresh_timestamp_is_optional_before_first_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
