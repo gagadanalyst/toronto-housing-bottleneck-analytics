@@ -269,6 +269,40 @@ jobs:
             --target snowflake \
             --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
 
+      - name: Regrant dashboard read-only access after dbt rebuild
+        run: |
+          python - <<'PYGRANT'
+          import os
+
+          import snowflake.connector
+
+          connection = snowflake.connector.connect(
+              account=os.environ["SNOWFLAKE_ACCOUNT"],
+              user=os.environ["SNOWFLAKE_USER"],
+              private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"],
+              role="TORONTO_DBT_ROLE",
+              warehouse="TORONTO_XS_WH",
+              database="TORONTO",
+              schema="ANALYTICS",
+          )
+          cursor = connection.cursor()
+          try:
+              tables = (
+                  "MART_ACTIVE_PERMIT_AGE",
+                  "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "FCT_CLEARED_PERMIT_REVISION",
+              )
+              for table in tables:
+                  cursor.execute(
+                      f"GRANT SELECT ON TABLE TORONTO.ANALYTICS.{table} "
+                      "TO ROLE TORONTO_DASHBOARD_ROLE"
+                  )
+                  print(f"Granted dashboard SELECT on TORONTO.ANALYTICS.{table}")
+          finally:
+              cursor.close()
+              connection.close()
+          PYGRANT
+
       - name: Verify dashboard relations and non-empty results
         run: |
           python - <<'PY'
