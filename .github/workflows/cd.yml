@@ -185,6 +185,41 @@ jobs:
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
 
+      - name: Inject Google Analytics into generated dbt docs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          index = Path("dbt/docs-site/index.html")
+          measurement_id = "G-7F7JW7LG51"
+          script_url = (
+              "https://www.googletagmanager.com/gtag/js?id="
+              + measurement_id
+          )
+          html = index.read_text(encoding="utf-8")
+
+          if script_url not in html:
+              if html.count("</head>") != 1:
+                  raise SystemExit("Expected one </head> in generated dbt docs")
+              tag = (
+                  f'    <!-- Google tag (gtag.js) -->\n'
+                  f'    <script async src="{script_url}"></script>\n'
+                  f'    <script>\n'
+                  f'      window.dataLayer = window.dataLayer || [];\n'
+                  f'      function gtag() {{ window.dataLayer.push(arguments); }}\n'
+                  f'      gtag("js", new Date());\n'
+                  f'      gtag("config", "{measurement_id}");\n'
+                  f'    </script>\n'
+              )
+              html = html.replace("</head>", tag + "</head>", 1)
+              index.write_text(html, encoding="utf-8")
+
+          html = index.read_text(encoding="utf-8")
+          if script_url not in html or f'gtag("config", "{measurement_id}")' not in html:
+              raise SystemExit("Google Analytics tag injection failed")
+          print(f"Verified Google Analytics in {index}")
+          PY
+
       - name: Record successful refresh metadata in DuckDB
         env:
           SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
