@@ -57,24 +57,9 @@ NAV = [
 ]
 
 
-def current_theme_type() -> str:
-    """Return the active Streamlit theme, with a safe fallback for older versions."""
-    try:
-        theme_type = getattr(st.context.theme, "type", None)
-        if theme_type in {"light", "dark"}:
-            return theme_type
-    except AttributeError, RuntimeError:
-        pass
-    try:
-        theme_base = st.get_option("theme.base")
-        if theme_base in {"light", "dark"}:
-            return theme_base
-    except Exception:
-        pass
-    return "light"
-
-
-THEME_TYPE = current_theme_type()  # Palette for Python-rendered Plotly figures
+# The dashboard uses one Light theme, configured in .streamlit/config.toml.
+# Do not infer the palette from st.context.theme during initial page load.
+THEME_TYPE = "light"  # Palette for Python-rendered Plotly figures
 if THEME_TYPE == "dark":
     NAVY = "#e8eef7"
     TEAL = "#45c4c8"
