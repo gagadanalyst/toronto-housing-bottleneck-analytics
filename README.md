@@ -1,6 +1,6 @@
-# Toronto Housing Bottleneck Analytics
+# Toronto Housing Bottleneck Analytics — Snowflake + DuckDB
 
-An end-to-end Analytics Engineering project using City of Toronto building-permit data. I built the pipeline from source extraction through warehouse modeling and validation to a deployed dashboard, with DuckDB as the default backend and Snowflake as an optional second backend.
+An end-to-end Analytics Engineering project using City of Toronto building-permit data, with **DuckDB as the default warehouse backend and Snowflake as an optional second backend**. A single Python + dlt ingestion pipeline validates source snapshots, and one shared dbt project builds analytical models for both backends; the deployed Streamlit dashboard can read from either warehouse.
 
 **[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Source code](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
@@ -19,6 +19,7 @@ The analysis is descriptive, not causal. It examines observed active-permit ages
 ## Architecture
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#EAF8FD","primaryTextColor":"#28343E","primaryBorderColor":"#21B6E8","lineColor":"#21B6E8","secondaryColor":"#E9EEF3","tertiaryColor":"#FFFFFF","fontFamily":"Arial, sans-serif"}}}%%
 flowchart TB
     A[City of Toronto: Active Permits]
     C[City of Toronto: Cleared Permits]
@@ -118,6 +119,7 @@ For the parity run, `MART_ACTIVE_PERMIT_AGE` had 98,869 rows (98,798 eligible an
 The architecture diagram above describes the data path; this separate view shows the automated GitHub Actions path from validation through DuckDB publication to the optional Snowflake refresh. Separate manually dispatched baseline/replay, Snowflake dbt validation, and smoke workflows, plus gated pull-request parity, are described below but not drawn here.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#EAF8FD","primaryTextColor":"#28343E","primaryBorderColor":"#21B6E8","lineColor":"#21B6E8","secondaryColor":"#E9EEF3","tertiaryColor":"#FFFFFF","fontFamily":"Arial, sans-serif"}}}%%
 flowchart TB
     PR[Pull request] --> CI[CI checks, tests, security and packaging]
     TRIG[Path-eligible main push / daily 23:00 America/Toronto / manual dispatch] --> CI
