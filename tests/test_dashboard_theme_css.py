@@ -30,6 +30,6 @@ def test_dashboard_source_parses_as_python() -> None:
 def test_dashboard_uses_single_light_theme() -> None:
     config = tomllib.loads(CONFIG_SOURCE.read_text(encoding="utf-8"))
     assert config["theme"]["base"] == "light"
-    assert "light" in config["theme"]
+    assert "light" not in config["theme"]
     assert "dark" not in config["theme"]
     assert config["client"]["toolbarMode"] == "minimal"
