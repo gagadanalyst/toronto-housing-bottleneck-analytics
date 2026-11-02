@@ -247,10 +247,7 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     assert flags["cleared_builder_name_missing"] == 1
     assert flags["cleared_geo_id_missing"] == 2
     assert flags["cleared_revisions_with_findings"] == 1
-    assert sum(
-        "FCT_ACTIVE_PERMIT_REVISION" in query
-        for query in cursor.queries
-    ) == 1
+    assert sum("FCT_ACTIVE_PERMIT_REVISION" in query for query in cursor.queries) == 1
     assert "application_date IS NULL" in cursor.last_query
     assert "NOT COALESCE(application_date_conflict, FALSE)" in cursor.last_query
     assert all(
