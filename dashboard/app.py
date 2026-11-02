@@ -16,7 +16,10 @@ import requests
 import streamlit as st
 from backend_config import resolve_dashboard_backend
 from refresh_metadata import format_refresh_timestamp
-from snowflake_backend import load_snowflake_dashboard_data
+from snowflake_backend import (
+    FLAG_FIELDS,
+    load_snowflake_dashboard_data,
+)
 from streamlit.errors import StreamlitSecretNotFoundError
 
 FAVICON_SVG = (
@@ -485,33 +488,42 @@ def load_dashboard_data(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type"
             ).fetchdf()
 
-            # Data-quality page needs only aggregate flag counts, not the entire
-            # cleared fact table in application memory.
-            flag_fields = [
-                "builder_name_conflict",
-                "has_status_conflict",
-                "application_date_conflict",
-                "issued_date_conflict",
-                "completed_date_conflict",
-                "geo_id_conflict",
-                "application_to_issue_negative",
-                "application_to_completion_negative",
-                "issue_to_completion_negative",
-            ]
-            flag_expressions = ", ".join(
+            # The data-quality page needs aggregates, not the full Cleared fact.
+            flag_expressions = [
                 f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) AS {field}"
-                for field in flag_fields
-            )
+                for field in FLAG_FIELDS
+            ]
+            date_coverage_expressions = [
+                "SUM(CASE WHEN application_date IS NOT NULL THEN 1 ELSE 0 END) "
+                "AS application_date_usable",
+                "SUM(CASE WHEN application_date IS NULL "
+                "AND NOT COALESCE(application_date_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS application_date_no_usable",
+                "SUM(CASE WHEN completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+                "AS completion_date_usable",
+                "SUM(CASE WHEN completed_date IS NULL "
+                "AND NOT COALESCE(completed_date_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS completion_date_no_usable",
+                "SUM(CASE WHEN application_date IS NOT NULL "
+                "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+                "AS both_dates_available",
+                "SUM(CASE WHEN status = 'Closed' THEN 1 ELSE 0 END) "
+                "AS closed_revision_count",
+                "SUM(CASE WHEN status = 'Closed' "
+                "AND application_date IS NOT NULL "
+                "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+                "AS closed_both_dates_available",
+            ]
             result = connection.execute(
                 "SELECT COUNT(*) AS cleared_revision_count, "
-                f"{flag_expressions} "
+                f"{', '.join(flag_expressions + date_coverage_expressions)} "
                 f"FROM {DBT_SCHEMA}.fct_cleared_permit_revision"
             )
             values = result.fetchone()
             columns = [item[0] for item in result.description]
             totals = dict(zip(columns, values, strict=True))
             cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
-            cleared_flag_counts = {
+            cleared_quality_counts = {
                 key: int(value or 0) for key, value in totals.items()
             }
 
@@ -539,7 +551,7 @@ def load_dashboard_data(
         active,
         summary,
         cleared_revision_count,
-        cleared_flag_counts,
+        cleared_quality_counts,
         last_successful_refresh_utc,
     )
 
@@ -1151,7 +1163,7 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
 def quality_page(
     active: pd.DataFrame,
     cleared_revision_count: int,
-    cleared_flag_counts: dict[str, int],
+    cleared_quality_counts: dict[str, int],
     summary: pd.DataFrame,
 ) -> None:
     hero(
@@ -1173,15 +1185,18 @@ def quality_page(
         int(active["is_age_eligible"].sum()) if "is_age_eligible" in active else 0
     )
     active_n = len(active)
+    excluded_n = active_n - eligible_n
+    reason_series = active.get(
+        "cohort_exclusion_reason", pd.Series(index=active.index, dtype="object")
+    )
     exclusion = (
-        active.get("cohort_exclusion_reason", pd.Series(dtype=str))
-        .fillna("included")
+        reason_series.dropna()
+        .astype(str)
         .value_counts()
         .rename_axis("Reason")
         .reset_index(name="Records")
     )
     exclusion_labels = {
-        "included": "Included in age analysis",
         "status_conflict": "Status information conflicts",
         "missing_status": "Status is missing",
         "terminal_or_exception_status": "Closed or special status",
@@ -1191,6 +1206,32 @@ def quality_page(
     exclusion["Reason"] = (
         exclusion["Reason"].map(exclusion_labels).fillna(exclusion["Reason"])
     )
+    classified_excluded_n = (
+        int(exclusion["Records"].sum()) if not exclusion.empty else 0
+    )
+    unclassified_excluded_n = excluded_n - classified_excluded_n
+    if unclassified_excluded_n < 0:
+        st.warning(
+            "The exclusion reasons exceed the number of ineligible Active records. "
+            "Review the age-eligibility and reason-classification outputs."
+        )
+    if unclassified_excluded_n > 0:
+        exclusion = pd.concat(
+            [
+                exclusion,
+                pd.DataFrame(
+                    [
+                        {
+                            "Reason": "Unclassified exclusion",
+                            "Records": unclassified_excluded_n,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    exclusion = exclusion.sort_values("Records", ascending=False)
+
     cols = st.columns(4)
     with cols[0]:
         metric_card(
@@ -1204,33 +1245,52 @@ def quality_page(
         )
     with cols[2]:
         metric_card(
+            "Records excluded from age view",
+            fmt_int(excluded_n),
+            "Reconciles to total Active records",
+        )
+    with cols[3]:
+        metric_card(
             "Records in Cleared data",
             fmt_int(cleared_revision_count),
             "Includes all statuses in the Cleared dataset",
         )
-    with cols[3]:
-        metric_card(
-            "Closed-permit summary groups",
-            fmt_int(len(summary)),
-            "Grouped by year, type and date pair",
-        )
+
     left, right = st.columns(2, gap="large")
     with left:
         st.subheader("Why some Active records are left out")
-        fig = px.bar(
-            exclusion,
-            x="Records",
-            y="Reason",
-            orientation="h",
-            color="Reason",
-            color_discrete_sequence=[TEAL, GOLD, BLUE, RED],
-            title="Records by reason",
+        st.caption(
+            f"{excluded_n:,} excluded records, shown by their first applicable reason."
         )
-        fig.update_xaxes(title="Records")
-        fig.update_yaxes(title="")
-        st.plotly_chart(chart_layout(fig, 330), width="stretch")
+        if exclusion.empty:
+            st.info("No Active records are excluded from the age analysis.")
+        else:
+            fig = px.bar(
+                exclusion,
+                x="Records",
+                y="Reason",
+                text="Records",
+                orientation="h",
+                color="Reason",
+                color_discrete_sequence=[TEAL, GOLD, BLUE, RED],
+                title="Excluded records by reason",
+            )
+            fig.update_traces(
+                texttemplate="%{text:,}", textposition="outside", cliponaxis=False
+            )
+            fig.update_xaxes(
+                title="Excluded records",
+                range=[0, max(1, int(exclusion["Records"].max()) * 1.25)],
+            )
+            fig.update_yaxes(title="")
+            st.plotly_chart(
+                chart_layout(fig, max(260, min(420, 110 + 55 * len(exclusion)))),
+                width="stretch",
+            )
+            st.dataframe(exclusion, width="stretch", hide_index=True)
+
     with right:
-        st.subheader("Checks on the Cleared dataset")
+        st.subheader("Conflicts and out-of-order Cleared dates")
         flag_fields = {
             "Builder names disagree": "builder_name_conflict",
             "Status values disagree": "has_status_conflict",
@@ -1247,22 +1307,139 @@ def quality_page(
             vals.append(
                 {
                     "Check": label,
-                    "Records flagged": int(cleared_flag_counts.get(field, 0)),
+                    "Records flagged": int(cleared_quality_counts.get(field, 0)),
                 }
             )
-        flag_df = pd.DataFrame(vals).sort_values("Records flagged")
-        fig = px.bar(
-            flag_df,
-            x="Records flagged",
-            y="Check",
-            orientation="h",
-            color="Records flagged",
-            color_continuous_scale=[SCALE_LOW, TEAL],
-            title="Records with each issue",
+        flag_df = pd.DataFrame(vals)
+        flag_df = flag_df[flag_df["Records flagged"] > 0].sort_values("Records flagged")
+        if flag_df.empty:
+            st.info("No source conflicts or out-of-order date intervals were found.")
+        else:
+            fig = px.bar(
+                flag_df,
+                x="Records flagged",
+                y="Check",
+                text="Records flagged",
+                orientation="h",
+                color="Records flagged",
+                color_continuous_scale=[SCALE_LOW, TEAL],
+                title="Records with each check",
+            )
+            fig.update_traces(
+                texttemplate="%{text:,}", textposition="outside", cliponaxis=False
+            )
+            fig.update_xaxes(
+                title="Records flagged",
+                range=[0, max(1, int(flag_df["Records flagged"].max()) * 1.25)],
+            )
+            fig.update_yaxes(title="")
+            st.plotly_chart(chart_layout(fig, 390), width="stretch")
+        st.caption(
+            "These checks can overlap: one revision may have more than one issue. "
+            "Missing or unusable dates are counted separately below."
         )
-        fig.update_xaxes(title="Records flagged")
-        fig.update_yaxes(title="")
-        st.plotly_chart(chart_layout(fig, 390), width="stretch")
+
+    st.subheader("Cleared date completeness")
+    st.caption(
+        "Counts cover all current logical Cleared revisions, across every status. "
+        "A date is usable only when current source rows agree on one non-null, "
+        "parseable value. Conflicts are kept separate from dates with no usable value."
+    )
+    app_usable = cleared_quality_counts.get("application_date_usable", 0)
+    app_no_usable = cleared_quality_counts.get("application_date_no_usable", 0)
+    app_conflicts = cleared_quality_counts.get("application_date_conflict", 0)
+    completion_usable = cleared_quality_counts.get("completion_date_usable", 0)
+    completion_no_usable = cleared_quality_counts.get("completion_date_no_usable", 0)
+    completion_conflicts = cleared_quality_counts.get("completed_date_conflict", 0)
+    both_dates_available = cleared_quality_counts.get("both_dates_available", 0)
+    closed_count = cleared_quality_counts.get("closed_revision_count", 0)
+    closed_both_dates = cleared_quality_counts.get("closed_both_dates_available", 0)
+
+    coverage_cols = st.columns(4)
+    with coverage_cols[0]:
+        metric_card(
+            "Application dates usable",
+            fmt_int(app_usable),
+            f"{app_usable / cleared_revision_count:.1%} of Cleared records"
+            if cleared_revision_count
+            else "No Cleared records",
+        )
+    with coverage_cols[1]:
+        metric_card(
+            "Completion dates usable",
+            fmt_int(completion_usable),
+            f"{completion_usable / cleared_revision_count:.1%} of Cleared records"
+            if cleared_revision_count
+            else "No Cleared records",
+        )
+    with coverage_cols[2]:
+        metric_card(
+            "Both dates available",
+            fmt_int(both_dates_available),
+            "Across all Cleared statuses",
+        )
+    with coverage_cols[3]:
+        metric_card(
+            "Closed records with both dates",
+            fmt_int(closed_both_dates),
+            f"Of {closed_count:,} records marked Closed",
+        )
+
+    coverage_table = pd.DataFrame(
+        [
+            {
+                "Date field": "Application date",
+                "Usable": app_usable,
+                "No usable value": app_no_usable,
+                "Conflicting source values": app_conflicts,
+            },
+            {
+                "Date field": "Completion date",
+                "Usable": completion_usable,
+                "No usable value": completion_no_usable,
+                "Conflicting source values": completion_conflicts,
+            },
+        ]
+    )
+    st.dataframe(coverage_table, width="stretch", hide_index=True)
+    app_coverage_total = app_usable + app_no_usable + app_conflicts
+    completion_coverage_total = (
+        completion_usable + completion_no_usable + completion_conflicts
+    )
+    if (
+        app_coverage_total != cleared_revision_count
+        or completion_coverage_total != cleared_revision_count
+    ):
+        st.warning(
+            "Date coverage categories do not reconcile to the total Cleared "
+            "revision count. Review the fact-level date and conflict flags."
+        )
+    st.caption(
+        "‘No usable value’ includes missing or unparseable source values where "
+        "there is no row-to-row conflict. The Closed records with both dates "
+        "should reconcile with the Application-to-completion date-pair total below."
+    )
+
+    summary_pairs = int(
+        pd.to_numeric(
+            summary.loc[
+                summary["measure"] == "Application to completion",
+                "eligible_date_pairs",
+            ],
+            errors="coerce",
+        )
+        .fillna(0)
+        .sum()
+    )
+    if summary_pairs != closed_both_dates:
+        st.warning(
+            "The Cleared fact reports "
+            f"{closed_both_dates:,} Closed revisions with both dates, but the "
+            f"lifecycle summary reports {summary_pairs:,} Application-to-completion "
+            "date pairs. Review the fact and summary model refresh before "
+            "interpreting the timeline coverage."
+        )
+
     st.subheader("What the numbers mean")
     st.markdown("""
     - **Age of an Active permit:** calendar days from its application date to the date shown on the Active permits page. The permit is still open, so this is not a final completion time.
@@ -1358,7 +1535,7 @@ def main() -> None:
                         active,
                         summary,
                         cleared_count,
-                        cleared_flag_counts,
+                        cleared_quality_counts,
                         last_successful_refresh_utc,
                     ) = load_dashboard_data(backend, config_fingerprint)
                 except Exception:
@@ -1380,7 +1557,7 @@ def main() -> None:
                 active,
                 summary,
                 cleared_count,
-                cleared_flag_counts,
+                cleared_quality_counts,
                 last_successful_refresh_utc,
             ) = load_dashboard_data(backend, config_fingerprint)
         st.session_state["_dashboard_loaded"] = True
@@ -1444,7 +1621,9 @@ def main() -> None:
     elif page == "Closed-permit timelines":
         lifecycle_page(summary.copy())
     else:
-        quality_page(active.copy(), cleared_count, cleared_flag_counts, summary.copy())
+        quality_page(
+            active.copy(), cleared_count, cleared_quality_counts, summary.copy()
+        )
 
     st.divider()
     st.caption(

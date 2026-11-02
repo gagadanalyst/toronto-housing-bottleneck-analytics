@@ -49,8 +49,10 @@ class FakeCursor:
         self.description: list[tuple[str]] | None = None
         self.rows: list[tuple[Any, ...]] = []
         self.closed = False
+        self.last_query = ""
 
     def execute(self, query: str, params: object = None) -> None:
+        self.last_query = query
         if "INFORMATION_SCHEMA.TABLES" in query:
             self.rows = [(name,) for name in sorted(self.relations)]
         elif "DASHBOARD_REFRESH_METADATA" in query:
@@ -72,12 +74,22 @@ class FakeCursor:
             ]
             self.rows = [(2025, "Residential", "Application to issue")]
         elif "FCT_CLEARED_PERMIT_REVISION" in query:
+            all_quality_fields = (*backend.FLAG_FIELDS, *backend.DATE_COVERAGE_FIELDS)
             self.description = [("CLEARED_REVISION_COUNT",)] + [
-                (field.upper(),) for field in backend.FLAG_FIELDS
+                (field.upper(),) for field in all_quality_fields
             ]
+            coverage_counts = {
+                "application_date_usable": 2,
+                "application_date_no_usable": 0,
+                "completion_date_usable": 1,
+                "completion_date_no_usable": 1,
+                "both_dates_available": 1,
+                "closed_revision_count": 2,
+                "closed_both_dates_available": 1,
+            }
             counts = tuple(
-                1 if field == "builder_name_conflict" else 0
-                for field in backend.FLAG_FIELDS
+                1 if field == "builder_name_conflict" else coverage_counts.get(field, 0)
+                for field in all_quality_fields
             )
             self.rows = [(3, *counts)]
         else:
@@ -184,6 +196,15 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     assert cleared_count == 3
     assert actual_refresh_timestamp == refresh_timestamp
     assert flags["builder_name_conflict"] == 1
+    assert flags["application_date_usable"] == 2
+    assert flags["application_date_no_usable"] == 0
+    assert flags["completion_date_usable"] == 1
+    assert flags["completion_date_no_usable"] == 1
+    assert flags["both_dates_available"] == 1
+    assert flags["closed_revision_count"] == 2
+    assert flags["closed_both_dates_available"] == 1
+    assert "application_date IS NULL" in cursor.last_query
+    assert "NOT COALESCE(application_date_conflict, FALSE)" in cursor.last_query
     assert all(
         flags[field] == 0
         for field in backend.FLAG_FIELDS
