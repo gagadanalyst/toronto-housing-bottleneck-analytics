@@ -730,7 +730,7 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
         st.markdown("**Where the data comes from**")
         if backend == "snowflake":
             st.caption(
-                "Reads the dashboard-facing dbt marts in TORONTO.ANALYTICS "
+                "Reads the dashboard-facing dbt relations in TORONTO.ANALYTICS "
                 "using the configured Snowflake role."
             )
         else:
@@ -756,9 +756,15 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
             st.session_state["refresh_published_data"] = True
             st.rerun()
         loading_slot = st.empty()
-        st.caption(
-            "Data is cached for up to 24 hours. Refreshing downloads the database again."
-        )
+        if backend == "snowflake":
+            st.caption(
+                "Data is cached for up to 24 hours. Refreshing re-queries Snowflake."
+            )
+        else:
+            st.caption(
+                "Data is cached for up to 24 hours. Refreshing downloads the latest "
+                "published database from GitHub (about 120 MB)."
+            )
         st.divider()
         st.caption(
             "These charts show patterns in the data. They do not explain what caused a permit delay."
@@ -1628,9 +1634,9 @@ def quality_page(
         )
     with lifecycle_cols[1]:
         metric_card(
-            "Non-Closed revisions with both dates",
+            "Revisions not marked Closed with both dates",
             fmt_int(non_closed_both_dates),
-            "Source dates are retained but not treated as successful completion",
+            "Includes records with missing or conflicting status",
         )
 
     summary_pairs = int(
@@ -1679,7 +1685,8 @@ def quality_page(
     st.markdown("""
     - Toronto's published data changes over time, so counts and results can change after a new release.
     - The latest application year is incomplete; compare it carefully with earlier years.
-    - The dashboard uses the latest published database from GitHub, not a live query to the City website. Data is cached for up to 24 hours, unless **Refresh data now** is selected.
+    - DuckDB uses the latest published database from GitHub; Snowflake queries the configured analytics relations. Neither backend queries the City website directly.
+    - Data is cached for up to 24 hours, unless **Refresh data now** is selected.
     - These charts describe what appears in the data. They do not show why a permit took longer.
     """)
 
@@ -1800,7 +1807,7 @@ def main() -> None:
         else:
             st.markdown(
                 "Check the Snowflake connection settings, the dashboard role's "
-                "read-only grants, and whether all three required dbt relations "
+                "read-only grants, and whether all four required dbt relations "
                 "exist in the configured analytics schema. The app will not silently "
                 "switch to DuckDB when Snowflake fails."
             )
