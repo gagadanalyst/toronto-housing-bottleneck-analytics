@@ -8,6 +8,28 @@ from typing import Any
 
 import pandas as pd
 
+ACTIVE_FLAG_FIELDS = (
+    "builder_name_conflict",
+    "has_status_conflict",
+    "application_date_conflict",
+    "issued_date_conflict",
+    "geo_id_conflict",
+)
+
+ACTIVE_AGGREGATE_FIELDS = (
+    "active_builder_name_conflict",
+    "active_has_status_conflict",
+    "active_application_date_conflict",
+    "active_issued_date_conflict",
+    "active_geo_id_conflict",
+    "active_builder_name_missing",
+    "active_status_missing",
+    "active_application_date_missing",
+    "active_issued_date_missing",
+    "active_geo_id_missing",
+    "active_revisions_with_findings",
+)
+
 FLAG_FIELDS = (
     "builder_name_conflict",
     "has_status_conflict",
@@ -23,6 +45,8 @@ FLAG_FIELDS = (
 DATE_COVERAGE_FIELDS = (
     "application_date_usable",
     "application_date_no_usable",
+    "issued_date_usable",
+    "issued_date_no_usable",
     "completion_date_usable",
     "completion_date_no_usable",
     "both_dates_available",
@@ -30,8 +54,16 @@ DATE_COVERAGE_FIELDS = (
     "closed_both_dates_available",
 )
 
+CLEARED_AGGREGATE_FIELDS = (
+    "cleared_builder_name_missing",
+    "cleared_status_missing",
+    "cleared_geo_id_missing",
+    "cleared_revisions_with_findings",
+)
+
 REQUIRED_RELATIONS = (
     "MART_ACTIVE_PERMIT_AGE",
+    "FCT_ACTIVE_PERMIT_REVISION",
     "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
     "FCT_CLEARED_PERMIT_REVISION",
 )
@@ -166,6 +198,51 @@ def load_snowflake_dashboard_data(
             f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
         )
 
+        active_flag_expressions = [
+            f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) "
+            f"AS active_{field}"
+            for field in ACTIVE_FLAG_FIELDS
+        ]
+        active_missing_expressions = [
+            "SUM(CASE WHEN builder_name IS NULL "
+            "AND NOT COALESCE(builder_name_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS active_builder_name_missing",
+            "SUM(CASE WHEN status IS NULL "
+            "AND NOT COALESCE(has_status_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS active_status_missing",
+            "SUM(CASE WHEN application_date IS NULL "
+            "AND NOT COALESCE(application_date_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS active_application_date_missing",
+            "SUM(CASE WHEN issued_date IS NULL "
+            "AND NOT COALESCE(issued_date_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS active_issued_date_missing",
+            "SUM(CASE WHEN geo_id IS NULL "
+            "AND NOT COALESCE(geo_id_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS active_geo_id_missing",
+        ]
+        active_finding_conditions = [
+            f"COALESCE({field}, FALSE)" for field in ACTIVE_FLAG_FIELDS
+        ] + [
+            "(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))",
+            "(application_date IS NULL "
+            "AND NOT COALESCE(application_date_conflict, FALSE))",
+        ]
+        active_missing_expressions.append(
+            "SUM(CASE WHEN "
+            + " OR ".join(active_finding_conditions)
+            + " THEN 1 ELSE 0 END) AS active_revisions_with_findings"
+        )
+        active_quality_frame = _fetch_dataframe(
+            cursor,
+            "SELECT "
+            + ", ".join(active_flag_expressions + active_missing_expressions)
+            + f" FROM {qualified_schema}.FCT_ACTIVE_PERMIT_REVISION",
+        )
+        active_quality_counts = {
+            field: int(active_quality_frame.iloc[0].get(field) or 0)
+            for field in ACTIVE_AGGREGATE_FIELDS
+        }
+
         flag_expressions = [
             f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) AS {field}"
             for field in FLAG_FIELDS
@@ -176,6 +253,11 @@ def load_snowflake_dashboard_data(
             "SUM(CASE WHEN application_date IS NULL "
             "AND NOT COALESCE(application_date_conflict, FALSE) "
             "THEN 1 ELSE 0 END) AS application_date_no_usable",
+            "SUM(CASE WHEN issued_date IS NOT NULL THEN 1 ELSE 0 END) "
+            "AS issued_date_usable",
+            "SUM(CASE WHEN issued_date IS NULL "
+            "AND NOT COALESCE(issued_date_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS issued_date_no_usable",
             "SUM(CASE WHEN completed_date IS NOT NULL THEN 1 ELSE 0 END) "
             "AS completion_date_usable",
             "SUM(CASE WHEN completed_date IS NULL "
@@ -190,6 +272,21 @@ def load_snowflake_dashboard_data(
             "AND application_date IS NOT NULL "
             "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
             "AS closed_both_dates_available",
+            "SUM(CASE WHEN observed_builder_names IS NULL "
+            "AND NOT COALESCE(builder_name_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS cleared_builder_name_missing",
+            "SUM(CASE WHEN status IS NULL "
+            "AND NOT COALESCE(has_status_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS cleared_status_missing",
+            "SUM(CASE WHEN geo_id IS NULL "
+            "AND NOT COALESCE(geo_id_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS cleared_geo_id_missing",
+            "SUM(CASE WHEN "
+            + " OR ".join(
+                [f"COALESCE({field}, FALSE)" for field in FLAG_FIELDS]
+                + ["(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))"]
+            )
+            + " THEN 1 ELSE 0 END) AS cleared_revisions_with_findings",
         ]
         totals_frame = _fetch_dataframe(
             cursor,
@@ -210,16 +307,21 @@ def load_snowflake_dashboard_data(
 
         totals = totals_frame.iloc[0].to_dict()
         cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
-        cleared_quality_counts = {
+        quality_counts = {
             field: int(totals.get(field) or 0)
-            for field in (*FLAG_FIELDS, *DATE_COVERAGE_FIELDS)
+            for field in (
+                *FLAG_FIELDS,
+                *DATE_COVERAGE_FIELDS,
+                *CLEARED_AGGREGATE_FIELDS,
+            )
         }
+        quality_counts.update(active_quality_counts)
 
         return (
             active,
             summary,
             cleared_revision_count,
-            cleared_quality_counts,
+            quality_counts,
             last_successful_refresh_utc,
         )
     finally:

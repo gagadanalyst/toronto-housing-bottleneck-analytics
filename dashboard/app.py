@@ -17,6 +17,7 @@ import streamlit as st
 from backend_config import resolve_dashboard_backend
 from refresh_metadata import format_refresh_timestamp
 from snowflake_backend import (
+    ACTIVE_FLAG_FIELDS,
     FLAG_FIELDS,
     load_snowflake_dashboard_data,
 )
@@ -468,6 +469,7 @@ def load_dashboard_data(
             }
             required = {
                 (DBT_SCHEMA, "mart_active_permit_age"),
+                (DBT_SCHEMA, "fct_active_permit_revision"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_by_year_type"),
                 (DBT_SCHEMA, "fct_cleared_permit_revision"),
             }
@@ -499,6 +501,11 @@ def load_dashboard_data(
                 "SUM(CASE WHEN application_date IS NULL "
                 "AND NOT COALESCE(application_date_conflict, FALSE) "
                 "THEN 1 ELSE 0 END) AS application_date_no_usable",
+                "SUM(CASE WHEN issued_date IS NOT NULL THEN 1 ELSE 0 END) "
+                "AS issued_date_usable",
+                "SUM(CASE WHEN issued_date IS NULL "
+                "AND NOT COALESCE(issued_date_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS issued_date_no_usable",
                 "SUM(CASE WHEN completed_date IS NOT NULL THEN 1 ELSE 0 END) "
                 "AS completion_date_usable",
                 "SUM(CASE WHEN completed_date IS NULL "
@@ -513,6 +520,21 @@ def load_dashboard_data(
                 "AND application_date IS NOT NULL "
                 "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
                 "AS closed_both_dates_available",
+                "SUM(CASE WHEN observed_builder_names IS NULL "
+                "AND NOT COALESCE(builder_name_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS cleared_builder_name_missing",
+                "SUM(CASE WHEN status IS NULL "
+                "AND NOT COALESCE(has_status_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS cleared_status_missing",
+                "SUM(CASE WHEN geo_id IS NULL "
+                "AND NOT COALESCE(geo_id_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS cleared_geo_id_missing",
+                "SUM(CASE WHEN "
+                + " OR ".join(
+                    [f"COALESCE({field}, FALSE)" for field in FLAG_FIELDS]
+                    + ["(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))"]
+                )
+                + " THEN 1 ELSE 0 END) AS cleared_revisions_with_findings",
             ]
             result = connection.execute(
                 "SELECT COUNT(*) AS cleared_revision_count, "
@@ -523,9 +545,57 @@ def load_dashboard_data(
             columns = [item[0] for item in result.description]
             totals = dict(zip(columns, values, strict=True))
             cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
-            cleared_quality_counts = {
-                key: int(value or 0) for key, value in totals.items()
-            }
+            quality_counts = {key: int(value or 0) for key, value in totals.items()}
+
+            active_flag_expressions = [
+                f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) "
+                f"AS active_{field}"
+                for field in ACTIVE_FLAG_FIELDS
+            ]
+            active_finding_conditions = [
+                f"COALESCE({field}, FALSE)" for field in ACTIVE_FLAG_FIELDS
+            ] + [
+                "(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))",
+                "(application_date IS NULL "
+                "AND NOT COALESCE(application_date_conflict, FALSE))",
+            ]
+            active_aggregate_expressions = active_flag_expressions + [
+                "SUM(CASE WHEN builder_name IS NULL "
+                "AND NOT COALESCE(builder_name_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS active_builder_name_missing",
+                "SUM(CASE WHEN status IS NULL "
+                "AND NOT COALESCE(has_status_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS active_status_missing",
+                "SUM(CASE WHEN application_date IS NULL "
+                "AND NOT COALESCE(application_date_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS active_application_date_missing",
+                "SUM(CASE WHEN issued_date IS NULL "
+                "AND NOT COALESCE(issued_date_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS active_issued_date_missing",
+                "SUM(CASE WHEN geo_id IS NULL "
+                "AND NOT COALESCE(geo_id_conflict, FALSE) "
+                "THEN 1 ELSE 0 END) AS active_geo_id_missing",
+                "SUM(CASE WHEN "
+                + " OR ".join(active_finding_conditions)
+                + " THEN 1 ELSE 0 END) AS active_revisions_with_findings",
+            ]
+            active_quality_result = connection.execute(
+                "SELECT "
+                + ", ".join(active_aggregate_expressions)
+                + f" FROM {DBT_SCHEMA}.fct_active_permit_revision"
+            )
+            active_quality_values = active_quality_result.fetchone()
+            active_quality_columns = [
+                item[0] for item in active_quality_result.description
+            ]
+            quality_counts.update(
+                {
+                    key: int(value or 0)
+                    for key, value in zip(
+                        active_quality_columns, active_quality_values, strict=True
+                    )
+                }
+            )
 
             # The refresh timestamp is written by CD only after a successful
             # dbt build/test run, then published as part of this DuckDB release.
@@ -551,7 +621,7 @@ def load_dashboard_data(
         active,
         summary,
         cleared_revision_count,
-        cleared_quality_counts,
+        quality_counts,
         last_successful_refresh_utc,
     )
 
@@ -1163,29 +1233,147 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
 def quality_page(
     active: pd.DataFrame,
     cleared_revision_count: int,
-    cleared_quality_counts: dict[str, int],
+    quality_counts: dict[str, int],
     summary: pd.DataFrame,
 ) -> None:
     hero(
         "CHECK THE DATA",
         "Data quality and definitions",
-        "See why some records are left out and where source information is missing or inconsistent.",
+        "Findings, analysis exclusions and date completeness are reported separately so their counts are not confused.",
     )
     active = active.copy()
-    for field in [
-        "is_age_eligible",
-        "has_status_conflict",
-        "application_date_conflict",
-        "issued_date_conflict",
-        "geo_id_conflict",
-    ]:
+    for field in ["is_age_eligible"]:
         if field in active:
             active[field] = normalize_bool(active[field])
+
     eligible_n = (
         int(active["is_age_eligible"].sum()) if "is_age_eligible" in active else 0
     )
     active_n = len(active)
     excluded_n = active_n - eligible_n
+    active_findings_n = int(quality_counts.get("active_revisions_with_findings", 0))
+    cleared_findings_n = int(quality_counts.get("cleared_revisions_with_findings", 0))
+
+    active_cols = st.columns(4)
+    with active_cols[0]:
+        metric_card(
+            "Active revisions analysed", fmt_int(active_n), "Current logical revisions"
+        )
+    with active_cols[1]:
+        metric_card(
+            "Active revisions with findings",
+            fmt_int(active_findings_n),
+            "Each revision counted once",
+        )
+    with active_cols[2]:
+        metric_card(
+            "Included in Active age view",
+            fmt_int(eligible_n),
+            f"{eligible_n / active_n:.1%} of Active revisions"
+            if active_n
+            else "No records",
+        )
+    with active_cols[3]:
+        metric_card(
+            "Excluded from Active age view",
+            fmt_int(excluded_n),
+            "Includes intentional status exclusions",
+        )
+
+    st.subheader("Active data-quality checks")
+    st.caption(
+        f"{active_findings_n:,} distinct Active revisions have at least one flagged issue. "
+        "This count includes source conflicts and missing status or application date. "
+        "Missing builder names, issue dates and geographic IDs are shown as completeness "
+        "checks and do not increase this KPI. Counts by check can overlap."
+    )
+    active_checks = [
+        {
+            "Check": "Builder names disagree",
+            "Records": quality_counts.get("active_builder_name_conflict", 0),
+            "What it means": "Current source rows for the same revision contain different builder names, or a mix of a name and a missing value.",
+            "Effect on analysis": "The builder name is withheld. Age eligibility is unchanged.",
+        },
+        {
+            "Check": "Status values disagree",
+            "Records": quality_counts.get("active_has_status_conflict", 0),
+            "What it means": "Current source rows for the same revision contain different statuses, or a mix of a status and a missing value.",
+            "Effect on analysis": "The status is withheld and the revision is excluded from the Active age view.",
+        },
+        {
+            "Check": "Application dates disagree",
+            "Records": quality_counts.get("active_application_date_conflict", 0),
+            "What it means": "Current source rows for the same revision contain different application dates, or a mix of a date and a missing value.",
+            "Effect on analysis": "The application date is withheld; age cannot be calculated for a revision otherwise eligible for the Active age view.",
+        },
+        {
+            "Check": "Issue dates disagree",
+            "Records": quality_counts.get("active_issued_date_conflict", 0),
+            "What it means": "Current source rows for the same revision contain different issue dates, or a mix of a date and a missing value.",
+            "Effect on analysis": "The issue date is withheld. It does not affect the Active age calculation, which uses application date and the as-of date.",
+        },
+        {
+            "Check": "Geographic IDs disagree",
+            "Records": quality_counts.get("active_geo_id_conflict", 0),
+            "What it means": "Current source rows for the same revision contain different geographic IDs, or a mix of an ID and a missing value.",
+            "Effect on analysis": "The geographic ID is withheld. Age eligibility is unchanged.",
+        },
+        {
+            "Check": "Builder name missing",
+            "Records": quality_counts.get("active_builder_name_missing", 0),
+            "What it means": "No builder name is available and the current source rows do not disagree on the value.",
+            "Effect on analysis": "Builder-level analysis is less complete; Active age eligibility is unchanged.",
+        },
+        {
+            "Check": "Issue date missing",
+            "Records": quality_counts.get("active_issued_date_missing", 0),
+            "What it means": "No issue date is available and the current source rows do not disagree on the value.",
+            "Effect on analysis": "This can be expected for a permit not yet issued; Active age uses application date, not issue date.",
+        },
+        {
+            "Check": "Geographic ID missing",
+            "Records": quality_counts.get("active_geo_id_missing", 0),
+            "What it means": "No geographic ID is available and the current source rows do not disagree on the value.",
+            "Effect on analysis": "Geographic analysis may be incomplete; Active age eligibility is unchanged.",
+        },
+        {
+            "Check": "Status missing",
+            "Records": quality_counts.get("active_status_missing", 0),
+            "What it means": "No status is available and the current source rows do not disagree on status.",
+            "Effect on analysis": "The revision is excluded because its status cannot be classified.",
+        },
+        {
+            "Check": "Application date missing",
+            "Records": quality_counts.get("active_application_date_missing", 0),
+            "What it means": "No application date is available and the current source rows do not disagree on the date.",
+            "Effect on analysis": "The revision cannot be aged if it otherwise qualifies for the Active cohort; a terminal status may already exclude it.",
+        },
+    ]
+    active_findings = pd.DataFrame(active_checks)
+    fig = px.bar(
+        active_findings.sort_values("Records"),
+        x="Records",
+        y="Check",
+        text="Records",
+        orientation="h",
+        title="Active revisions by check",
+    )
+    fig.update_traces(
+        texttemplate="%{text:,}", textposition="outside", cliponaxis=False
+    )
+    fig.update_xaxes(title="Logical revisions", rangemode="tozero")
+    fig.update_yaxes(title="")
+    st.plotly_chart(
+        chart_layout(fig, max(310, 48 * len(active_findings) + 85)),
+        width="stretch",
+    )
+    st.dataframe(active_findings, width="stretch", hide_index=True)
+
+    st.subheader("Why Active revisions are excluded from the age view")
+    st.caption(
+        "Each excluded revision is assigned its first applicable reason. "
+        "This chart is an eligibility breakdown, not a count of data-quality defects."
+    )
     reason_series = active.get(
         "cohort_exclusion_reason", pd.Series(index=active.index, dtype="object")
     )
@@ -1197,9 +1385,9 @@ def quality_page(
         .reset_index(name="Records")
     )
     exclusion_labels = {
-        "status_conflict": "Status information conflicts",
+        "status_conflict": "Status values conflict",
         "missing_status": "Status is missing",
-        "terminal_or_exception_status": "Closed or special status",
+        "terminal_or_exception_status": "Closed, Cancelled or Abandoned (intentional exclusion)",
         "application_date_conflict": "Application dates conflict",
         "missing_application_date": "Application date is missing",
     }
@@ -1212,10 +1400,10 @@ def quality_page(
     unclassified_excluded_n = excluded_n - classified_excluded_n
     if unclassified_excluded_n < 0:
         st.warning(
-            "The exclusion reasons exceed the number of ineligible Active records. "
+            "The exclusion reasons exceed the number of ineligible Active revisions. "
             "Review the age-eligibility and reason-classification outputs."
         )
-    if unclassified_excluded_n > 0:
+    elif unclassified_excluded_n > 0:
         exclusion = pd.concat(
             [
                 exclusion,
@@ -1231,200 +1419,219 @@ def quality_page(
             ignore_index=True,
         )
     exclusion = exclusion.sort_values("Records", ascending=False)
-
-    cols = st.columns(4)
-    with cols[0]:
-        metric_card(
-            "Active permit records", fmt_int(active_n), "In the latest published data"
+    if exclusion.empty:
+        st.info("No Active revisions are excluded from the age analysis.")
+    else:
+        fig = px.bar(
+            exclusion,
+            x="Records",
+            y="Reason",
+            text="Records",
+            orientation="h",
+            title="Excluded Active revisions by first applicable reason",
         )
-    with cols[1]:
-        metric_card(
-            "Records included in age view",
-            fmt_int(eligible_n),
-            f"{eligible_n / active_n:.2%} included" if active_n else "No records",
+        fig.update_traces(
+            texttemplate="%{text:,}", textposition="outside", cliponaxis=False
         )
-    with cols[2]:
-        metric_card(
-            "Records excluded from age view",
-            fmt_int(excluded_n),
-            "Reconciles to total Active records",
+        fig.update_xaxes(title="Excluded logical revisions", rangemode="tozero")
+        fig.update_yaxes(title="")
+        st.plotly_chart(
+            chart_layout(fig, max(260, min(420, 110 + 55 * len(exclusion)))),
+            width="stretch",
         )
-    with cols[3]:
-        metric_card(
-            "Records in Cleared data",
-            fmt_int(cleared_revision_count),
-            "Includes all statuses in the Cleared dataset",
-        )
-
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.subheader("Why some Active records are left out")
-        st.caption(
-            f"{excluded_n:,} excluded records, shown by their first applicable reason."
-        )
-        if exclusion.empty:
-            st.info("No Active records are excluded from the age analysis.")
-        else:
-            fig = px.bar(
-                exclusion,
-                x="Records",
-                y="Reason",
-                text="Records",
-                orientation="h",
-                color="Reason",
-                color_discrete_sequence=[TEAL, GOLD, BLUE, RED],
-                title="Excluded records by reason",
-            )
-            fig.update_traces(
-                texttemplate="%{text:,}", textposition="outside", cliponaxis=False
-            )
-            fig.update_xaxes(
-                title="Excluded records",
-                range=[0, max(1, int(exclusion["Records"].max()) * 1.25)],
-            )
-            fig.update_yaxes(title="")
-            st.plotly_chart(
-                chart_layout(fig, max(260, min(420, 110 + 55 * len(exclusion)))),
-                width="stretch",
-            )
-            st.dataframe(exclusion, width="stretch", hide_index=True)
-
-    with right:
-        st.subheader("Conflicts and out-of-order Cleared dates")
-        flag_fields = {
-            "Builder names disagree": "builder_name_conflict",
-            "Status values disagree": "has_status_conflict",
-            "Application dates disagree": "application_date_conflict",
-            "Issue dates disagree": "issued_date_conflict",
-            "Completion dates disagree": "completed_date_conflict",
-            "Geographic IDs disagree": "geo_id_conflict",
-            "Issue date is before application": "application_to_issue_negative",
-            "Completion date is before application": "application_to_completion_negative",
-            "Completion date is before issue": "issue_to_completion_negative",
-        }
-        vals = []
-        for label, field in flag_fields.items():
-            vals.append(
-                {
-                    "Check": label,
-                    "Records flagged": int(cleared_quality_counts.get(field, 0)),
-                }
-            )
-        flag_df = pd.DataFrame(vals)
-        flag_df = flag_df[flag_df["Records flagged"] > 0].sort_values("Records flagged")
-        if flag_df.empty:
-            st.info("No source conflicts or out-of-order date intervals were found.")
-        else:
-            fig = px.bar(
-                flag_df,
-                x="Records flagged",
-                y="Check",
-                text="Records flagged",
-                orientation="h",
-                color="Records flagged",
-                color_continuous_scale=[SCALE_LOW, TEAL],
-                title="Records with each check",
-            )
-            fig.update_traces(
-                texttemplate="%{text:,}", textposition="outside", cliponaxis=False
-            )
-            fig.update_xaxes(
-                title="Records flagged",
-                range=[0, max(1, int(flag_df["Records flagged"].max()) * 1.25)],
-            )
-            fig.update_yaxes(title="")
-            st.plotly_chart(chart_layout(fig, 390), width="stretch")
-        st.caption(
-            "These checks can overlap: one revision may have more than one issue. "
-            "Missing or unpublished dates are counted separately below."
-        )
-
-    st.subheader("Cleared date fields")
+        st.dataframe(exclusion, width="stretch", hide_index=True)
     st.caption(
-        "Counts cover all current logical Cleared revisions, across every status. "
-        "A date is populated when current source rows agree on one non-null, "
-        "parseable value. Conflicting values are counted separately. A populated "
-        "completion date is source information; it does not by itself mean the "
-        "permit was successfully completed."
+        "Closed, Cancelled and Abandoned statuses are excluded by design because "
+        "they are not part of the open Active-age cohort. That exclusion does not, "
+        "by itself, mean the source data is defective."
     )
-    app_populated = cleared_quality_counts.get("application_date_usable", 0)
-    app_no_populated = cleared_quality_counts.get("application_date_no_usable", 0)
-    app_conflicts = cleared_quality_counts.get("application_date_conflict", 0)
-    completion_populated = cleared_quality_counts.get("completion_date_usable", 0)
-    completion_no_populated = cleared_quality_counts.get("completion_date_no_usable", 0)
-    completion_conflicts = cleared_quality_counts.get("completed_date_conflict", 0)
-    both_dates_populated = cleared_quality_counts.get("both_dates_available", 0)
-    closed_count = cleared_quality_counts.get("closed_revision_count", 0)
-    closed_both_dates = cleared_quality_counts.get("closed_both_dates_available", 0)
-    not_closed_both_dates = max(both_dates_populated - closed_both_dates, 0)
 
-    coverage_cols = st.columns(4)
-    with coverage_cols[0]:
+    st.divider()
+    cleared_cols = st.columns(2)
+    with cleared_cols[0]:
         metric_card(
-            "Application date populated",
-            fmt_int(app_populated),
-            f"{app_populated / cleared_revision_count:.1%} of Cleared records"
-            if cleared_revision_count
-            else "No Cleared records",
+            "Cleared revisions analysed",
+            fmt_int(cleared_revision_count),
+            "All statuses in the current Cleared dataset",
         )
-    with coverage_cols[1]:
+    with cleared_cols[1]:
         metric_card(
-            "Completion date populated",
-            fmt_int(completion_populated),
-            f"{completion_populated / cleared_revision_count:.1%} of Cleared records"
-            if cleared_revision_count
-            else "No Cleared records",
+            "Cleared revisions with flagged issues",
+            fmt_int(cleared_findings_n),
+            "Each revision counted once; checks can overlap",
         )
-    with coverage_cols[2]:
-        metric_card(
-            "Closed records with both dates",
-            fmt_int(closed_both_dates),
-            f"Of {closed_count:,} records marked Closed",
-        )
-    with coverage_cols[3]:
-        metric_card(
-            "Non-Closed records with both dates",
-            fmt_int(not_closed_both_dates),
-            "Not included in lifecycle summaries",
-        )
+
+    st.subheader("Cleared data-quality checks")
+    st.caption(
+        f"{cleared_findings_n:,} distinct Cleared revisions have at least one flagged issue. "
+        "The unique count includes source conflicts, missing status and out-of-order "
+        "dates across all statuses. Missing builder names and geographic IDs are "
+        "completeness checks, not part of this KPI; missing lifecycle dates are shown "
+        "in the date-completeness table. One revision can contribute to more than one check."
+    )
+    cleared_checks = [
+        {
+            "Check": "Builder names disagree",
+            "Records": quality_counts.get("builder_name_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on builder name, including missing versus populated values.",
+            "Effect on analysis": "The builder name is withheld; other fields remain available when valid.",
+        },
+        {
+            "Check": "Status values disagree",
+            "Records": quality_counts.get("has_status_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on status, including missing versus populated values.",
+            "Effect on analysis": "The status is withheld; the revision cannot be identified reliably as Closed for lifecycle summaries.",
+        },
+        {
+            "Check": "Application dates disagree",
+            "Records": quality_counts.get("application_date_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on application date.",
+            "Effect on analysis": "The application date is withheld; durations that require it cannot be calculated.",
+        },
+        {
+            "Check": "Issue dates disagree",
+            "Records": quality_counts.get("issued_date_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on issue date.",
+            "Effect on analysis": "The issue date is withheld; durations that require it cannot be calculated.",
+        },
+        {
+            "Check": "Completion dates disagree",
+            "Records": quality_counts.get("completed_date_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on completion date.",
+            "Effect on analysis": "The completion date is withheld; durations that require it cannot be calculated.",
+        },
+        {
+            "Check": "Geographic IDs disagree",
+            "Records": quality_counts.get("geo_id_conflict", 0),
+            "What it means": "Current source rows for the same revision disagree on geographic ID.",
+            "Effect on analysis": "The geographic ID is withheld; lifecycle durations are unaffected.",
+        },
+        {
+            "Check": "Issue date before application date",
+            "Records": quality_counts.get("application_to_issue_negative", 0),
+            "What it means": "The recorded issue date occurs before the recorded application date.",
+            "Effect on analysis": "For a Closed revision, only the Application-to-issue duration is excluded; other date comparisons are evaluated separately.",
+        },
+        {
+            "Check": "Completion date before application date",
+            "Records": quality_counts.get("application_to_completion_negative", 0),
+            "What it means": "The recorded completion date occurs before the recorded application date.",
+            "Effect on analysis": "For a Closed revision, only the Application-to-completion duration is excluded; other date comparisons are evaluated separately.",
+        },
+        {
+            "Check": "Completion date before issue date",
+            "Records": quality_counts.get("issue_to_completion_negative", 0),
+            "What it means": "The recorded completion date occurs before the recorded issue date.",
+            "Effect on analysis": "For a Closed revision, only the Issue-to-completion duration is excluded; other date comparisons are evaluated separately.",
+        },
+        {
+            "Check": "Builder name missing",
+            "Records": quality_counts.get("cleared_builder_name_missing", 0),
+            "What it means": "No builder name was observed in the current source rows and there is no builder-name conflict.",
+            "Effect on analysis": "Builder-level analysis is less complete; lifecycle durations are unaffected.",
+        },
+        {
+            "Check": "Geographic ID missing",
+            "Records": quality_counts.get("cleared_geo_id_missing", 0),
+            "What it means": "No geographic ID is available and the current source rows do not disagree on the value.",
+            "Effect on analysis": "Geographic analysis may be incomplete; lifecycle durations are unaffected.",
+        },
+        {
+            "Check": "Status missing",
+            "Records": quality_counts.get("cleared_status_missing", 0),
+            "What it means": "No status is available and the current source rows do not disagree on status.",
+            "Effect on analysis": "The revision cannot be assigned to the Closed lifecycle cohort.",
+        },
+    ]
+    cleared_findings = pd.DataFrame(cleared_checks)
+    fig = px.bar(
+        cleared_findings.sort_values("Records"),
+        x="Records",
+        y="Check",
+        text="Records",
+        orientation="h",
+        title="Cleared revisions by check",
+    )
+    fig.update_traces(
+        texttemplate="%{text:,}", textposition="outside", cliponaxis=False
+    )
+    fig.update_xaxes(title="Logical revisions", rangemode="tozero")
+    fig.update_yaxes(title="")
+    st.plotly_chart(
+        chart_layout(fig, max(380, 42 * len(cleared_findings) + 100)),
+        width="stretch",
+    )
+    st.dataframe(cleared_findings, width="stretch", hide_index=True)
+
+    st.subheader("Cleared date completeness")
+    st.caption(
+        "These are availability counts, not a list of defects. They cover every "
+        "current logical Cleared revision, regardless of status. 'Missing / "
+        "unavailable' excludes revisions already counted as having conflicting values."
+    )
+    application_populated = quality_counts.get("application_date_usable", 0)
+    application_missing = quality_counts.get("application_date_no_usable", 0)
+    application_conflicts = quality_counts.get("application_date_conflict", 0)
+    issue_populated = quality_counts.get("issued_date_usable", 0)
+    issue_missing = quality_counts.get("issued_date_no_usable", 0)
+    issue_conflicts = quality_counts.get("issued_date_conflict", 0)
+    completion_populated = quality_counts.get("completion_date_usable", 0)
+    completion_missing = quality_counts.get("completion_date_no_usable", 0)
+    completion_conflicts = quality_counts.get("completed_date_conflict", 0)
+    closed_count = quality_counts.get("closed_revision_count", 0)
+    closed_both_dates = quality_counts.get("closed_both_dates_available", 0)
+    both_dates_populated = quality_counts.get("both_dates_available", 0)
+    non_closed_both_dates = max(both_dates_populated - closed_both_dates, 0)
 
     coverage_table = pd.DataFrame(
         [
             {
                 "Date field": "Application date",
-                "Date populated": app_populated,
-                "No populated value": app_no_populated,
-                "Conflicting source values": app_conflicts,
+                "Populated": application_populated,
+                "Missing / unavailable": application_missing,
+                "Conflicting source values": application_conflicts,
+            },
+            {
+                "Date field": "Issue date",
+                "Populated": issue_populated,
+                "Missing / unavailable": issue_missing,
+                "Conflicting source values": issue_conflicts,
             },
             {
                 "Date field": "Completion date",
-                "Date populated": completion_populated,
-                "No populated value": completion_no_populated,
+                "Populated": completion_populated,
+                "Missing / unavailable": completion_missing,
                 "Conflicting source values": completion_conflicts,
             },
         ]
     )
     st.dataframe(coverage_table, width="stretch", hide_index=True)
-    app_coverage_total = app_populated + app_no_populated + app_conflicts
-    completion_coverage_total = (
-        completion_populated + completion_no_populated + completion_conflicts
-    )
-    if (
-        app_coverage_total != cleared_revision_count
-        or completion_coverage_total != cleared_revision_count
+    if any(
+        populated + missing + conflicts != cleared_revision_count
+        for populated, missing, conflicts in [
+            (application_populated, application_missing, application_conflicts),
+            (issue_populated, issue_missing, issue_conflicts),
+            (completion_populated, completion_missing, completion_conflicts),
+        ]
     ):
         st.warning(
-            "Date coverage categories do not reconcile to the total Cleared "
+            "One or more date-coverage rows do not reconcile to the total Cleared "
             "revision count. Review the fact-level date and conflict flags."
         )
-    st.caption(
-        "‘No populated value’ includes missing or unparseable source values where "
-        "there is no row-to-row conflict. A non-Closed record can still have a "
-        "populated COMPLETED_DATE; we retain that source value but do not interpret "
-        "it as successful completion. Only records marked Closed are used in the "
-        "lifecycle summary. The Closed records with both dates should reconcile "
-        "with the Application-to-completion date-pair total below."
-    )
+
+    lifecycle_cols = st.columns(2)
+    with lifecycle_cols[0]:
+        metric_card(
+            "Closed revisions with application and completion dates",
+            fmt_int(closed_both_dates),
+            f"Of {closed_count:,} records marked Closed",
+        )
+    with lifecycle_cols[1]:
+        metric_card(
+            "Non-Closed revisions with both dates",
+            fmt_int(non_closed_both_dates),
+            "Source dates are retained but not treated as successful completion",
+        )
 
     summary_pairs = int(
         pd.to_numeric(
@@ -1445,21 +1652,33 @@ def quality_page(
             "date pairs. Review the fact and summary model refresh before "
             "interpreting the timeline coverage."
         )
+    st.caption(
+        "A populated COMPLETED_DATE is source information, not proof that a permit "
+        "was successfully completed. Only records marked Closed enter the lifecycle "
+        "summary. A negative interval removes only that specific date comparison "
+        "from its duration statistics; it does not remove the revision from every "
+        "other analysis."
+    )
 
     st.subheader("What the numbers mean")
     st.markdown("""
-    - **Age of an Active permit:** calendar days from its application date to the date shown on the Active permits page. The permit is still open, so this is not a final completion time.
-    - **Time between dates for a Closed permit:** calendar days between the selected dates for a record marked Closed. Records where dates run backwards are flagged and left out of the published duration statistics.
-    - **Middle value (median):** half the values are below it and half are above it.
-    - **90th percentile:** 9 out of 10 values are at or below this value. It helps show the higher end of the times.
-    - **Group summaries:** some charts summarize the median or 90th percentile within each year and permit type, then compare those group values. They are not a single calculation across every permit.
-    - **Data conflicts:** more than one current source row can exist for a permit revision, and values may disagree. Those disagreements are counted rather than silently choosing one value.
+    - **Logical revision:** one permit number, revision number and permit type. Physical source rows for the same revision are consolidated before these checks.
+    - **Revisions with at least one finding:** each affected logical revision is counted once, even when it has several findings.
+    - **Findings by check:** counts are separate for each check and can overlap; do not add them to calculate unique affected revisions.
+    - **Conflicting values:** current source rows disagree, including a mix of missing and populated values. The disputed value is withheld instead of arbitrarily selecting one.
+    - **Missing / unavailable field:** no value is available and no conflict was detected. Missing values can be expected for some attributes, permit statuses or lifecycle stages and are not automatically errors.
+    - **Missing / unavailable date:** no consistent date is available and no date conflict was detected. Missing dates can be expected for some statuses and are not automatically errors.
+    - **Negative interval:** the recorded dates run backwards. The corresponding duration is excluded from that measure's published statistics; other durations for the same revision can still be used. Durations are elapsed calendar days, not business days.
+    - **Active age:** calendar days from application date to the dashboard's as-of date. It is an ongoing age, not a completed lifecycle duration.
+    - **Lifecycle duration:** elapsed calendar days between the selected dates for a revision marked Closed. The dashboard does not infer why a permit took longer.
+    - **Median:** half of the duration values are below it and half are above it.
+    - **90th percentile:** 9 out of 10 duration values are at or below this value; it highlights the higher end of the distribution.
+    - **Grouped summaries:** the charts compare statistics calculated within each application-year and permit-type group, rather than one statistic calculated across all permits.
     """)
     st.subheader("What to keep in mind")
     st.markdown("""
     - Toronto's published data changes over time, so counts and results can change after a new release.
     - The latest application year is incomplete; compare it carefully with earlier years.
-    - Some records have missing dates, unusual statuses, repeated rows or conflicting details.
     - The dashboard uses the latest published database from GitHub, not a live query to the City website. Data is cached for up to 24 hours, unless **Refresh data now** is selected.
     - These charts describe what appears in the data. They do not show why a permit took longer.
     """)
@@ -1541,7 +1760,7 @@ def main() -> None:
                         active,
                         summary,
                         cleared_count,
-                        cleared_quality_counts,
+                        quality_counts,
                         last_successful_refresh_utc,
                     ) = load_dashboard_data(backend, config_fingerprint)
                 except Exception:
@@ -1563,7 +1782,7 @@ def main() -> None:
                 active,
                 summary,
                 cleared_count,
-                cleared_quality_counts,
+                quality_counts,
                 last_successful_refresh_utc,
             ) = load_dashboard_data(backend, config_fingerprint)
         st.session_state["_dashboard_loaded"] = True
@@ -1627,9 +1846,7 @@ def main() -> None:
     elif page == "Closed-permit timelines":
         lifecycle_page(summary.copy())
     else:
-        quality_page(
-            active.copy(), cleared_count, cleared_quality_counts, summary.copy()
-        )
+        quality_page(active.copy(), cleared_count, quality_counts, summary.copy())
 
     st.divider()
     st.caption(

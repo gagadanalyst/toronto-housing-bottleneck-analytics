@@ -50,9 +50,11 @@ class FakeCursor:
         self.rows: list[tuple[Any, ...]] = []
         self.closed = False
         self.last_query = ""
+        self.queries: list[str] = []
 
     def execute(self, query: str, params: object = None) -> None:
         self.last_query = query
+        self.queries.append(query)
         if "INFORMATION_SCHEMA.TABLES" in query:
             self.rows = [(name,) for name in sorted(self.relations)]
         elif "DASHBOARD_REFRESH_METADATA" in query:
@@ -73,19 +75,49 @@ class FakeCursor:
                 ("MEASURE",),
             ]
             self.rows = [(2025, "Residential", "Application to issue")]
+        elif "FCT_ACTIVE_PERMIT_REVISION" in query:
+            self.description = [
+                (field.upper(),) for field in backend.ACTIVE_AGGREGATE_FIELDS
+            ]
+            active_counts = {
+                "active_builder_name_conflict": 1,
+                "active_builder_name_missing": 3,
+                "active_has_status_conflict": 0,
+                "active_application_date_conflict": 0,
+                "active_issued_date_conflict": 0,
+                "active_geo_id_conflict": 0,
+                "active_status_missing": 0,
+                "active_application_date_missing": 0,
+                "active_issued_date_missing": 0,
+                "active_geo_id_missing": 0,
+                "active_revisions_with_findings": 1,
+            }
+            self.rows = [
+                tuple(active_counts[field] for field in backend.ACTIVE_AGGREGATE_FIELDS)
+            ]
         elif "FCT_CLEARED_PERMIT_REVISION" in query:
-            all_quality_fields = (*backend.FLAG_FIELDS, *backend.DATE_COVERAGE_FIELDS)
+            all_quality_fields = (
+                *backend.FLAG_FIELDS,
+                *backend.DATE_COVERAGE_FIELDS,
+                *backend.CLEARED_AGGREGATE_FIELDS,
+            )
             self.description = [("CLEARED_REVISION_COUNT",)] + [
                 (field.upper(),) for field in all_quality_fields
             ]
             coverage_counts = {
                 "application_date_usable": 2,
                 "application_date_no_usable": 0,
+                "issued_date_usable": 2,
+                "issued_date_no_usable": 0,
                 "completion_date_usable": 1,
                 "completion_date_no_usable": 1,
                 "both_dates_available": 1,
                 "closed_revision_count": 2,
                 "closed_both_dates_available": 1,
+                "cleared_builder_name_missing": 1,
+                "cleared_status_missing": 0,
+                "cleared_geo_id_missing": 2,
+                "cleared_revisions_with_findings": 1,
             }
             counts = tuple(
                 1 if field == "builder_name_conflict" else coverage_counts.get(field, 0)
@@ -198,11 +230,27 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     assert flags["builder_name_conflict"] == 1
     assert flags["application_date_usable"] == 2
     assert flags["application_date_no_usable"] == 0
+    assert flags["issued_date_usable"] == 2
+    assert flags["issued_date_no_usable"] == 0
     assert flags["completion_date_usable"] == 1
     assert flags["completion_date_no_usable"] == 1
     assert flags["both_dates_available"] == 1
     assert flags["closed_revision_count"] == 2
     assert flags["closed_both_dates_available"] == 1
+    assert flags["cleared_status_missing"] == 0
+    assert flags["cleared_revisions_with_findings"] == 1
+    assert flags["active_builder_name_conflict"] == 1
+    assert flags["active_builder_name_missing"] == 3
+    assert flags["active_issued_date_missing"] == 0
+    assert flags["active_geo_id_missing"] == 0
+    assert flags["active_revisions_with_findings"] == 1
+    assert flags["cleared_builder_name_missing"] == 1
+    assert flags["cleared_geo_id_missing"] == 2
+    assert flags["cleared_revisions_with_findings"] == 1
+    assert sum(
+        "FCT_ACTIVE_PERMIT_REVISION" in query
+        for query in cursor.queries
+    ) == 1
     assert "application_date IS NULL" in cursor.last_query
     assert "NOT COALESCE(application_date_conflict, FALSE)" in cursor.last_query
     assert all(
