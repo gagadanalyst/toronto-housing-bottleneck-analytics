@@ -20,6 +20,16 @@ FLAG_FIELDS = (
     "issue_to_completion_negative",
 )
 
+DATE_COVERAGE_FIELDS = (
+    "application_date_usable",
+    "application_date_no_usable",
+    "completion_date_usable",
+    "completion_date_no_usable",
+    "both_dates_available",
+    "closed_revision_count",
+    "closed_both_dates_available",
+)
+
 REQUIRED_RELATIONS = (
     "MART_ACTIVE_PERMIT_AGE",
     "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
@@ -156,14 +166,35 @@ def load_snowflake_dashboard_data(
             f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
         )
 
-        flag_expressions = ", ".join(
+        flag_expressions = [
             f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) AS {field}"
             for field in FLAG_FIELDS
-        )
+        ]
+        date_coverage_expressions = [
+            "SUM(CASE WHEN application_date IS NOT NULL THEN 1 ELSE 0 END) "
+            "AS application_date_usable",
+            "SUM(CASE WHEN application_date IS NULL "
+            "AND NOT COALESCE(application_date_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS application_date_no_usable",
+            "SUM(CASE WHEN completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+            "AS completion_date_usable",
+            "SUM(CASE WHEN completed_date IS NULL "
+            "AND NOT COALESCE(completed_date_conflict, FALSE) "
+            "THEN 1 ELSE 0 END) AS completion_date_no_usable",
+            "SUM(CASE WHEN application_date IS NOT NULL "
+            "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+            "AS both_dates_available",
+            "SUM(CASE WHEN status = 'Closed' THEN 1 ELSE 0 END) "
+            "AS closed_revision_count",
+            "SUM(CASE WHEN status = 'Closed' "
+            "AND application_date IS NOT NULL "
+            "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
+            "AS closed_both_dates_available",
+        ]
         totals_frame = _fetch_dataframe(
             cursor,
             "SELECT COUNT(*) AS cleared_revision_count, "
-            f"{flag_expressions} "
+            f"{', '.join(flag_expressions + date_coverage_expressions)} "
             f"FROM {qualified_schema}.FCT_CLEARED_PERMIT_REVISION",
         )
 
@@ -179,15 +210,16 @@ def load_snowflake_dashboard_data(
 
         totals = totals_frame.iloc[0].to_dict()
         cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
-        cleared_flag_counts = {
-            field: int(totals.get(field) or 0) for field in FLAG_FIELDS
+        cleared_quality_counts = {
+            field: int(totals.get(field) or 0)
+            for field in (*FLAG_FIELDS, *DATE_COVERAGE_FIELDS)
         }
 
         return (
             active,
             summary,
             cleared_revision_count,
-            cleared_flag_counts,
+            cleared_quality_counts,
             last_successful_refresh_utc,
         )
     finally:
