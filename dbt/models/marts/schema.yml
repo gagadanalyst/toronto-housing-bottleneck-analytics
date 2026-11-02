@@ -2,6 +2,9 @@ version: 2
 
 models:
   - name: fct_active_permit_revision
+    config:
+      contract:
+        enforced: true
     description: >-
       One row per logical Active Permits revision, keyed by permit_num,
       revision_num, and permit_type. Uses current SCD2 source rows only and
@@ -14,10 +17,13 @@ models:
       historical record of every source revision.
     columns:
       - name: permit_num
+        data_type: VARCHAR
         description: Permit number; part of the logical permit-revision key.
       - name: revision_num
+        data_type: VARCHAR
         description: Permit revision number; part of the logical permit-revision key.
       - name: permit_type
+        data_type: VARCHAR
         description: City-defined permit type; part of the logical permit-revision key.
         data_tests:
           # Catch future permit types that are missing from the dimension.
@@ -26,36 +32,52 @@ models:
                 to: ref('dim_permit_type')
                 field: permit_type
       - name: current_source_row_count
+        data_type: BIGINT
         description: Number of physical current SCD2 source rows consolidated into this logical revision.
       - name: builder_name
+        data_type: VARCHAR
         description: Builder name, published only when every current source row contains the same non-null value.
       - name: observed_builder_names
+        data_type: VARCHAR
         description: Distinct observed builder names across current rows, including a marker for missing values.
       - name: builder_name_conflict
+        data_type: BOOLEAN
         description: True when observed builder names disagree, including a mixture of missing and non-missing values.
       - name: status
+        data_type: VARCHAR
         description: Trimmed status, published only when every current source row contains the same non-null value.
       - name: observed_status_values
+        data_type: VARCHAR
         description: Distinct observed trimmed status values across current rows, including a marker for missing values.
       - name: has_status_conflict
+        data_type: BOOLEAN
         description: True when status values disagree across current source rows, including missing versus non-missing values.
       - name: application_date
+        data_type: DATE
         description: Application date, published only when every current source row contains the same non-null date.
       - name: observed_application_dates
+        data_type: VARCHAR
         description: Distinct application dates observed across current rows, including a marker for missing values.
       - name: application_date_conflict
+        data_type: BOOLEAN
         description: True when application dates disagree across current source rows, including missing versus non-missing values.
       - name: issued_date
+        data_type: DATE
         description: Issue date, published only when every current source row contains the same non-null date.
       - name: observed_issued_dates
+        data_type: VARCHAR
         description: Distinct issue dates observed across current rows, including a marker for missing values.
       - name: issued_date_conflict
+        data_type: BOOLEAN
         description: True when issue dates disagree across current source rows, including missing versus non-missing values.
       - name: geo_id
+        data_type: VARCHAR
         description: Geographic identifier, published only when every current source row contains the same non-null value.
       - name: observed_geo_ids
+        data_type: VARCHAR
         description: Distinct geographic identifiers observed across current rows, including a marker for missing values.
       - name: geo_id_conflict
+        data_type: BOOLEAN
         description: True when geographic identifiers disagree across current source rows, including missing versus non-missing values.
 
   - name: mart_active_permit_age
