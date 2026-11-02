@@ -1336,75 +1336,78 @@ def quality_page(
             st.plotly_chart(chart_layout(fig, 390), width="stretch")
         st.caption(
             "These checks can overlap: one revision may have more than one issue. "
-            "Missing or unusable dates are counted separately below."
+            "Missing or unpublished dates are counted separately below."
         )
 
-    st.subheader("Cleared date completeness")
+    st.subheader("Cleared date fields")
     st.caption(
         "Counts cover all current logical Cleared revisions, across every status. "
-        "A date is usable only when current source rows agree on one non-null, "
-        "parseable value. Conflicts are kept separate from dates with no usable value."
+        "A date is populated when current source rows agree on one non-null, "
+        "parseable value. Conflicting values are counted separately. A populated "
+        "completion date is source information; it does not by itself mean the "
+        "permit was successfully completed."
     )
-    app_usable = cleared_quality_counts.get("application_date_usable", 0)
-    app_no_usable = cleared_quality_counts.get("application_date_no_usable", 0)
+    app_populated = cleared_quality_counts.get("application_date_usable", 0)
+    app_no_populated = cleared_quality_counts.get("application_date_no_usable", 0)
     app_conflicts = cleared_quality_counts.get("application_date_conflict", 0)
-    completion_usable = cleared_quality_counts.get("completion_date_usable", 0)
-    completion_no_usable = cleared_quality_counts.get("completion_date_no_usable", 0)
+    completion_populated = cleared_quality_counts.get("completion_date_usable", 0)
+    completion_no_populated = cleared_quality_counts.get("completion_date_no_usable", 0)
     completion_conflicts = cleared_quality_counts.get("completed_date_conflict", 0)
-    both_dates_available = cleared_quality_counts.get("both_dates_available", 0)
+    both_dates_populated = cleared_quality_counts.get("both_dates_available", 0)
     closed_count = cleared_quality_counts.get("closed_revision_count", 0)
     closed_both_dates = cleared_quality_counts.get("closed_both_dates_available", 0)
+    not_closed_both_dates = max(both_dates_populated - closed_both_dates, 0)
 
     coverage_cols = st.columns(4)
     with coverage_cols[0]:
         metric_card(
-            "Application dates usable",
-            fmt_int(app_usable),
-            f"{app_usable / cleared_revision_count:.1%} of Cleared records"
+            "Application date populated",
+            fmt_int(app_populated),
+            f"{app_populated / cleared_revision_count:.1%} of Cleared records"
             if cleared_revision_count
             else "No Cleared records",
         )
     with coverage_cols[1]:
         metric_card(
-            "Completion dates usable",
-            fmt_int(completion_usable),
-            f"{completion_usable / cleared_revision_count:.1%} of Cleared records"
+            "Completion date populated",
+            fmt_int(completion_populated),
+            f"{completion_populated / cleared_revision_count:.1%} of Cleared records"
             if cleared_revision_count
             else "No Cleared records",
         )
     with coverage_cols[2]:
         metric_card(
-            "Both dates available",
-            fmt_int(both_dates_available),
-            "Across all Cleared statuses",
-        )
-    with coverage_cols[3]:
-        metric_card(
             "Closed records with both dates",
             fmt_int(closed_both_dates),
             f"Of {closed_count:,} records marked Closed",
+        )
+    with coverage_cols[3]:
+        metric_card(
+            "Non-Closed records with both dates",
+            fmt_int(not_closed_both_dates),
+            "Not included in lifecycle summaries",
         )
 
     coverage_table = pd.DataFrame(
         [
             {
                 "Date field": "Application date",
-                "Usable": app_usable,
-                "No usable value": app_no_usable,
+                "Date populated": app_populated,
+                "No populated value": app_no_populated,
                 "Conflicting source values": app_conflicts,
             },
             {
                 "Date field": "Completion date",
-                "Usable": completion_usable,
-                "No usable value": completion_no_usable,
+                "Date populated": completion_populated,
+                "No populated value": completion_no_populated,
                 "Conflicting source values": completion_conflicts,
             },
         ]
     )
     st.dataframe(coverage_table, width="stretch", hide_index=True)
-    app_coverage_total = app_usable + app_no_usable + app_conflicts
+    app_coverage_total = app_populated + app_no_populated + app_conflicts
     completion_coverage_total = (
-        completion_usable + completion_no_usable + completion_conflicts
+        completion_populated + completion_no_populated + completion_conflicts
     )
     if (
         app_coverage_total != cleared_revision_count
@@ -1415,9 +1418,12 @@ def quality_page(
             "revision count. Review the fact-level date and conflict flags."
         )
     st.caption(
-        "‘No usable value’ includes missing or unparseable source values where "
-        "there is no row-to-row conflict. The Closed records with both dates "
-        "should reconcile with the Application-to-completion date-pair total below."
+        "‘No populated value’ includes missing or unparseable source values where "
+        "there is no row-to-row conflict. A non-Closed record can still have a "
+        "populated COMPLETED_DATE; we retain that source value but do not interpret "
+        "it as successful completion. Only records marked Closed are used in the "
+        "lifecycle summary. The Closed records with both dates should reconcile "
+        "with the Application-to-completion date-pair total below."
     )
 
     summary_pairs = int(
