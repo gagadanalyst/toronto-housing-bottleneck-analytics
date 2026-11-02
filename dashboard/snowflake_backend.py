@@ -1,4 +1,4 @@
-"""Read the dashboard-facing dbt marts from Snowflake."""
+"""Read the four dashboard-facing dbt relations using a dedicated read-only role."""
 
 from __future__ import annotations
 
@@ -87,7 +87,7 @@ def _fetch_dataframe(cursor: Any, query: str) -> pd.DataFrame:
 def load_snowflake_dashboard_data(
     config: Mapping[str, Any],
 ) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int], Any | None]:
-    """Read the three dashboard relations using a dedicated read-only role.
+    """Read the four dashboard relations using a dedicated read-only role.
 
     Expected configuration keys:
       account, user, private_key

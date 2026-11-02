@@ -6,7 +6,9 @@ This directory contains the dbt analytics layer for Toronto Housing Bottleneck A
 
 The dbt project transforms the raw Active and Cleared Permits tables published by the ingestion workflow into documented, tested analytical models.
 
-The project uses dbt v2, DuckDB, SQL, and the `dbt-labs/dbt_utils` package.
+The project uses dbt v2, SQL, and the `dbt-labs/dbt_utils` package. The same dbt project supports DuckDB and Snowflake targets.
+
+The setup below uses the local DuckDB `dev` target. The tracked `profiles.yml.example` also includes a `snowflake` output; see the [Snowflake operations guide](../infra/snowflake/README.md) for credentials and automated refresh details.
 
 ## Architecture
 
@@ -250,15 +252,17 @@ dbt docs generate
 
 Model and column descriptions are maintained in the properties YAML files under `models/`. Generate the documentation after the relevant model contracts and descriptions have been reviewed.
 
-## Most recent local validation
+## Recorded local validation
 
-On October 17, 2026, the project was built successfully using dbt v2.0.5, `dbt_utils` 1.4.1, and a separate DuckDB development database.
+On October 17, 2026, the project was built successfully using dbt v2.0.5, `dbt_utils` 1.4.1, and a separate DuckDB development database. This is a dated local result, not the latest automated validation.
 
 The observed result was:
 
 - 8 models processed.
 - 40 tests processed.
 - 48 total resources successful.
+The latest automated Snowflake serving build, on November 2, 2026, passed all 52 dbt resources and verified the dashboard-facing relations ([workflow run #38](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41397052684)).
+
 
 These results describe that particular local run and warehouse snapshot. CI validation and future source refreshes must be checked independently.
 

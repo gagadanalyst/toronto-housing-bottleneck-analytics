@@ -1,6 +1,6 @@
 # Toronto Housing Bottleneck Analytics — Snowflake + DuckDB
 
-An end-to-end Analytics Engineering project using City of Toronto building-permit data, with **DuckDB as the default warehouse backend and Snowflake as an optional second backend**. A single Python + dlt ingestion pipeline validates source snapshots, and one shared dbt project builds analytical models for both backends; the deployed Streamlit dashboard can read from either warehouse.
+An end-to-end Analytics Engineering project using City of Toronto building-permit data, with **Snowflake and DuckDB as supported warehouse backends**. A single Python + dlt ingestion pipeline validates source snapshots, and one shared dbt project builds analytical models for both; the Streamlit dashboard selects its data source through an explicit backend setting.
 
 **[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
@@ -12,7 +12,7 @@ An end-to-end Analytics Engineering project using City of Toronto building-permi
 | Warehouse history | SCD Type 2 tracking for source changes observed between ingestion runs. |
 | Analytics engineering | One dbt project for DuckDB and Snowflake, with staging models, revision-level facts, dimensions, marts, contracts, tests, and documentation. |
 | Reliability | Regression tests, freshness and completeness checks, a verified rolling-release publication with recovery safeguards, and separate CI/CD workflows. |
-| Data product | A deployed Streamlit dashboard with explicit backend selection and read-only Snowflake access. |
+| Data product | A deployed Streamlit dashboard with explicit DuckDB/Snowflake backend selection and Active/Cleared data-quality reporting. |
 
 The analysis is descriptive, not causal. It examines observed active-permit ages and dates recorded for permits marked `Closed`; it does not claim to explain why a permit took a given amount of time.
 
@@ -87,7 +87,7 @@ The dimensions are separately modeled and tested; the serving marts are purpose-
 
 ## Data-quality snapshot
 
-These source and model counts describe the published DuckDB warehouse observed on **October 18, 2026**. They are a dated illustration of the checks, not expected permanent totals.
+These source and model counts describe the published DuckDB warehouse observed on **October 18, 2026**. They are a historical illustration of the checks, not current dashboard totals or expected permanent counts. The live dashboard calculates its KPIs from whichever backend is selected at runtime.
 
 | Check | Observed value | Meaning |
 |---|---:|---|
@@ -107,6 +107,7 @@ The following results are tied to specific workflow runs and inputs; they are no
 
 | Validation | Evidence |
 |---|---|
+| Latest automated refresh (November 2, 2026) | On commit [`bf27af2`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/bf27af2cfc8e99936777a0332b752981da4de81a), [CI #124](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396261400), [CD #92](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396374837), [Snowflake RAW #37](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396850955), and [Snowflake serving #38](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41397052684) succeeded. The serving build passed 52/52 dbt resources and verified 98,591 current logical Active revisions, 189,857 current logical Cleared revisions, and 300 lifecycle-summary groups (288,448 logical revisions combined). These are counts from that refresh, not permanent expected totals. |
 | Fresh-baseline SCD2 behaviour | The [successful Snapshot Baseline and Replay run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40491637116), added in [PR #76](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/pull/76), verified that an unchanged replay added no versions and a controlled `STATUS` change created the expected version. |
 | DuckDB/Snowflake parity | [Run 40482009588](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40482009588), using `as_of_date=2026-10-27`: compared dimensions, facts, and marts had zero row-value mismatches, and dashboard summary metrics matched. Staging was compared on schema, grain/count, and semantic types rather than row by row. |
 | Automatic refresh chain | On commit [`e8bb994`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/e8bb994c8ec664d2da7d12d1c296a1b15da3dc49), [CI](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622105661), [CD/publication](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622186735), [canonical RAW refresh](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622867433), and [serving build](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40623059248) all succeeded on **October 27, 2026, Toronto time**. RAW and serving runs triggered automatically in sequence. |
@@ -116,7 +117,7 @@ For the parity run, `MART_ACTIVE_PERMIT_AGE` had 98,869 rows (98,798 eligible an
 
 ## Automation, publication, and operating controls
 
-The architecture diagram above describes the data path; this separate view shows the automated GitHub Actions path from validation through DuckDB publication to the optional Snowflake refresh. Separate manually dispatched baseline/replay, Snowflake dbt validation, and smoke workflows, plus gated pull-request parity, are described below but not drawn here.
+The architecture diagram above describes the data path; this separate view shows the automated GitHub Actions path from validation through DuckDB publication to the separately gated Snowflake refresh. Separate manually dispatched baseline/replay, Snowflake dbt validation, and smoke workflows, plus gated pull-request parity, are described below but not drawn here.
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"primaryColor":"#EAF8FD","primaryTextColor":"#28343E","primaryBorderColor":"#21B6E8","lineColor":"#21B6E8","secondaryColor":"#E9EEF3","tertiaryColor":"#FFFFFF","fontFamily":"Arial, sans-serif"}}}%%
@@ -153,12 +154,14 @@ If a real credential is detected, treat it as exposed and rotate/revoke it; dele
 
 ## Live dashboard
 
-**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. As verified on October 28, 2026, the public deployment is currently configured to query the published DuckDB release; a local run also defaults to DuckDB if `DASHBOARD_BACKEND` is omitted. The optional Snowflake backend remains available by explicitly setting `DASHBOARD_BACKEND` to `snowflake` and configuring its read-only credentials. Both paths query analytics relations rather than calling Toronto CKAN directly. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successfully published DuckDB artifact or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections:
+**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. The dashboard supports both DuckDB and Snowflake; `DASHBOARD_BACKEND` selects the source (`duckdb` or `snowflake`). If neither the environment variable nor the Streamlit secret is set, the app defaults to DuckDB. Both paths query the same dbt analytical relations rather than calling Toronto CKAN directly. Connection or query errors are shown rather than silently switching backends. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successful DuckDB publication or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections:
 
-- **Overview** — high-level active-age and closed-permit lifecycle summaries.
+- **The story** — project context and high-level summaries of the permit data.
 - **Active permits** — age distributions and comparisons by permit type, including record-level detail.
-- **Permits marked Closed** — lifecycle date-pair comparisons by application year and permit type.
-- **Data & definitions** — eligibility, exclusions, data-quality checks, metric definitions, and caveats.
+- **Closed-permit timelines** — lifecycle date-pair comparisons by application year and permit type for records marked `Closed`.
+- **Data quality & definitions** — logical-revision findings, overlapping check counts, Active age eligibility and exclusions, Cleared date completeness, metric definitions, and caveats.
+
+The “revisions with findings” KPIs count each logical revision once; per-check counts can overlap and should not be added. Active age exclusions are reported separately from data-quality findings. Cleared checks cover all current statuses, and date completeness separates conflicting values from missing or unusable values. A populated completion date is a source value, not confirmation that a permit is marked `Closed`.
 
 The dashboard distinguishes within-group summary statistics from statistics across individual revisions; a median of group medians is not presented as the median of all permits.
 

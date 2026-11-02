@@ -1,8 +1,8 @@
 # Snowflake operations guide
 
-This guide covers the optional Snowflake backend for Toronto Housing Bottleneck Analytics: initial account setup, roles and cost safeguards, automated refreshes, dashboard access, and the procedure for returning to DuckDB.
+This guide covers the Snowflake warehouse backend for Toronto Housing Bottleneck Analytics: account setup, roles and cost safeguards, automated refreshes, dashboard access, and the procedure for disabling Snowflake operations.
 
-DuckDB remains independently usable and is the routine CI/CD publication path. Snowflake is a second backend, not a replacement that the rest of the project depends on.
+DuckDB remains the routine CI/CD publication path. Snowflake RAW and serving refreshes are separately gated and do not block DuckDB publication; the dashboard can read from either backend.
 
 ## Configuration at a glance
 
@@ -113,17 +113,18 @@ The Snowflake serving workflow checks source freshness before building the marts
 
 ## Configure the Streamlit Snowflake reader
 
-As verified on October 28, 2026, the public deployment selects DuckDB while Snowflake operations are disabled. A local app also uses DuckDB by default when `DASHBOARD_BACKEND` is omitted. The application explicitly reports connection or query errors instead of silently switching to another backend. To deliberately resume Snowflake later, first verify account/trial status and cost safeguards, set `SNOWFLAKE_OPERATIONS_ENABLED=true`, and configure the public app's `DASHBOARD_BACKEND` and read-only secrets separately.
+`DASHBOARD_BACKEND` selects the dashboard's data source independently of the Snowflake workflow gate. The app defaults to DuckDB when neither the environment variable nor the Streamlit secret is set; an environment value takes precedence over the secret. Set it to `snowflake` only after configuring the dashboard's read-only role and credentials. Connection or query errors are shown rather than silently switching backends.
 
 ### 1. Grant read-only access
 
-Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the three dbt serving relations and `DASHBOARD_REFRESH_METADATA` exist in `TORONTO.ANALYTICS`.
+Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the four dashboard-facing dbt relations and `DASHBOARD_REFRESH_METADATA` exist in `TORONTO.ANALYTICS`.
 
 `TORONTO_DASHBOARD_ROLE` should have:
 
 - `USAGE` on database `TORONTO`, schema `TORONTO.ANALYTICS`, and warehouse `TORONTO_XS_WH`.
 - `SELECT` only on these dashboard-facing relations:
   - `TORONTO.ANALYTICS.MART_ACTIVE_PERMIT_AGE`
+  - `TORONTO.ANALYTICS.FCT_ACTIVE_PERMIT_REVISION`
   - `TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE`
   - `TORONTO.ANALYTICS.FCT_CLEARED_PERMIT_REVISION`
   - `TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA` (refresh timestamp only)
@@ -163,7 +164,7 @@ schema = "ANALYTICS"
 
 ### 4. Verify dashboard access
 
-After changing credentials, roles, or serving relations, verify access to all three data relations and, when present, `DASHBOARD_REFRESH_METADATA` in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
+After changing credentials, roles, or serving relations, verify access to all four dashboard-facing relations and `DASHBOARD_REFRESH_METADATA` in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
 
 The reader checks that required relations exist, reads dashboard-facing data, and closes the connection after the read. Missing relations, denied permissions, or connection errors are shown to the user; no silent fallback to DuckDB takes place.
 
@@ -182,3 +183,5 @@ A fresh `TORONTO.RAW` baseline was loaded from a complete, validated Active/Clea
 The same-snapshot [DuckDB/Snowflake parity run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40482009588), using `as_of_date=2026-10-27`, reported zero row-value mismatches for compared dimensions, facts, and marts, and matching dashboard summary metrics. Staging comparisons covered schema, grain/count, and semantics rather than full row-by-row values.
 
 After PR #82, the full automatic chain succeeded on commit [`e8bb994`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/e8bb994c8ec664d2da7d12d1c296a1b15da3dc49) on **October 27, 2026, Toronto time**: [CI](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622105661), [CD/publication](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622186735), [automatic RAW refresh](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622867433), and [automatic serving build](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40623059248). These runs verify workflow chaining, not parity between old DuckDB SCD2 history and the intentionally fresh Snowflake baseline.
+
+The latest automated chain succeeded on **November 2, 2026**: [CD #92](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396374837), [canonical RAW refresh #37](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396850955), and [serving build #38](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41397052684) completed successfully on commit `bf27af2`. The serving build passed 52/52 dbt resources and verified all four dashboard relations were non-empty. This records that run's result; it does not establish the setting's state after that date.

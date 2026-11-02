@@ -39,16 +39,18 @@ The end-to-end setup test performs a live probe, a full Active Permits extractio
 RUN_LIVE_TESTS=1 python -m pytest tests/test_local_setup.py -q
 ```
 
-## Dashboard theme and refresh metadata regression coverage
+## Dashboard regression coverage
 
-The theme CSS token checks, pure timestamp formatter, and optional Snowflake metadata read have targeted tests. Run them with:
+Backend selection, theme configuration, refresh timestamp formatting, and the Snowflake reader have targeted tests. Run them with:
 
 ```bash
-python -m pytest -q tests/test_dashboard_theme_css.py tests/test_dashboard_refresh_metadata.py tests/test_dashboard_snowflake_backend.py
+python -m pytest -q tests/test_dashboard_backend_config.py tests/test_dashboard_theme_css.py tests/test_dashboard_refresh_metadata.py tests/test_dashboard_snowflake_backend.py
 ```
 
-When reviewing a UI change, also manually switch the published dashboard between Light and Dark and verify that page labels, slider labels, metric cards, inputs, and select/multiselect text remain readable in both modes.
+The dashboard uses a single Light theme. For UI changes, verify contrast in the sidebar, page labels, sliders, metric cards, inputs, and select/multiselect controls.
 
 ## Key SCD2 regression coverage
 
 `tests/integration/test_dlt_scd2_row_hash.py` verifies that changing only the upstream `_id` does not create an extra SCD2 version, while changing a tracked attribute does. It uses synthetic Parquet snapshots and a temporary DuckDB database, so it does not require a captured Toronto snapshot.
+
+`tests/integration/test_dlt_scd2_missing_row_v2.py` verifies that a row absent from a later full snapshot is retired from current SCD2 state. It uses synthetic Parquet snapshots and a temporary DuckDB database.
