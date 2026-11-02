@@ -1,6 +1,6 @@
 -- Toronto Housing Bottleneck Analytics: read-only dashboard access.
 -- Run deliberately in Snowsight as ACCOUNTADMIN.
--- Execute after the three dashboard data relations and refresh metadata exist in TORONTO.ANALYTICS.
+-- Execute after the four dashboard data relations and refresh metadata exist in TORONTO.ANALYTICS.
 -- This creates the role and grants only; it does not create a user or load data.
 
 USE ROLE ACCOUNTADMIN;
@@ -18,6 +18,9 @@ GRANT USAGE ON SCHEMA TORONTO.ANALYTICS
   TO ROLE TORONTO_DASHBOARD_ROLE;
 
 GRANT SELECT ON TABLE TORONTO.ANALYTICS.MART_ACTIVE_PERMIT_AGE
+  TO ROLE TORONTO_DASHBOARD_ROLE;
+
+GRANT SELECT ON TABLE TORONTO.ANALYTICS.FCT_ACTIVE_PERMIT_REVISION
   TO ROLE TORONTO_DASHBOARD_ROLE;
 
 GRANT SELECT ON TABLE TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE

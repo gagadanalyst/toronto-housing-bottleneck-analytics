@@ -323,6 +323,7 @@ jobs:
           try:
               tables = (
                   "MART_ACTIVE_PERMIT_AGE",
+                  "FCT_ACTIVE_PERMIT_REVISION",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
                   "FCT_CLEARED_PERMIT_REVISION",
                   "DASHBOARD_REFRESH_METADATA",
@@ -357,6 +358,7 @@ jobs:
           try:
               required = (
                   "MART_ACTIVE_PERMIT_AGE",
+                  "FCT_ACTIVE_PERMIT_REVISION",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
                   "FCT_CLEARED_PERMIT_REVISION",
               )
