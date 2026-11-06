@@ -181,6 +181,7 @@ def test_scd2_quarantines_conflict_and_preserves_history(tmp_path) -> None:
     }
 
     with duckdb.connect(str(database), read_only=True) as connection:
+
         def history(permit_num):
             return connection.execute(
                 """

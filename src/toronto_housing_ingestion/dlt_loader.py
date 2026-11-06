@@ -251,9 +251,7 @@ def _validate_scd2_snapshot(
         if key in conflicting_keys:
             quarantined_row_count += 1
         elif previous[0] != row_hash:
-            conflicts.append(
-                (key, previous[1], previous[0], source_id, row_hash)
-            )
+            conflicts.append((key, previous[1], previous[0], source_id, row_hash))
             conflicting_keys.add(key)
             quarantined_row_count += row_count
 
@@ -401,9 +399,7 @@ def load_scd2(
 
         quarantined_details = tuple(
             {
-                "business_key": dict(
-                    zip(source.primary_key, key, strict=True)
-                ),
+                "business_key": dict(zip(source.primary_key, key, strict=True)),
                 "source_ids": [first_id, second_id],
                 "row_hash_prefixes": [
                     first_hash[:12],
