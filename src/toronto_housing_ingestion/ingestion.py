@@ -451,6 +451,22 @@ def ingest_source(
             "duration_seconds": round(time.monotonic() - started_monotonic, 3),
         }
     )
+
+    if result.quarantined_business_keys:
+        manifest["scd2_quarantine"] = {
+            "reason": "conflicting_scd2_tracked_values",
+            "business_key_count": len(result.quarantined_business_keys),
+            "source_row_count": result.quarantined_row_count,
+            "business_keys": list(result.quarantined_business_keys),
+        }
+        utils.log_event(
+            logging.WARNING,
+            "scd2_keys_quarantined",
+            source_name=source.name,
+            business_key_count=len(result.quarantined_business_keys),
+            source_row_count=result.quarantined_row_count,
+        )
+
     _write_manifest(manifest_path, manifest)
     return manifest
 
