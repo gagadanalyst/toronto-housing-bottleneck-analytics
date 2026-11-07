@@ -439,10 +439,20 @@ def main() -> None:
         raise ValueError(
             "TORONTO_DBT_TARGET_SCHEMA must name this run's isolated parity schema."
         )
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    for label, value in (
+        ("GitHub workflow run ID", workflow_run_id),
+        ("GitHub workflow attempt", attempt),
+    ):
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError(f"{label} must contain digits only.")
+
     source_schema = os.environ.get("TORONTO_DBT_SOURCE_SCHEMA", "")
-    if source_schema != f"SNOWFLAKE_BASELINE_{run_id}":
+    expected_source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
+    if source_schema != expected_source_schema:
         raise ValueError(
-            "TORONTO_DBT_SOURCE_SCHEMA must match the selected snapshot run."
+            f"TORONTO_DBT_SOURCE_SCHEMA must equal {expected_source_schema}."
         )
     database_path = os.environ["DBT_DUCKDB_PATH"]
     connection_uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")

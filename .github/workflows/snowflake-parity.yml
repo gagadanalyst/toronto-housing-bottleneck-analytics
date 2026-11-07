@@ -40,9 +40,10 @@ jobs:
     timeout-minutes: 45
     env:
       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      # The default is a one-time parity audit against the current validated
-      # baseline during this PR. Manual runs must supply their own CD run ID.
+      # Use one validated source snapshot to build fresh DuckDB and Snowflake
+      # raw baselines with the same PR code. Manual runs may select another CD run.
       SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id || '40470002594' }}
+      TORONTO_DBT_SOURCE_SCHEMA: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id || '40470002594' }}_${{ github.run_id }}_${{ github.run_attempt }}
       TORONTO_WAREHOUSE_KIND: duckdb
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ github.workspace }}/data/warehouse/parity/toronto.duckdb
       TORONTO_WAREHOUSE_DATASET: raw
@@ -161,6 +162,15 @@ jobs:
                   env.write(f"{key}={value}\n")
           PY
 
+      - name: Build a fresh Snowflake baseline from the same snapshot and PR loader
+        env:
+          TORONTO_WAREHOUSE_KIND: snowflake
+          TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+          TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id || '40470002594' }}_${{ github.run_id }}_${{ github.run_attempt }}
+          SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
+          RUNTIME__DLTHUB_TELEMETRY: "false"
+        run: python scripts/snowflake_snapshot_baseline.py
+
       - name: Prepare isolated Snowflake parity target and grant dbt access
         run: |
           python - <<'PY'
@@ -179,7 +189,7 @@ jobs:
           if not re.fullmatch(r"[0-9]+", attempt):
               raise ValueError("GitHub workflow attempt must contain digits only.")
 
-          source_schema = f"SNOWFLAKE_BASELINE_{run_id}"
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
           target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
 
           values = {
@@ -264,7 +274,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Clean up isolated Snowflake parity target
+      - name: Clean up isolated Snowflake parity schemas
         if: ${{ always() }}
         run: |
           python - <<'PY'
@@ -272,12 +282,21 @@ jobs:
           import re
 
           target_schema = os.environ.get("TORONTO_DBT_TARGET_SCHEMA")
-          if not target_schema:
-              print("No parity target schema was registered; skipping cleanup.")
-              raise SystemExit(0)
+          source_schema = os.environ.get("TORONTO_DBT_SOURCE_SCHEMA")
 
-          if not re.fullmatch(r"ANALYTICS_PARITY_[0-9]+_[0-9]+", target_schema):
+          if target_schema and not re.fullmatch(
+              r"ANALYTICS_PARITY_[0-9]+_[0-9]+", target_schema
+          ):
               raise ValueError("Unexpected Snowflake parity target schema.")
+
+          if source_schema and not re.fullmatch(
+              r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+_[0-9]+", source_schema
+          ):
+              raise ValueError("Unexpected Snowflake parity source schema.")
+
+          if not target_schema and not source_schema:
+              print("No isolated parity schemas were registered; skipping cleanup.")
+              raise SystemExit(0)
 
           import snowflake.connector
 
@@ -291,7 +310,12 @@ jobs:
           )
           cursor = connection.cursor()
           try:
-              cursor.execute(f"DROP SCHEMA IF EXISTS TORONTO.{target_schema}")
+              for schema in (target_schema, source_schema):
+                  if schema:
+                      cursor.execute(
+                          f'DROP SCHEMA IF EXISTS TORONTO."{schema}" CASCADE'
+                      )
+                      print(f"Removed isolated schema TORONTO.{schema}")
           finally:
               cursor.close()
               connection.close()
