@@ -5,6 +5,7 @@ import pyarrow as pa
 from pyarrow import parquet as pq
 
 from toronto_housing_ingestion.dlt_loader import (
+    _destination_scope_excluding_keys,
     _iter_scd2_snapshot_rows,
     _record_in_warehouse_window,
     _resolve_scd2_key_columns,
@@ -12,6 +13,19 @@ from toronto_housing_ingestion.dlt_loader import (
     _validate_scd2_snapshot,
     load_scd2,
 )
+
+
+def test_destination_scope_preserves_resolved_column_names() -> None:
+    scope = _destination_scope_excluding_keys(
+        ("PERMIT_NUM", "REVISION_NUM", "PERMIT_TYPE"),
+        {("26 184407 BLD", "00", "New Houses")},
+    )
+
+    assert scope is not None
+    assert '"PERMIT_NUM"' in scope
+    assert '"REVISION_NUM"' in scope
+    assert '"PERMIT_TYPE"' in scope
+    assert '"permit_num"' not in scope
 
 
 def test_warehouse_date_filter_keeps_2020_and_later() -> None:

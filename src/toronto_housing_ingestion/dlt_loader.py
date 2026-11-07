@@ -289,7 +289,7 @@ def _destination_scope_excluding_keys(
     ):
         conditions = []
         for column, value in zip(key_columns, key, strict=True):
-            identifier = _identifier(column.lower(), "SCD2 key column")
+            identifier = _identifier(column, "SCD2 key column")
             if isinstance(value, bool):
                 literal = "TRUE" if value else "FALSE"
             elif isinstance(value, (int, float)):
@@ -413,7 +413,7 @@ def load_scd2(
             for key, first_id, first_hash, second_id, second_hash in conflicts
         )
         destination_scope = _destination_scope_excluding_keys(
-            source.primary_key,
+            key_columns,
             quarantined_key_values,
         )
 
