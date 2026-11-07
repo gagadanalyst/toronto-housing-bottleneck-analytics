@@ -345,6 +345,7 @@ def load_scd2(
     destination_kind: str,
     preserve_row_hash: bool = False,
     pipeline_name: str | None = None,
+    boundary_timestamp: str | None = None,
 ) -> LoadResult:
     """Load a full Parquet snapshot using ``source.warehouse_strategy``.
 
@@ -356,6 +357,9 @@ def load_scd2(
     ``preserve_row_hash`` is an opt-in for controlled continuity fixtures that
     carry stored hashes from the migrated warehouse. Normal ingestion leaves it
     disabled and computes hashes from source snapshot attributes as before.
+
+    ``boundary_timestamp`` optionally sets the historical SCD2 validity boundary
+    for controlled snapshot replay. Pass an ISO-8601 timestamp with timezone.
 
     If the source config has ``warehouse_since`` and ``warehouse_date_column``,
     only rows on or after that date are sent to the warehouse.
@@ -441,6 +445,8 @@ def load_scd2(
             "strategy": "scd2",
             "row_version_column_name": "row_hash",
         }
+        if boundary_timestamp is not None:
+            write_disposition["boundary_timestamp"] = boundary_timestamp
         if destination_scope:
             write_disposition["destination_scope"] = destination_scope
 
