@@ -11,8 +11,10 @@ models:
     columns:
       - name: source_uniq_id
         description: >-
-          City Open Data row identifier preserved from _id.
-          It may recur across different SCD2 versions in staging.
+          Snapshot-level City Open Data row identifier preserved from _id.
+          It is not a persistent permit identifier and may be reassigned
+          to a different permit across successive source snapshots.
+          Do not use it as a business key or cross-snapshot join key.
       - name: permit_num
         description: Last two digits of calendar year, plus IBMS-generated sequence
       - name: revision_num
