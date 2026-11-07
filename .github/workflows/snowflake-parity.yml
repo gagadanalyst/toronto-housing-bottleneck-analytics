@@ -13,6 +13,7 @@ on:
       - ".github/workflows/snowflake-parity.yml"
       - "scripts/prepare_duckdb_parity_baseline.py"
       - "scripts/compare_duckdb_snowflake_parity.py"
+      - "scripts/snowflake_snapshot_baseline.py"
       - "dbt/**"
       - "pyproject.toml"
       - "open_data_config.yml"
@@ -23,7 +24,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: toronto-snowflake-parity-${{ inputs.snapshot_run_id }}
+  group: toronto-snowflake-parity-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -161,6 +162,32 @@ jobs:
                   env.write(f"{key}={value}\n")
           PY
 
+      - name: Register isolated Snowflake source schema for cleanup
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
+          workflow_run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+
+          for label, value in (
+              ("snapshot run ID", run_id),
+              ("workflow run ID", workflow_run_id),
+              ("workflow attempt", attempt),
+          ):
+              if not re.fullmatch(r"[0-9]+", value):
+                  raise ValueError(f"{label} must contain digits only.")
+
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"TORONTO_DBT_SOURCE_SCHEMA={source_schema}\n")
+
+          print(f"Registered cleanup schema: {source_schema}")
+          PY
+
       - name: Build a fresh Snowflake baseline from the same snapshot and PR loader
         env:
           TORONTO_WAREHOUSE_KIND: snowflake
@@ -190,9 +217,10 @@ jobs:
 
           source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
           target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
+          if os.environ.get("TORONTO_DBT_SOURCE_SCHEMA") != source_schema:
+              raise ValueError("Registered Snowflake source schema does not match run IDs.")
 
           values = {
-              "TORONTO_DBT_SOURCE_SCHEMA": source_schema,
               "TORONTO_DBT_TARGET_SCHEMA": target_schema,
           }
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
@@ -295,6 +323,22 @@ jobs:
 
           if not target_schema and not source_schema:
               print("No isolated parity schemas were registered; skipping cleanup.")
+              raise SystemExit(0)
+          required_connection_settings = (
+              "SNOWFLAKE_ACCOUNT",
+              "SNOWFLAKE_USER",
+              "SNOWFLAKE_PRIVATE_KEY_PATH",
+          )
+          missing = [
+              name for name in required_connection_settings
+              if not os.environ.get(name)
+          ]
+          if missing:
+              print(
+                  "Snowflake connection was not initialized; "
+                  "no parity schemas could have been created. "
+                  f"Skipping cleanup (missing: {missing})."
+              )
               raise SystemExit(0)
 
           import snowflake.connector

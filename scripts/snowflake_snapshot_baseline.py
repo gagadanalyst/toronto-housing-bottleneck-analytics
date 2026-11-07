@@ -399,7 +399,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="toronto-snowflake-baseline-") as temp:
         bundle = _validate_and_extract(bundle_path, Path(temp), sources)
         probe = dlt.pipeline(
-            pipeline_name=f"toronto_baseline_probe_{dataset.lower()}",
+            pipeline_name=f"toronto_baseline_probe_{workflow_run_id}_{attempt}",
             destination=dlt.destinations.snowflake(
                 credentials=app.warehouse_credentials, use_timestamp_tz=False
             ),
@@ -417,6 +417,7 @@ def main() -> None:
                 source=source,
                 dataset_name=dataset,
                 destination_kind="snowflake",
+                pipeline_name=f"toronto_{name}_baseline_{workflow_run_id}_{attempt}",
             )
             counts = _count_rows(probe, source.warehouse_table)
             if counts[0] < 1 or counts[1] < 1 or counts[0] != counts[1] + counts[2]:
@@ -438,6 +439,7 @@ def main() -> None:
                 source=source,
                 dataset_name=dataset,
                 destination_kind="snowflake",
+                pipeline_name=f"toronto_{name}_baseline_{workflow_run_id}_{attempt}",
             )
             after = _count_rows(probe, source.warehouse_table)
             if after != baseline_counts[name]:
