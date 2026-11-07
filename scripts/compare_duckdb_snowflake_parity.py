@@ -12,7 +12,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import duckdb
-import snowflake.connector
 
 MODELS = (
     "dim_date",
@@ -470,6 +469,8 @@ def main() -> None:
     parts = urlsplit(connection_uri)
     if parts.scheme != "snowflake" or not parts.hostname:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION is not a valid Snowflake URI.")
+    import snowflake.connector
+
     snowflake_connection = snowflake.connector.connect(
         account=os.environ["SNOWFLAKE_ACCOUNT"],
         user=os.environ["SNOWFLAKE_USER"],
