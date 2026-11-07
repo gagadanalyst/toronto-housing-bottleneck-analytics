@@ -43,7 +43,6 @@ jobs:
       # Use one validated source snapshot to build fresh DuckDB and Snowflake
       # raw baselines with the same PR code. Manual runs may select another CD run.
       SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id || '40470002594' }}
-      TORONTO_DBT_SOURCE_SCHEMA: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id || '40470002594' }}_${{ github.run_id }}_${{ github.run_attempt }}
       TORONTO_WAREHOUSE_KIND: duckdb
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ github.workspace }}/data/warehouse/parity/toronto.duckdb
       TORONTO_WAREHOUSE_DATASET: raw
