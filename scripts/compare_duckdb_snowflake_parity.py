@@ -199,52 +199,130 @@ def _compare_row_values(
     keys: tuple[str, ...],
 ) -> dict:
     select_list = ", ".join(_quote_duck_column(column) for column in columns)
-    order_by = ", ".join(_quote_duck_column(key) for key in keys)
-    # dbt-created Snowflake identifiers are unquoted uppercase names. DuckDB
-    # preserves lowercase model column names, so use unquoted identifiers for
-    # the Snowflake projection and ordering (Snowflake resolves them uppercase).
+    duck_order_by = ", ".join(
+        f"{_quote_duck_column(key)} ASC NULLS LAST" for key in keys
+    )
+
+    # dbt-created Snowflake identifiers are unquoted uppercase names.
     snowflake_select_list = ", ".join(columns)
-    snowflake_order_by = ", ".join(keys)
+    snowflake_order_by = ", ".join(f"{key} ASC NULLS LAST" for key in keys)
+
     duck_cursor = duck_connection.execute(
-        f'SELECT {select_list} FROM analytics."{table}" ORDER BY {order_by}'
+        f'SELECT {select_list} FROM analytics."{table}" ORDER BY {duck_order_by}'
     )
     snowflake_cursor.execute(
         f'SELECT {snowflake_select_list} FROM TORONTO."{schema}"."{table.upper()}" '
         f"ORDER BY {snowflake_order_by}"
     )
+
     key_positions = [columns.index(key) for key in keys]
+    key_names = set(keys)
+
+    def key_sort_value(value: Any) -> tuple[int, Any]:
+        if value is None:
+            return (9, "")
+        if isinstance(value, bool):
+            return (1, int(value))
+        if isinstance(value, (int, float, Decimal)):
+            return (2, Decimal(str(value)))
+        if isinstance(value, (datetime, date, time)):
+            return (3, value.isoformat())
+        return (4, str(value))
+
+    def row_key(row: tuple) -> tuple:
+        return tuple(key_sort_value(row[index]) for index in key_positions)
+
+    def grain_dict(row: tuple) -> dict:
+        return {
+            key: str(row[index]) for key, index in zip(keys, key_positions, strict=True)
+        }
+
     mismatches: list[dict] = []
     compared_rows = 0
+    matched_key_count = 0
+    duckdb_only_count = 0
+    snowflake_only_count = 0
+    value_mismatch_count = 0
+
     sentinel = object()
     duck_rows = _row_stream(duck_cursor)
     snowflake_rows = _row_stream(snowflake_cursor)
-    while True:
-        left = next(duck_rows, sentinel)
-        right = next(snowflake_rows, sentinel)
-        if left is sentinel and right is sentinel:
-            break
+
+    left = next(duck_rows, sentinel)
+    right = next(snowflake_rows, sentinel)
+
+    while left is not sentinel or right is not sentinel:
         compared_rows += 1
-        if left is sentinel or right is sentinel:
+
+        if left is sentinel:
+            snowflake_only_count += 1
             if len(mismatches) < 10:
                 mismatches.append(
                     {
                         "row_index": compared_rows,
-                        "reason": "row present in only one backend",
-                        "duckdb_present": left is not sentinel,
-                        "snowflake_present": right is not sentinel,
+                        "reason": "snowflake_only",
+                        "grain": grain_dict(right),
                     }
                 )
+            right = next(snowflake_rows, sentinel)
             continue
-        key_value = {
-            key: str(left[index])
-            for key, index in zip(keys, key_positions, strict=True)
-        }
+
+        if right is sentinel:
+            duckdb_only_count += 1
+            if len(mismatches) < 10:
+                mismatches.append(
+                    {
+                        "row_index": compared_rows,
+                        "reason": "duckdb_only",
+                        "grain": grain_dict(left),
+                    }
+                )
+            left = next(duck_rows, sentinel)
+            continue
+
+        left_key = row_key(left)
+        right_key = row_key(right)
+
+        if left_key < right_key:
+            duckdb_only_count += 1
+            if len(mismatches) < 10:
+                mismatches.append(
+                    {
+                        "row_index": compared_rows,
+                        "reason": "duckdb_only",
+                        "grain": grain_dict(left),
+                    }
+                )
+            left = next(duck_rows, sentinel)
+            continue
+
+        if right_key < left_key:
+            snowflake_only_count += 1
+            if len(mismatches) < 10:
+                mismatches.append(
+                    {
+                        "row_index": compared_rows,
+                        "reason": "snowflake_only",
+                        "grain": grain_dict(right),
+                    }
+                )
+            right = next(snowflake_rows, sentinel)
+            continue
+
+        matched_key_count += 1
+        key_value = grain_dict(left)
+
         for name, left_value, right_value in zip(columns, left, right, strict=True):
+            if name in key_names:
+                continue
+
             if not _values_equal(left_value, right_value, name):
+                value_mismatch_count += 1
                 if len(mismatches) < 10:
                     mismatches.append(
                         {
                             "row_index": compared_rows,
+                            "reason": "value_mismatch",
                             "grain": key_value,
                             "column": name,
                             "duckdb": str(left_value),
@@ -252,8 +330,16 @@ def _compare_row_values(
                         }
                     )
                 break
+
+        left = next(duck_rows, sentinel)
+        right = next(snowflake_rows, sentinel)
+
     return {
         "compared_rows": compared_rows,
+        "matched_key_count": matched_key_count,
+        "duckdb_only_count": duckdb_only_count,
+        "snowflake_only_count": snowflake_only_count,
+        "value_mismatch_count": value_mismatch_count,
         "mismatches": mismatches,
         "values_match": not mismatches,
     }
