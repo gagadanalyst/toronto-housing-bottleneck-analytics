@@ -1,0 +1,72 @@
+name: Snowflake Historical SCD2 Replay
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: toronto-snowflake-historical-scd2-replay
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    name: Replay 28 validated snapshots into an isolated Snowflake schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TORONTO_WAREHOUSE_KIND: snowflake
+      TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_SCD2_REBUILD_20261107_${{ github.run_id }}_${{ github.run_attempt }}
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DO_NOT_TRACK: "1"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install ingestion and Snowflake dependencies
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[snowflake]"
+
+      - name: Validate and replay all historical snapshots
+        run: python scripts/snowflake_scd2_historical_replay.py
+
+      - name: Publish replay evidence to the workflow summary
+        if: always()
+        run: |
+          if test -s data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          summary = json.loads(Path("data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json").read_text())
+          print(f"## Snowflake historical SCD2 replay: {summary['status'].upper()}")
+          print(f"Schema: `TORONTO.{summary['schema']}`")
+          print(f"Snapshots: {summary['snapshot_count']}")
+          for name, source in summary.get("sources", {}).items():
+              m = source["metrics"]
+              print(f"- **{name}:** {m['total']:,} total; {m['current']:,} current; {m['expired']:,} expired; "
+                    f"{m['overlapping_intervals']} overlaps; {m['duplicate_current_business_keys']} duplicate current keys")
+          PY
+          else
+            echo "## Snowflake historical SCD2 replay did not produce a completed summary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Snowflake history exports and replay audit
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snowflake-scd2-replay-evidence-${{ github.run_id }}
+          path: data/recovery/scd2-rebuild/snowflake-replay-evidence/
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 30
