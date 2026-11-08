@@ -72,7 +72,7 @@ def test_default_cli_processes_only_configured_sources(monkeypatch) -> None:
     import sys
     from contextlib import nullcontext
 
-    monkeypatch.setattr(sys, "argv", ["ingest"])
+    monkeypatch.setattr(sys, "argv", ["ingest", "--extract-only"])
     processed = []
 
     class FakeClient:
