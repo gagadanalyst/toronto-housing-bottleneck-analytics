@@ -53,6 +53,10 @@ EXPECTED_LEGACY_RUN_IDS = (
     "41824174680",
     "42022028625",
 )
+EXPECTED_LEGACY_RUN_ATTEMPTS = {
+    "40491722684": "2",
+    "40679228717": "4",
+}
 SOURCE_NAMES = ("active_permits", "cleared_permits")
 ARTIFACT_RE = re.compile(r"toronto-snapshot-bundle-(\d+)\Z")
 ASSET_RE = re.compile(r"toronto-raw-snapshot-bundle-(\d+)-(\d+)\.zip\Z")

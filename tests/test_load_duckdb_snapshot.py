@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from zipfile import ZIP_STORED, ZipFile
 
@@ -10,6 +10,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from scripts import load_duckdb_snapshot as loader
+from scripts import validate_duckdb_scd2_historical_replay as duckdb_validation
+from scripts import validate_scd2_replay_provenance as provenance_validation
 
 
 def _seed(
@@ -324,3 +326,150 @@ def test_historical_baseline_scope_rejects_multiple_attempts_for_one_run():
 
     with pytest.raises(ValueError, match="multiple archive attempts"):
         loader._select_expected_run_archives(archives, ("100",))
+
+
+def test_historical_baseline_rejects_unexpected_archive_attempt():
+    archives = [SimpleNamespace(run_id="100", attempt="2", order=(1, 100, 2))]
+
+    with pytest.raises(
+        ValueError, match="run 100 has archive attempt 2; expected attempt 1"
+    ):
+        loader._select_expected_run_archives(archives, ("100",))
+
+
+def test_historical_baseline_accepts_explicit_approved_attempt():
+    archive = SimpleNamespace(run_id="100", attempt="2", order=(1, 100, 2))
+
+    selected = loader._select_expected_run_archives(
+        [archive], ("100",), expected_attempts={"100": "2"}
+    )
+
+    assert selected == [archive]
+
+
+def test_persist_manifest_metadata_upsert_succeeds_with_duckdb_timestamp_function(
+    tmp_path,
+):
+    database = tmp_path / "manifest.duckdb"
+    loader._ensure_ledger(database)
+    manifest_root = tmp_path / "manifests"
+    first_manifest = {
+        "source_name": "active_permits",
+        "source_run_id": "100",
+        "source_run_attempt": "1",
+        "extracted_at_utc": "2026-11-07T15:00:00+00:00",
+        "sha256": "a" * 64,
+        "row_count": 1,
+    }
+    second_manifest = {
+        **first_manifest,
+        "source_run_id": "101",
+        "extracted_at_utc": "2026-11-07T15:01:00+00:00",
+        "sha256": "b" * 64,
+    }
+
+    # First call exercises INSERT; the second uses the same source_name and
+    # must execute the ON CONFLICT DO UPDATE branch that previously failed.
+    loader._persist_manifest(
+        database,
+        manifest_root,
+        source_name="active_permits",
+        manifest=first_manifest,
+        release_tag="toronto-raw-snapshot-archive-2026-11",
+        asset_name="toronto-raw-snapshot-bundle-100-1.zip",
+    )
+    loader._persist_manifest(
+        database,
+        manifest_root,
+        source_name="active_permits",
+        manifest=second_manifest,
+        release_tag="toronto-raw-snapshot-archive-2026-12",
+        asset_name="toronto-raw-snapshot-bundle-101-1.zip",
+    )
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        row = connection.execute(
+            "SELECT extracted_at_utc, manifest_json, release_tag, asset_name, updated_at "
+            "FROM raw.toronto_source_snapshot_metadata WHERE source_name = ?",
+            ["active_permits"],
+        ).fetchone()
+
+    assert row is not None
+    assert row[0].astimezone(UTC).isoformat().startswith("2026-11-07T15:01:00")
+    assert '"source_run_id": "101"' in row[1]
+    assert row[2] == "toronto-raw-snapshot-archive-2026-12"
+    assert row[3] == "toronto-raw-snapshot-bundle-101-1.zip"
+    assert row[4] is not None
+
+
+def test_duckdb_metrics_detect_scd2_integrity_violations(tmp_path):
+    database = tmp_path / "metrics.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("CREATE SCHEMA raw")
+        connection.execute(
+            """CREATE TABLE raw.raw_active_permits (
+                permit_num VARCHAR,
+                revision_num VARCHAR,
+                permit_type VARCHAR,
+                _dlt_valid_from TIMESTAMP,
+                _dlt_valid_to TIMESTAMP
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO raw.raw_active_permits VALUES
+                ('P-1', '00', 'Building', TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-10'),
+                ('P-1', '00', 'Building', TIMESTAMP '2026-01-02', TIMESTAMP '2026-01-03'),
+                ('P-1', '00', 'Building', TIMESTAMP '2026-01-04', TIMESTAMP '2026-01-05'),
+                ('P-1', '00', 'Building', TIMESTAMP '2026-01-10', NULL),
+                ('P-2', '00', 'Plumbing', TIMESTAMP '2026-01-01', NULL),
+                ('P-2', '00', 'Plumbing', TIMESTAMP '2026-01-02', NULL),
+                ('P-3', '00', 'Electrical', NULL, NULL),
+                ('P-4', '00', 'Demolition', TIMESTAMP '2026-01-05', TIMESTAMP '2026-01-05')"""
+        )
+
+        metrics = duckdb_validation._metrics(connection, "raw", "raw_active_permits")
+
+    assert metrics == {
+        "total": 8,
+        "current": 4,
+        "expired": 4,
+        "null_valid_from": 1,
+        "invalid_intervals": 1,
+        "duplicate_current_business_keys": 1,
+        # Two nested P-1 overlaps plus one P-2 open-ended overlap. The
+        # contiguous P-1 transition at Jan 10 is correctly not an overlap.
+        "overlapping_intervals": 3,
+    }
+
+
+def test_duckdb_validator_rejects_unexpected_historical_row_counts():
+    metrics = {
+        "total": 1,
+        "current": 1,
+        "expired": 0,
+        "null_valid_from": 0,
+        "invalid_intervals": 0,
+        "duplicate_current_business_keys": 0,
+        "overlapping_intervals": 0,
+    }
+
+    with pytest.raises(ValueError, match="approved historical baseline"):
+        duckdb_validation._validate_source_metrics("active_permits", metrics)
+
+
+def test_provenance_validator_rejects_a_shared_but_unapproved_snapshot_set():
+    snapshot_ids = [
+        f"{run_id}:{duckdb_validation.EXPECTED_LEGACY_RUN_ATTEMPTS.get(run_id, '1')}"
+        for run_id in duckdb_validation.EXPECTED_LEGACY_RUN_IDS
+    ]
+    run_ids = list(duckdb_validation.EXPECTED_LEGACY_RUN_IDS)
+    snapshot_ids[-1] = "99999999999:1"
+    run_ids[-1] = "99999999999"
+    summary = {
+        "snapshot_count": 28,
+        "snapshot_ids": snapshot_ids,
+        "snapshot_run_ids": run_ids,
+    }
+
+    with pytest.raises(ValueError, match="approved 28-run baseline"):
+        provenance_validation._validate_snapshot_scope(summary, "DuckDB")
