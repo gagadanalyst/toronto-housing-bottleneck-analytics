@@ -44,6 +44,20 @@ def test_source_change_detects_resource_change() -> None:
     assert ingestion.source_has_changed(previous, current)
 
 
+@pytest.mark.parametrize(
+    "warehouse_status",
+    ["not_loaded", "loading", "failed", "blocked"],
+)
+def test_unfinished_warehouse_load_is_retried(warehouse_status: str) -> None:
+    previous = {
+        "resource_id": "1",
+        "resource_hash": "same",
+        "warehouse_status": warehouse_status,
+    }
+    current = {"resource_id": "1", "resource_hash": "same"}
+    assert ingestion.source_has_changed(previous, current)
+
+
 def test_no_ckan_filter_is_used() -> None:
     assert not hasattr(ingestion, "_filters")
 
@@ -85,6 +99,30 @@ def test_default_cli_processes_only_configured_sources(monkeypatch) -> None:
 
     assert ingestion.main() == 0
     assert processed == ["active_permits", "cleared_permits"]
+
+
+def test_load_persisted_snapshot_manifest_reads_duckdb_baseline(tmp_path) -> None:
+    import duckdb
+
+    database = tmp_path / "baseline.duckdb"
+    manifest = {
+        "source_name": "active_permits",
+        "row_count": 199307,
+        "resource_id": "resource-1",
+        "extracted_at_utc": "2026-11-07T15:00:00+00:00",
+    }
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("CREATE SCHEMA raw")
+        connection.execute(
+            "CREATE TABLE raw.toronto_source_snapshot_metadata (source_name VARCHAR PRIMARY KEY, manifest_json VARCHAR)"
+        )
+        connection.execute(
+            "INSERT INTO raw.toronto_source_snapshot_metadata VALUES (?, ?)",
+            ["active_permits", json.dumps(manifest)],
+        )
+
+    app = SimpleNamespace(warehouse_kind="duckdb", warehouse_credentials=str(database))
+    assert ingestion.load_persisted_snapshot_manifest(app, "active_permits") == manifest
 
 
 def test_freshness() -> None:

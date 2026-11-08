@@ -11,6 +11,7 @@ permissions:
 concurrency:
   group: toronto-housing-data-publication
   cancel-in-progress: false
+  queue: max
 
 jobs:
   data-assets:
@@ -45,26 +46,62 @@ jobs:
       - name: Install pytest
         run: python -m pip install "pytest>=9,<10"
 
-      - name: Restore persistent DuckDB asset
+      - name: Restore latest immutable DuckDB recovery checkpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p data/warehouse
-          if gh release view warehouse-latest >/dev/null 2>&1; then
-            gh release download warehouse-latest \
+          if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
+            echo "Restored and verified the latest immutable DuckDB recovery checkpoint."
+          else
+            restore_status=$?
+            if [ "$restore_status" -ne 2 ]; then
+              echo "Versioned DuckDB recovery restore failed; refusing to fall back to an older database."
+              exit "$restore_status"
+            fi
+            if gh release download warehouse-recovery-latest \
+              --repo "$GITHUB_REPOSITORY" \
               --pattern "toronto.duckdb" \
-              --dir data/warehouse \
-              --clobber
+              --dir data/warehouse; then
+              echo "Restored the legacy recovery checkpoint; future checkpoints are immutable and versioned."
+            elif gh release download warehouse-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "toronto.duckdb" \
+              --dir data/warehouse; then
+              echo "No versioned recovery checkpoint exists; restored the published warehouse-latest asset."
+            else
+              echo "No previous DuckDB database was found; this is an initial warehouse build."
+            fi
           fi
+      - name: Restore previous full-source row-count baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data/snapshot-baseline
+          if gh release view warehouse-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for asset in toronto-active-permits.parquet toronto-cleared-permits.parquet; do
+              gh release download warehouse-latest \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" \
+                --dir data/snapshot-baseline \
+                --clobber
+            done
+          fi
+          python scripts/restore_previous_snapshot_baseline.py \
+            --active data/snapshot-baseline/toronto-active-permits.parquet \
+            --cleared data/snapshot-baseline/toronto-cleared-permits.parquet \
+            --manifest-root data/manifests
 
       - name: Record snapshot extraction start
         shell: bash
         run: |
-          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)"
           echo "SNAPSHOT_EXTRACTION_STARTED_AT=${started_at}" >> "$GITHUB_ENV"
           echo "TORONTO_DBT_AS_OF_DATE=${started_at:0:10}" >> "$GITHUB_ENV"
 
       - name: Extract Active and Cleared Permits only
+        id: extract_snapshots
+        continue-on-error: true
         run: >-
           toronto-ingest
           --config open_data_config.yml
@@ -72,12 +109,209 @@ jobs:
           --manifest-root data/manifests
           --checkpoint-root data/checkpoints
           --lock-file data/.ingestion.lock
+          --extract-only
           --full-refresh
 
+      - name: Package raw snapshot bundle
+        env:
+          SNAPSHOT_SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: >-
+          python scripts/package_snapshot_bundle.py
+          --stage raw
+          --allow-partial
+          --output data-assets/toronto-raw-snapshot-bundle.zip
+
+      - name: Upload raw snapshot artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-raw-snapshot-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data-assets/toronto-raw-snapshot-bundle.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Archive immutable raw snapshot in a monthly GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_name="toronto-raw-snapshot-bundle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          asset_path="data-assets/${asset_name}"
+          cp data-assets/toronto-raw-snapshot-bundle.zip "$asset_path"
+
+          asset_size="$(stat -c '%s' "$asset_path")"
+          if [ "$asset_size" -ge 2147483648 ]; then
+            echo "Snapshot asset exceeds the 2 GiB GitHub Release asset limit: $asset_size bytes."
+            exit 1
+          fi
+
+          archive_tag="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          from datetime import datetime
+          from zipfile import ZipFile
+          with ZipFile("data-assets/toronto-raw-snapshot-bundle.zip") as archive:
+              bundle = json.loads(archive.read("bundle.json"))
+          stamp = datetime.fromisoformat(
+              bundle["extraction_started_at_utc"].replace("Z", "+00:00")
+          )
+          if stamp.tzinfo is None:
+              raise SystemExit("Bundle extraction timestamp must include a timezone.")
+          print("toronto-raw-snapshot-archive-" + stamp.astimezone(__import__("datetime").UTC).strftime("%Y-%m"))
+          PY
+          )"
+          echo "SNAPSHOT_ARCHIVE_TAG=$archive_tag" >> "$GITHUB_ENV"
+          echo "SNAPSHOT_ARCHIVE_ASSET=$asset_name" >> "$GITHUB_ENV"
+
+          if ! gh release view "$archive_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$archive_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Toronto raw snapshot archive ${archive_tag##*-}" \
+              --notes "Immutable raw Active and Cleared Permits snapshots, partitioned by UTC extraction month. Assets are named by source CD run and workflow attempt. No automatic asset pruning is performed."
+          fi
+
+          asset_state="$(ARCHIVE_TAG="$archive_tag" SNAPSHOT_ASSET_NAME="$asset_name" python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["ARCHIVE_TAG"]
+          asset_name = os.environ["SNAPSHOT_ASSET_NAME"]
+          release = json.loads(subprocess.run(
+              ["gh", "api", f"repos/{repository}/releases/tags/{tag}"],
+              check=True, capture_output=True, text=True,
+          ).stdout)
+          release_id = int(release["id"])
+          pages = json.loads(subprocess.run(
+              ["gh", "api", "--paginate", "--slurp",
+               f"repos/{repository}/releases/{release_id}/assets?per_page=100"],
+              check=True, capture_output=True, text=True,
+          ).stdout or "[]")
+          assets = [asset for page in pages for asset in page]
+          matches = [asset for asset in assets if asset.get("name") == asset_name]
+          if len(matches) > 1:
+              raise SystemExit("Release contains duplicate assets with the immutable snapshot name.")
+          print(f"{matches[0].get('id', '') if matches else ''}\t{len(assets)}")
+          PY
+          )"
+          existing_asset_id="${asset_state%%$'\t'*}"
+          asset_count="${asset_state#*$'\t'}"
+          if [ -n "$existing_asset_id" ]; then
+            mkdir -p "$RUNNER_TEMP/raw-snapshot-verify"
+            gh release download "$archive_tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset_name" --dir "$RUNNER_TEMP/raw-snapshot-verify"
+            if ! cmp -s "$asset_path" "$RUNNER_TEMP/raw-snapshot-verify/$asset_name"; then
+              echo "Immutable archive asset exists with different bytes: $asset_name"
+              exit 1
+            fi
+            echo "Verified identical existing immutable asset: $asset_name"
+          else
+            if [ "$asset_count" -ge 1000 ]; then
+              echo "Release asset limit reached (1000). No existing asset was removed."
+              exit 1
+            fi
+            gh release upload "$archive_tag" "$asset_path" --repo "$GITHUB_REPOSITORY"
+            echo "Published immutable asset: $asset_name"
+          fi
+
+      - name: Require complete, approved raw snapshots before warehouse loading
+        id: raw_warehouse_gate
+        env:
+          EXTRACTION_OUTCOME: ${{ steps.extract_snapshots.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from zipfile import ZipFile
+
+          if os.environ["EXTRACTION_OUTCOME"] != "success":
+              raise SystemExit(
+                  "At least one source extraction failed. Raw evidence was archived; "
+                  "warehouse loads are blocked."
+              )
+
+          with ZipFile("data-assets/toronto-raw-snapshot-bundle.zip") as archive:
+              bundle = json.loads(archive.read("bundle.json"))
+
+          if bundle.get("complete") is not True:
+              raise SystemExit(
+                  f"Raw archive is incomplete: {bundle.get('missing_sources')}"
+              )
+
+          if bundle.get("approved_for_warehouse") is not True:
+              blockers = {
+                  name: source.get("warehouse_quality_blockers", [])
+                  for name, source in bundle["sources"].items()
+                  if source.get("warehouse_eligible") is not True
+              }
+              raise SystemExit(
+                  f"Raw extracts were preserved but are not approved for loading: {blockers}"
+              )
+
+          print("Both raw snapshots are complete and approved for warehouse loading.")
+          PY
+
+      - name: Dispatch independent Snowflake refresh
+        if: steps.raw_warehouse_gate.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_SOURCE_RUN_ID: ${{ github.run_id }}
+          SNAPSHOT_SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SNAPSHOT_SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          payload = {
+              "event_type": "toronto_raw_snapshot_ready",
+              "client_payload": {
+                  "run_id": os.environ["SNAPSHOT_SOURCE_RUN_ID"],
+                  "run_attempt": int(os.environ["SNAPSHOT_SOURCE_RUN_ATTEMPT"]),
+                  "source_commit": os.environ["SNAPSHOT_SOURCE_COMMIT"],
+                  "release_tag": os.environ["SNAPSHOT_ARCHIVE_TAG"],
+                  "asset_name": os.environ["SNAPSHOT_ARCHIVE_ASSET"],
+              },
+          }
+
+          subprocess.run(
+              [
+                  "gh", "api",
+                  f"repos/{os.environ['GITHUB_REPOSITORY']}/dispatches",
+                  "--method", "POST",
+                  "--input", "-",
+              ],
+              input=json.dumps(payload),
+              text=True,
+              check=True,
+          )
+          print("Dispatched Snowflake refresh independently of DuckDB.")
+          PY
+
+      - name: Load the archived raw snapshot backlog into DuckDB SCD2
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        id: duckdb_snapshot_replay
+        env:
+          TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
+          TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID }}
+          TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT }}
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/load_duckdb_snapshot.py --backlog
+
+      - name: Persist immutable DuckDB SCD2 recovery checkpoint immediately after replay
+        if: steps.duckdb_snapshot_replay.outcome == 'success' && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publish_duckdb_recovery.py
+
       - name: Run Active Permits SCD2 integration test
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: python -m pytest -s tests/integration/test_scd2_active_permits.py
 
       - name: Validate assets
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -98,6 +332,7 @@ jobs:
       #- name: Run permit business-key tests
       #  run: python -m pytest -q tests/test_business_keys.py
       - name: Validate DuckDB contents
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           python - <<'PY'
           import duckdb
@@ -139,15 +374,18 @@ jobs:
           PY
 
       - name: Validate permit warehouse loads
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: python -m pytest -s tests/test_warehouse_load.py
 
       - name: Create isolated dbt environment
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           python -m venv "$RUNNER_TEMP/dbt-venv"
           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
 
       - name: Prepare fresh warehouse copy for dbt
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           set -euo pipefail
           mkdir -p data/warehouse/dbt-ci
@@ -156,25 +394,30 @@ jobs:
           sha256sum data/warehouse/dbt-ci/toronto.duckdb
 
       - name: Configure dbt profile
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: cp profiles.yml.example profiles.yml
 
       - name: Install dbt package dependencies
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
 
       - name: Check connection and parse project
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: |
           "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
           "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
 
       - name: Check dbt source freshness
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: |
           "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
 
       - name: Build models and run tests
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: |
           "$RUNNER_TEMP/dbt-venv/bin/dbt" build \
@@ -182,10 +425,12 @@ jobs:
             --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
 
       - name: Generate dbt documentation site for publication
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         working-directory: dbt
         run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
 
       - name: Inject Google Analytics into generated dbt docs
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -221,6 +466,7 @@ jobs:
           PY
 
       - name: Record successful refresh metadata in DuckDB
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         env:
           SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -266,6 +512,7 @@ jobs:
           PY
 
       - name: Promote dbt-built warehouse for publication
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           set -euo pipefail
           test -s data/warehouse/dbt-ci/toronto.duckdb
@@ -274,6 +521,7 @@ jobs:
           sha256sum data/warehouse/toronto.duckdb
 
       - name: Package dbt documentation for publication
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           set -euo pipefail
           test -s dbt/docs-site/index.html
@@ -312,12 +560,13 @@ jobs:
           test -s data-assets/toronto-dbt-docs.zip
 
       - name: Upload GitHub Pages artifact
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dbt/docs-site
 
       - name: Upload dbt logs on failure
-        if: failure()
+        if: (failure()) && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dbt-main-logs-${{ github.run_id }}
@@ -326,6 +575,7 @@ jobs:
           retention-days: 7
 
       - name: Upload DuckDB asset
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: toronto-duckdb-${{ github.run_id }}
@@ -335,6 +585,7 @@ jobs:
           retention-days: 14
 
       - name: Stage clearly named Parquet files
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
           set -euo pipefail
           test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
@@ -350,11 +601,16 @@ jobs:
           ls -lh data-assets/*.parquet
 
       - name: Package validated snapshot bundle
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         env:
           SNAPSHOT_SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
-        run: python scripts/package_snapshot_bundle.py --output data-assets/toronto-snapshot-bundle.zip
+        run: >-
+          python scripts/package_snapshot_bundle.py
+          --stage warehouse_validated
+          --output data-assets/toronto-snapshot-bundle.zip
 
       - name: Upload validated snapshot bundle
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: toronto-snapshot-bundle-${{ github.run_id }}
@@ -364,6 +620,7 @@ jobs:
           retention-days: 14
 
       - name: Publish durable data assets
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         id: publish_assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -372,7 +629,7 @@ jobs:
         run: python scripts/publish_release_assets.py
 
       - name: Preserve recovery backup if rollback fails
-        if: always() && steps.publish_assets.outcome != 'success'
+        if: (always() && steps.publish_assets.outcome != 'success') && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: warehouse-latest-recovery-${{ github.run_id }}
@@ -386,7 +643,8 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event != 'pull_request' &&
-      github.event.workflow_run.head_branch == 'main'
+      github.event.workflow_run.head_branch == 'main' &&
+      vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
     needs: data-assets
     permissions:
       pages: write
