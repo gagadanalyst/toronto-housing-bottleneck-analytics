@@ -18,17 +18,28 @@ from toronto_housing_ingestion.dlt_loader import ensure_duckdb_database, load_sc
 from toronto_housing_ingestion.utils import atomic_write_json, exclusive_lock
 
 try:  # CLI execution (python scripts/load_duckdb_snapshot.py)
-    from migrate_legacy_snapshot_artifacts import EXPECTED_LEGACY_RUN_IDS
+    from migrate_legacy_snapshot_artifacts import (
+        EXPECTED_LEGACY_RUN_ATTEMPTS,
+        EXPECTED_LEGACY_RUN_IDS,
+    )
     from snapshot_archive_backlog import discover_archives, snapshot_order
 except ImportError:  # pytest/module execution
-    from scripts.migrate_legacy_snapshot_artifacts import EXPECTED_LEGACY_RUN_IDS
+    from scripts.migrate_legacy_snapshot_artifacts import (
+        EXPECTED_LEGACY_RUN_ATTEMPTS,
+        EXPECTED_LEGACY_RUN_IDS,
+    )
     from scripts.snapshot_archive_backlog import discover_archives, snapshot_order
 
 SOURCE_NAMES = ("active_permits", "cleared_permits")
 
 
-def _select_expected_run_archives(archives: list[Any], expected_run_ids) -> list[Any]:
-    """Select exactly the requested legacy runs and fail on missing/ambiguous IDs."""
+def _select_expected_run_archives(
+    archives: list[Any],
+    expected_run_ids,
+    *,
+    expected_attempts: dict[str, str] | None = None,
+) -> list[Any]:
+    """Select the exact legacy runs and their approved immutable attempts."""
     expected = {str(run_id) for run_id in expected_run_ids}
     if not expected or any(not run_id.isdigit() for run_id in expected):
         raise ValueError("Historical baseline run IDs must be non-empty numeric IDs.")
@@ -50,6 +61,16 @@ def _select_expected_run_archives(archives: list[Any], expected_run_ids) -> list
             "Historical DuckDB baseline archive coverage is incomplete or blocked; "
             f"missing approved legacy runs: {missing}"
         )
+
+    approved_attempts = expected_attempts or {}
+    for run_id, archive in selected.items():
+        expected_attempt = str(approved_attempts.get(run_id, "1"))
+        actual_attempt = str(getattr(archive, "attempt", "1"))
+        if actual_attempt != expected_attempt:
+            raise ValueError(
+                f"Historical DuckDB baseline run {run_id} has archive attempt "
+                f"{actual_attempt}; expected attempt {expected_attempt}."
+            )
 
     return sorted(selected.values(), key=lambda item: item.order)
 
@@ -331,7 +352,7 @@ def _persist_manifest(
                 manifest_json = excluded.manifest_json,
                 release_tag = excluded.release_tag,
                 asset_name = excluded.asset_name,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = now()
             """,
             [
                 source_name,
@@ -787,10 +808,17 @@ def main() -> int:
                     exclude_snapshot_ids=(
                         set() if args.legacy_historical_baseline else completed_ids
                     ),
+                    include_run_ids=(
+                        set(EXPECTED_LEGACY_RUN_IDS)
+                        if args.legacy_historical_baseline
+                        else None
+                    ),
                 )
                 if args.legacy_historical_baseline:
                     archives = _select_expected_run_archives(
-                        archives, EXPECTED_LEGACY_RUN_IDS
+                        archives,
+                        EXPECTED_LEGACY_RUN_IDS,
+                        expected_attempts=EXPECTED_LEGACY_RUN_ATTEMPTS,
                     )
                     print(
                         f"Selected exactly {len(archives)} legacy historical "

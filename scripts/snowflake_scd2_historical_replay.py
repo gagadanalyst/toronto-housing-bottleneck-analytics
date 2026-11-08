@@ -26,6 +26,17 @@ except ImportError:  # pytest/module execution
     from scripts.snapshot_archive_backlog import SnapshotArchive, discover_archives
 from pyarrow import parquet as pq
 
+try:  # CLI execution (python scripts/snowflake_scd2_historical_replay.py)
+    from migrate_legacy_snapshot_artifacts import (
+        EXPECTED_LEGACY_RUN_ATTEMPTS,
+        EXPECTED_LEGACY_RUN_IDS,
+    )
+except ImportError:  # pytest/module execution
+    from scripts.migrate_legacy_snapshot_artifacts import (
+        EXPECTED_LEGACY_RUN_ATTEMPTS,
+        EXPECTED_LEGACY_RUN_IDS,
+    )
+
 from toronto_housing_ingestion.config import SourceConfig, load_config
 from toronto_housing_ingestion.dlt_loader import (
     _iter_scd2_snapshot_rows,
@@ -36,36 +47,7 @@ from toronto_housing_ingestion.dlt_loader import (
 
 REPOSITORY = "gagadanalyst/toronto-housing-bottleneck-analytics"
 SOURCE_NAMES = ("active_permits", "cleared_permits")
-RUN_IDS = (
-    "40470002594",
-    "40482942648",
-    "40491722684",
-    "40508242800",
-    "40513793300",
-    "40533706926",
-    "40567655707",
-    "40607541510",
-    "40622186735",
-    "40630228426",
-    "40638789933",
-    "40641089502",
-    "40668146616",
-    "40679228717",
-    "40788712364",
-    "40796993767",
-    "40820837442",
-    "40848285474",
-    "41034120228",
-    "41187888283",
-    "41295484744",
-    "41396374837",
-    "41403055348",
-    "41440929410",
-    "41533746699",
-    "41628672679",
-    "41824174680",
-    "42022028625",
-)
+RUN_IDS = EXPECTED_LEGACY_RUN_IDS
 EXPECTED_METRICS = {
     "active_permits": {"total": 104_321, "current": 98_511, "expired": 5_810},
     "cleared_permits": {"total": 190_323, "current": 190_274, "expired": 49},
@@ -129,7 +111,7 @@ def _select_expected_archives(
 ) -> list[SnapshotArchive]:
     """Require exactly one approved permanent Release archive for each legacy run."""
     expected = set(RUN_IDS)
-    expected_attempts = {"40491722684": "2", "40679228717": "4"}
+    expected_attempts = EXPECTED_LEGACY_RUN_ATTEMPTS
     selected: dict[str, SnapshotArchive] = {}
     for archive in archives:
         run_id = str(archive.run_id)
