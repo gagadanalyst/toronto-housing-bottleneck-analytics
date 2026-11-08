@@ -327,10 +327,13 @@ def test_historical_baseline_scope_rejects_multiple_attempts_for_one_run():
     with pytest.raises(ValueError, match="multiple archive attempts"):
         loader._select_expected_run_archives(archives, ("100",))
 
+
 def test_historical_baseline_rejects_unexpected_archive_attempt():
     archives = [SimpleNamespace(run_id="100", attempt="2", order=(1, 100, 2))]
 
-    with pytest.raises(ValueError, match="run 100 has archive attempt 2; expected attempt 1"):
+    with pytest.raises(
+        ValueError, match="run 100 has archive attempt 2; expected attempt 1"
+    ):
         loader._select_expected_run_archives(archives, ("100",))
 
 
@@ -424,9 +427,7 @@ def test_duckdb_metrics_detect_scd2_integrity_violations(tmp_path):
                 ('P-4', '00', 'Demolition', TIMESTAMP '2026-01-05', TIMESTAMP '2026-01-05')"""
         )
 
-        metrics = duckdb_validation._metrics(
-            connection, "raw", "raw_active_permits"
-        )
+        metrics = duckdb_validation._metrics(connection, "raw", "raw_active_permits")
 
     assert metrics == {
         "total": 8,

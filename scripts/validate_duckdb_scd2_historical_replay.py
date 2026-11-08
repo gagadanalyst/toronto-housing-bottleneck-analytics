@@ -135,11 +135,15 @@ def _manifest_records(manifest_root: Path, source_name: str) -> dict:
         attempt = str(manifest.get("source_run_attempt", ""))
         key = (run_id, attempt)
         if key in records:
-            raise ValueError(f"{source_name}: duplicate persisted manifest identity {key}.")
+            raise ValueError(
+                f"{source_name}: duplicate persisted manifest identity {key}."
+            )
         if manifest.get("source_name") != source_name:
             raise ValueError(f"{path}: source name mismatch.")
         if manifest.get("warehouse_status") != "loaded":
-            raise ValueError(f"{path}: archive manifest is not marked warehouse-loaded.")
+            raise ValueError(
+                f"{path}: archive manifest is not marked warehouse-loaded."
+            )
         digest = str(manifest.get("sha256", ""))
         if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
             raise ValueError(f"{path}: invalid SHA-256 digest.")
@@ -186,9 +190,7 @@ def main() -> None:
             "FROM raw.toronto_snapshot_ledger"
         ).fetchall()
         if len(ledger) != len(EXPECTED_LEGACY_RUN_IDS) * len(SOURCE_TABLES):
-            raise ValueError(
-                f"Expected 56 source ledger entries, found {len(ledger)}."
-            )
+            raise ValueError(f"Expected 56 source ledger entries, found {len(ledger)}.")
         expected_ledger = {
             (run_id, _expected_attempt(run_id), source_name)
             for run_id in EXPECTED_LEGACY_RUN_IDS
@@ -203,7 +205,9 @@ def main() -> None:
             if str(snapshot_id) != f"{run_id}:{attempt}":
                 raise ValueError(f"Ledger snapshot identity is inconsistent: {key}.")
             if str(status).lower() != "succeeded" or error:
-                raise ValueError(f"DuckDB ledger entry is not successful: {key}: {error}")
+                raise ValueError(
+                    f"DuckDB ledger entry is not successful: {key}: {error}"
+                )
         if actual_ledger != expected_ledger:
             raise ValueError(
                 "DuckDB ledger identities differ from the approved 28-run baseline; "

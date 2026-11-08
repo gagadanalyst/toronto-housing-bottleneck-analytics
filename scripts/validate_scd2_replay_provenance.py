@@ -28,7 +28,9 @@ SOURCE_NAMES = ("active_permits", "cleared_permits")
 def _read_summary(path: Path, label: str) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("status") != "passed":
-        raise ValueError(f"{label} replay summary is missing or not marked passed: {path}")
+        raise ValueError(
+            f"{label} replay summary is missing or not marked passed: {path}"
+        )
     if int(value.get("snapshot_count", 0)) != 28:
         raise ValueError(f"{label} summary does not report exactly 28 snapshots.")
     return value
@@ -55,9 +57,7 @@ def _validate_snapshot_scope(summary: dict, label: str) -> None:
         or len(set(run_ids)) != len(EXPECTED_RUN_ID_SET)
         or set(run_ids) != EXPECTED_RUN_ID_SET
     ):
-        raise ValueError(
-            f"{label}: run IDs do not match the approved 28-run baseline."
-        )
+        raise ValueError(f"{label}: run IDs do not match the approved 28-run baseline.")
 
 
 def _snapshot_map(summary: dict, source_name: str, label: str) -> dict:
@@ -66,7 +66,9 @@ def _snapshot_map(summary: dict, source_name: str, label: str) -> dict:
         raise ValueError(f"{label}: missing {source_name} summary.")
     loads = source.get("snapshot_loads")
     if not isinstance(loads, list) or len(loads) != len(EXPECTED_SNAPSHOT_ID_SET):
-        raise ValueError(f"{label}: {source_name} must contain 28 snapshot-load records.")
+        raise ValueError(
+            f"{label}: {source_name} must contain 28 snapshot-load records."
+        )
     result = {}
     for item in loads:
         if not isinstance(item, dict):
@@ -75,14 +77,20 @@ def _snapshot_map(summary: dict, source_name: str, label: str) -> dict:
         attempt = str(item.get("run_attempt", ""))
         key = (run_id, attempt)
         if not run_id.isdigit() or not attempt.isdigit() or key in result:
-            raise ValueError(f"{label}: invalid or duplicate {source_name} snapshot identity {key}.")
+            raise ValueError(
+                f"{label}: invalid or duplicate {source_name} snapshot identity {key}."
+            )
         digest = str(item.get("sha256", ""))
         if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
-            raise ValueError(f"{label}: invalid SHA-256 digest for {source_name} {key}.")
+            raise ValueError(
+                f"{label}: invalid SHA-256 digest for {source_name} {key}."
+            )
         rows = int(item.get("source_rows", 0))
         extracted_at = str(item.get("extracted_at_utc", ""))
         if rows < 1 or not extracted_at:
-            raise ValueError(f"{label}: incomplete source metadata for {source_name} {key}.")
+            raise ValueError(
+                f"{label}: incomplete source metadata for {source_name} {key}."
+            )
         result[key] = (digest, rows, extracted_at)
 
     expected_keys = {
@@ -117,7 +125,8 @@ def main() -> None:
             missing = sorted(set(duck_rows) - set(snow_rows))
             extra = sorted(set(snow_rows) - set(duck_rows))
             changed = sorted(
-                key for key in set(duck_rows) & set(snow_rows)
+                key
+                for key in set(duck_rows) & set(snow_rows)
                 if duck_rows[key] != snow_rows[key]
             )
             raise ValueError(
@@ -141,7 +150,9 @@ def main() -> None:
         args.output.write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-    print("PASS: DuckDB and Snowflake consumed exactly the same 56 source archive files.")
+    print(
+        "PASS: DuckDB and Snowflake consumed exactly the same 56 source archive files."
+    )
 
 
 if __name__ == "__main__":
