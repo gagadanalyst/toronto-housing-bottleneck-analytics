@@ -18,11 +18,40 @@ from toronto_housing_ingestion.dlt_loader import ensure_duckdb_database, load_sc
 from toronto_housing_ingestion.utils import atomic_write_json, exclusive_lock
 
 try:  # CLI execution (python scripts/load_duckdb_snapshot.py)
+    from migrate_legacy_snapshot_artifacts import EXPECTED_LEGACY_RUN_IDS
     from snapshot_archive_backlog import discover_archives, snapshot_order
 except ImportError:  # pytest/module execution
+    from scripts.migrate_legacy_snapshot_artifacts import EXPECTED_LEGACY_RUN_IDS
     from scripts.snapshot_archive_backlog import discover_archives, snapshot_order
 
 SOURCE_NAMES = ("active_permits", "cleared_permits")
+
+
+def _select_expected_run_archives(archives: list[Any], expected_run_ids) -> list[Any]:
+    """Select exactly the requested legacy runs and fail on missing/ambiguous IDs."""
+    expected = {str(run_id) for run_id in expected_run_ids}
+    if not expected or any(not run_id.isdigit() for run_id in expected):
+        raise ValueError("Historical baseline run IDs must be non-empty numeric IDs.")
+
+    selected: dict[str, Any] = {}
+    for archive in archives:
+        run_id = str(archive.run_id)
+        if run_id not in expected:
+            continue
+        if run_id in selected:
+            raise ValueError(
+                f"Historical baseline contains multiple archive attempts for run {run_id}."
+            )
+        selected[run_id] = archive
+
+    missing = sorted(expected - set(selected), key=int)
+    if missing:
+        raise RuntimeError(
+            "Historical DuckDB baseline archive coverage is incomplete or blocked; "
+            f"missing approved legacy runs: {missing}"
+        )
+
+    return sorted(selected.values(), key=lambda item: item.order)
 
 
 def _utc_timestamp(value: str) -> datetime:
@@ -710,9 +739,16 @@ def main() -> int:
     parser.add_argument(
         "--backlog",
         action="store_true",
-        help="Discover and replay all approved monthly Release archives in order.",
+        help="Discover and replay approved monthly Release archives in order.",
+    )
+    parser.add_argument(
+        "--legacy-historical-baseline",
+        action="store_true",
+        help="Restrict --backlog to the 28 preserved legacy snapshots from Oct 27-Nov 5, 2026.",
     )
     args = parser.parse_args()
+    if args.legacy_historical_baseline and not args.backlog:
+        parser.error("--legacy-historical-baseline requires --backlog.")
     if args.bundle is not None and args.backlog:
         parser.error("--bundle and --backlog cannot be combined.")
     if args.bundle is None and not args.backlog:
@@ -742,11 +778,24 @@ def main() -> int:
                 prefix="toronto-snapshot-backlog-"
             ) as temp:
                 completed_ids = _completed_snapshot_ids(database)
+                # A fresh CD run may already have archived snapshots newer
+                # than Nov 5. The initial two-warehouse rebuild must use the
+                # same fixed 28-run scope as the Snowflake replay.
                 archives = discover_archives(
                     repository,
                     Path(temp),
-                    exclude_snapshot_ids=completed_ids,
+                    exclude_snapshot_ids=(
+                        set() if args.legacy_historical_baseline else completed_ids
+                    ),
                 )
+                if args.legacy_historical_baseline:
+                    archives = _select_expected_run_archives(
+                        archives, EXPECTED_LEGACY_RUN_IDS
+                    )
+                    print(
+                        f"Selected exactly {len(archives)} legacy historical "
+                        "snapshots (Oct 27-Nov 5, 2026)."
+                    )
                 for item in archives:
                     _load_archive(
                         item.path,

@@ -292,3 +292,35 @@ def test_archive_validates_both_sources_before_loading_either(tmp_path, monkeypa
         )
 
     assert load_calls == []
+
+
+def test_historical_baseline_scope_selects_exact_runs_in_order():
+    archives = [
+        SimpleNamespace(run_id="103", order=(3, 103, 1)),
+        SimpleNamespace(run_id="100", order=(1, 100, 1)),
+        SimpleNamespace(run_id="102", order=(2, 102, 1)),
+        SimpleNamespace(run_id="999", order=(4, 999, 1)),
+    ]
+
+    selected = loader._select_expected_run_archives(archives, ("100", "102", "103"))
+
+    assert [archive.run_id for archive in selected] == ["100", "102", "103"]
+
+
+def test_historical_baseline_scope_rejects_missing_run():
+    archives = [SimpleNamespace(run_id="100", order=(1, 100, 1))]
+
+    with pytest.raises(
+        RuntimeError, match=r"missing approved legacy runs: \[.*101.*\]"
+    ):
+        loader._select_expected_run_archives(archives, ("100", "101"))
+
+
+def test_historical_baseline_scope_rejects_multiple_attempts_for_one_run():
+    archives = [
+        SimpleNamespace(run_id="100", order=(1, 100, 1)),
+        SimpleNamespace(run_id="100", order=(2, 100, 2)),
+    ]
+
+    with pytest.raises(ValueError, match="multiple archive attempts"):
+        loader._select_expected_run_archives(archives, ("100",))
