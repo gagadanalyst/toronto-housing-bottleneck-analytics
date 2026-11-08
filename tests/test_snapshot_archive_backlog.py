@@ -237,3 +237,52 @@ def test_manual_selection_can_force_download_of_completed_archive(
 
     assert calls == [asset]
     assert [item.snapshot_id for item in found] == ["123456:2"]
+
+
+def test_discovery_filters_by_run_ids_before_downloading(tmp_path, monkeypatch):
+    from scripts import snapshot_archive_backlog as backlog
+
+    assets = [
+        (
+            "toronto-raw-snapshot-archive-2026-11",
+            "toronto-raw-snapshot-bundle-123456-2.zip",
+            1,
+        ),
+        (
+            "toronto-raw-snapshot-archive-2026-11",
+            "toronto-raw-snapshot-bundle-123457-1.zip",
+            1,
+        ),
+    ]
+    monkeypatch.setattr(backlog, "_monthly_release_assets", lambda repository: assets)
+    downloaded = []
+
+    def fake_download(repository, tag, asset_name, destination):
+        downloaded.append(asset_name)
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / asset_name
+        _archive(path, run_id="123457", attempt="1")
+        return path
+
+    monkeypatch.setattr(backlog, "_download_asset", fake_download)
+
+    found = backlog.discover_archives(
+        "gagadanalyst/toronto-housing-bottleneck-analytics",
+        tmp_path,
+        include_run_ids={"123457"},
+    )
+
+    assert downloaded == ["toronto-raw-snapshot-bundle-123457-1.zip"]
+    assert [item.snapshot_id for item in found] == ["123457:1"]
+
+
+def test_discovery_rejects_invalid_explicit_run_id_filter(tmp_path, monkeypatch):
+    from scripts import snapshot_archive_backlog as backlog
+
+    monkeypatch.setattr(backlog, "_monthly_release_assets", lambda repository: [])
+    with pytest.raises(ValueError, match="non-empty numeric IDs"):
+        backlog.discover_archives(
+            "gagadanalyst/toronto-housing-bottleneck-analytics",
+            tmp_path,
+            include_run_ids={"run-123"},
+        )

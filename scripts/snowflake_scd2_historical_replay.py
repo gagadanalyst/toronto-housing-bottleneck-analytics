@@ -10,7 +10,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -20,6 +19,11 @@ from zipfile import ZipFile
 
 import snowflake.connector
 from pyarrow import Table
+
+try:  # CLI execution (python scripts/snowflake_scd2_historical_replay.py)
+    from snapshot_archive_backlog import SnapshotArchive, discover_archives
+except ImportError:  # pytest/module execution
+    from scripts.snapshot_archive_backlog import SnapshotArchive, discover_archives
 from pyarrow import parquet as pq
 
 from toronto_housing_ingestion.config import SourceConfig, load_config
@@ -78,6 +82,7 @@ TIMESTAMP_FORMAT = 'YYYY-MM-DD"T"HH24:MI:SS.FF6'
 @dataclass(frozen=True)
 class Snapshot:
     run_id: str
+    run_attempt: str
     source_name: str
     path: Path
     extracted_at: str
@@ -119,85 +124,71 @@ def _read_json(path: Path, label: str) -> dict:
     return value
 
 
-def _run_metadata(run_id: str) -> dict:
-    result = subprocess.run(
-        [
-            "gh",
-            "run",
-            "view",
-            run_id,
-            "--repo",
-            REPOSITORY,
-            "--json",
-            "name,status,conclusion,headBranch,headSha,event",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    metadata = json.loads(result.stdout)
-    expected = {
-        "name": "CD",
-        "status": "completed",
-        "conclusion": "success",
-        "headBranch": "main",
-        "event": "workflow_run",
-    }
-    differences = {
-        key: (value, metadata.get(key))
-        for key, value in expected.items()
-        if metadata.get(key) != value
-    }
-    if differences:
-        raise ValueError(
-            f"Run {run_id} is not a successful main-branch CD run: {differences}"
+def _select_expected_archives(
+    archives: list[SnapshotArchive],
+) -> list[SnapshotArchive]:
+    """Require exactly one approved permanent Release archive for each legacy run."""
+    expected = set(RUN_IDS)
+    expected_attempts = {"40491722684": "2", "40679228717": "4"}
+    selected: dict[str, SnapshotArchive] = {}
+    for archive in archives:
+        run_id = str(archive.run_id)
+        if run_id not in expected:
+            continue
+        if run_id in selected:
+            raise ValueError(
+                "Historical Snowflake baseline has multiple Release archive attempts "
+                f"for run {run_id}: {selected[run_id].attempt} and {archive.attempt}."
+            )
+        selected[run_id] = archive
+
+    missing = sorted(expected - set(selected), key=int)
+    if missing:
+        raise RuntimeError(
+            "Historical Snowflake baseline archive coverage is incomplete or blocked; "
+            f"missing approved monthly Release runs: {missing}"
         )
-    if not re.fullmatch(r"[0-9a-f]{40}", str(metadata.get("headSha", ""))):
-        raise ValueError(f"Run {run_id} returned an invalid source commit SHA.")
-    return metadata
+
+    for run_id, archive in selected.items():
+        expected_attempt = expected_attempts.get(run_id, "1")
+        actual_attempt = str(archive.attempt)
+        if actual_attempt != expected_attempt:
+            raise ValueError(
+                f"Historical Snowflake baseline run {run_id} has unexpected "
+                f"Release attempt {actual_attempt}; expected attempt {expected_attempt}."
+            )
+
+    return sorted(selected.values(), key=lambda item: item.order)
 
 
-def _download_bundles(root: Path) -> dict[str, dict]:
+def _download_bundles(root: Path) -> list[SnapshotArchive]:
+    """Download the exact historical run set from permanent monthly Releases."""
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ValueError("This replay must run in the expected GitHub repository.")
     if not os.environ.get("GH_TOKEN"):
         raise ValueError(
-            "GH_TOKEN is required to download historical snapshot artifacts."
+            "GH_TOKEN is required to download historical snapshot Release assets."
         )
 
-    metadata_by_run: dict[str, dict] = {}
-    for run_id in RUN_IDS:
-        run_dir = root / run_id
-        archive_path = run_dir / "toronto-snapshot-bundle.zip"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        metadata = _run_metadata(run_id)
-        if not archive_path.is_file():
-            subprocess.run(
-                [
-                    "gh",
-                    "run",
-                    "download",
-                    run_id,
-                    "--repo",
-                    REPOSITORY,
-                    "--name",
-                    f"toronto-snapshot-bundle-{run_id}",
-                    "--dir",
-                    str(run_dir),
-                ],
-                check=True,
-            )
-        if not archive_path.is_file() or archive_path.stat().st_size == 0:
-            raise FileNotFoundError(f"Snapshot artifact missing for CD run {run_id}.")
-        metadata_by_run[run_id] = metadata
-        print(f"Downloaded/verified artifact for CD run {run_id}.", flush=True)
-    return metadata_by_run
+    archives = discover_archives(
+        REPOSITORY,
+        root,
+        include_run_ids=set(RUN_IDS),
+    )
+    selected = _select_expected_archives(archives)
+    for archive in selected:
+        print(
+            "Downloaded and validated permanent Release archive "
+            f"{archive.release_tag}/{archive.asset_name} "
+            f"(snapshot {archive.snapshot_id}).",
+            flush=True,
+        )
+    return selected
 
 
 def _extract_and_validate_bundles(
-    bundle_root: Path,
+    archives: list[SnapshotArchive],
     prepared_root: Path,
-    metadata_by_run: dict[str, dict],
     sources: dict[str, SourceConfig],
 ) -> dict[str, list[Snapshot]]:
     expected_members = {"bundle.json"}
@@ -206,41 +197,67 @@ def _extract_and_validate_bundles(
 
     prepared: dict[str, list[Snapshot]] = {name: [] for name in SOURCE_NAMES}
     last_timestamp: dict[str, datetime | None] = {name: None for name in SOURCE_NAMES}
+    ordered_archives = _select_expected_archives(archives)
 
-    for run_id in RUN_IDS:
-        archive_path = bundle_root / run_id / "toronto-snapshot-bundle.zip"
-        run_metadata = metadata_by_run[run_id]
+    for archived in ordered_archives:
+        run_id = archived.run_id
+        attempt = archived.attempt
+        archive_path = archived.path
         with ZipFile(archive_path) as archive:
             names = set(archive.namelist())
-            if names != expected_members:
+            if names != expected_members or len(archive.namelist()) != len(
+                expected_members
+            ):
                 raise ValueError(
-                    f"Run {run_id}: unexpected bundle contents; "
+                    f"Run {run_id}:{attempt}: unexpected bundle contents; "
                     f"missing={sorted(expected_members - names)}, "
                     f"extra={sorted(names - expected_members)}"
                 )
             bad_member = archive.testzip()
             if bad_member is not None:
-                raise ValueError(f"Run {run_id}: corrupt ZIP member {bad_member!r}.")
+                raise ValueError(
+                    f"Run {run_id}:{attempt}: corrupt ZIP member {bad_member!r}."
+                )
 
             bundle = json.loads(archive.read("bundle.json"))
-            if bundle.get("format_version") != 1:
-                raise ValueError(f"Run {run_id}: unsupported bundle format.")
-            if str(bundle.get("source_run_id")) != run_id:
-                raise ValueError(f"Run {run_id}: bundle source_run_id mismatch.")
-            if bundle.get("source_commit") != run_metadata["headSha"]:
-                raise ValueError(f"Run {run_id}: bundle source commit mismatch.")
+            if (
+                bundle.get("format_version") != 1
+                or bundle.get("snapshot_stage") != "raw"
+                or bundle.get("complete") is not True
+                or bundle.get("approved_for_warehouse") is not True
+            ):
+                raise ValueError(
+                    f"Run {run_id}:{attempt}: archive is not a complete, approved raw bundle."
+                )
+            commit = str(bundle.get("source_commit", ""))
+            if (
+                str(bundle.get("source_run_id")) != run_id
+                or str(bundle.get("source_run_attempt")) != attempt
+                or bundle.get("source_commit") != archived.bundle.get("source_commit")
+                or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            ):
+                raise ValueError(
+                    f"Run {run_id}:{attempt}: permanent archive provenance mismatch."
+                )
+            started_at = _timestamp(
+                str(bundle.get("extraction_started_at_utc", "")),
+                f"Run {run_id}:{attempt} extraction_started_at_utc",
+            )
+            if started_at != archived.extracted_at:
+                raise ValueError(
+                    f"Run {run_id}:{attempt}: archive extraction timestamp mismatch."
+                )
 
             for source_name in SOURCE_NAMES:
                 source = sources[source_name]
                 summary = bundle.get("sources", {}).get(source_name)
                 if not isinstance(summary, dict):
                     raise ValueError(
-                        f"Run {run_id}: missing {source_name} bundle metadata."
+                        f"Run {run_id}:{attempt}: missing {source_name} bundle metadata."
                     )
-
                 data_member = f"{source_name}/data.parquet"
                 manifest_member = f"{source_name}/manifest.json"
-                destination = prepared_root / run_id / source_name
+                destination = prepared_root / run_id / attempt / source_name
                 destination.mkdir(parents=True, exist_ok=True)
                 snapshot_path = destination / "data.parquet"
                 manifest_path = destination / "manifest.json"
@@ -255,59 +272,81 @@ def _extract_and_validate_bundles(
                 digest = _sha256(snapshot_path)
                 if digest != summary.get("sha256") or digest != manifest.get("sha256"):
                     raise ValueError(
-                        f"Run {run_id} {source_name}: Parquet SHA-256 mismatch."
+                        f"Run {run_id}:{attempt} {source_name}: Parquet SHA-256 mismatch."
                     )
                 parquet = pq.ParquetFile(snapshot_path)
                 row_count = int(parquet.metadata.num_rows)
                 columns = list(parquet.schema_arrow.names)
-                if row_count != int(summary.get("row_count", -1)) or row_count != int(
-                    manifest.get("row_count", -1)
+                if (
+                    row_count < 1
+                    or row_count != int(summary.get("row_count", -1))
+                    or row_count != int(manifest.get("row_count", -1))
                 ):
-                    raise ValueError(f"Run {run_id} {source_name}: row-count mismatch.")
+                    raise ValueError(
+                        f"Run {run_id}:{attempt} {source_name}: row-count mismatch."
+                    )
                 if sorted(columns) != sorted(summary.get("columns", [])) or sorted(
                     columns
                 ) != sorted(manifest.get("columns", [])):
-                    raise ValueError(f"Run {run_id} {source_name}: schema mismatch.")
+                    raise ValueError(
+                        f"Run {run_id}:{attempt} {source_name}: schema mismatch."
+                    )
                 if (
-                    manifest.get("status") != "success"
-                    or manifest.get("warehouse_status") != "loaded"
+                    manifest.get("source_name") != source_name
+                    or str(manifest.get("source_run_id")) != run_id
+                    or str(manifest.get("source_run_attempt")) != attempt
+                    or manifest.get("source_commit") != commit
+                    or manifest.get("status") != "success"
+                    or manifest.get("warehouse_status") != "not_loaded"
+                    or manifest.get("warehouse_eligible") is not True
+                    or manifest.get("validation_errors")
+                    or manifest.get("warehouse_quality_blockers")
+                    or summary.get("warehouse_eligible") is not True
+                    or summary.get("validation_errors")
+                    or summary.get("warehouse_quality_blockers")
                 ):
                     raise ValueError(
-                        f"Run {run_id} {source_name}: unsuccessful source manifest."
+                        f"Run {run_id}:{attempt} {source_name}: raw snapshot is not "
+                        "complete, eligible, and ready for isolated warehouse loading."
                     )
                 if manifest.get("warehouse_since") != source.warehouse_since:
                     raise ValueError(
-                        f"Run {run_id} {source_name}: warehouse_since mismatch."
+                        f"Run {run_id}:{attempt} {source_name}: warehouse_since mismatch."
                     )
                 if (
                     manifest.get("warehouse_date_column")
                     != source.warehouse_date_column
                 ):
                     raise ValueError(
-                        f"Run {run_id} {source_name}: warehouse date column mismatch."
+                        f"Run {run_id}:{attempt} {source_name}: warehouse date column mismatch."
                     )
                 if (
                     int(manifest.get("raw_size_bytes", -1))
                     != snapshot_path.stat().st_size
                 ):
                     raise ValueError(
-                        f"Run {run_id} {source_name}: raw file-size mismatch."
+                        f"Run {run_id}:{attempt} {source_name}: raw file-size mismatch."
                     )
                 required = {column.lower() for column in source.required_columns}
                 actual = {column.lower() for column in columns}
                 missing = sorted(required - actual)
                 if missing:
                     raise ValueError(
-                        f"Run {run_id} {source_name}: missing columns {missing}."
+                        f"Run {run_id}:{attempt} {source_name}: missing columns {missing}."
                     )
 
                 extracted_at = str(manifest.get("extracted_at_utc", ""))
                 extracted_dt = _timestamp(
-                    extracted_at, f"{run_id} {source_name} extracted_at_utc"
+                    extracted_at,
+                    f"{run_id}:{attempt} {source_name} extracted_at_utc",
                 )
                 if summary.get("extracted_at_utc") != extracted_at:
                     raise ValueError(
-                        f"Run {run_id} {source_name}: timestamp metadata mismatch."
+                        f"Run {run_id}:{attempt} {source_name}: timestamp metadata mismatch."
+                    )
+                if extracted_dt < started_at:
+                    raise ValueError(
+                        f"Run {run_id}:{attempt} {source_name}: source extraction predates bundle start."
                     )
                 previous = last_timestamp[source_name]
                 if previous is not None and extracted_dt <= previous:
@@ -319,6 +358,7 @@ def _extract_and_validate_bundles(
                 prepared[source_name].append(
                     Snapshot(
                         run_id=run_id,
+                        run_attempt=attempt,
                         source_name=source_name,
                         path=snapshot_path,
                         extracted_at=extracted_at,
@@ -328,7 +368,7 @@ def _extract_and_validate_bundles(
                     )
                 )
                 print(
-                    f"PREFLIGHT {run_id} {source_name}: {row_count:,} rows; "
+                    f"PREFLIGHT {run_id}:{attempt} {source_name}: {row_count:,} rows; "
                     f"{extracted_at}; sha256 verified",
                     flush=True,
                 )
@@ -784,10 +824,8 @@ def main() -> None:
     prepared_root = Path("data/recovery/scd2-rebuild/prepared-snapshots")
     bundle_root.mkdir(parents=True, exist_ok=True)
     prepared_root.mkdir(parents=True, exist_ok=True)
-    metadata = _download_bundles(bundle_root)
-    prepared = _extract_and_validate_bundles(
-        bundle_root, prepared_root, metadata, sources
-    )
+    archives = _download_bundles(bundle_root)
+    prepared = _extract_and_validate_bundles(archives, prepared_root, sources)
 
     evidence_dir = Path("data/recovery/scd2-rebuild/snowflake-replay-evidence")
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -800,6 +838,7 @@ def main() -> None:
         "database": EXPECTED_DATABASE,
         "schema": schema,
         "snapshot_run_ids": list(RUN_IDS),
+        "snapshot_ids": [archive.snapshot_id for archive in archives],
         "snapshot_count": len(RUN_IDS),
         "created_at_utc": datetime.now(UTC).isoformat(),
         "sources": {},
@@ -833,6 +872,7 @@ def main() -> None:
                 load_log.append(
                     {
                         "run_id": snapshot.run_id,
+                        "run_attempt": snapshot.run_attempt,
                         "extracted_at_utc": snapshot.extracted_at,
                         "source_rows": snapshot.row_count,
                         "sha256": snapshot.sha256,

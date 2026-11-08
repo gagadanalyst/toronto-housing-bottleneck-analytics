@@ -242,18 +242,24 @@ def discover_archives(
     *,
     exclude_snapshot_ids: set[str] | None = None,
     include_snapshot_ids: set[str] | None = None,
+    include_run_ids: set[str] | None = None,
 ) -> list[SnapshotArchive]:
     """Download approved archives that still need processing, in extraction order.
 
-    Completed identities can be skipped using the warehouse ledger. This keeps
-    daily reconciliation from repeatedly downloading the entire permanent archive
-    history. Explicitly included identities (for manual identity verification)
-    are downloaded even when already complete.
+    Completed identities can be skipped using the warehouse ledger. Explicitly
+    included snapshot IDs override that exclusion; ``include_run_ids`` restricts
+    discovery to selected run IDs even when their workflow attempts are not known
+    in advance.
     """
     discovered: list[SnapshotArchive] = []
     seen_ids: set[str] = set()
     excluded = exclude_snapshot_ids or set()
     included = include_snapshot_ids or set()
+    selected_runs = include_run_ids or set()
+    if include_run_ids is not None and (
+        not selected_runs or any(not str(run_id).isdigit() for run_id in selected_runs)
+    ):
+        raise ValueError("Explicit archive run IDs must be non-empty numeric IDs.")
     assets = _monthly_release_assets(repository)
 
     for index, (tag, asset_name, _release_id) in enumerate(assets):
@@ -261,6 +267,8 @@ def discover_archives(
         if identity is None:
             continue
         run_id, attempt = identity.groups()
+        if selected_runs and run_id not in selected_runs:
+            continue
         snapshot_id = f"{run_id}:{attempt}"
         if snapshot_id in excluded and snapshot_id not in included:
             continue
