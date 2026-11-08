@@ -120,6 +120,9 @@ def _prepare_bundle(
             "source_name": source_name,
             "status": "success",
             "warehouse_status": "loaded",
+            "warehouse_eligible": True,
+            "warehouse_quality_blockers": [],
+            "required_columns": list(REQUIRED_COLUMNS[source_name]),
             "raw_path": str(raw_path),
             "sha256": _sha256(raw_path),
             "row_count": 1,
@@ -256,12 +259,45 @@ def test_validator_rejects_manifest_row_count_mismatch(
 def test_validator_rejects_missing_required_source_column(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bundle = _prepare_bundle(
-        tmp_path, monkeypatch, omit_columns={"active_permits": {"STATUS"}}
+    # Package a valid bundle first: the packager correctly rejects missing
+    # required columns, so construct a checksum-consistent bad archive to
+    # exercise the downstream validator's independent schema check.
+    bundle = _prepare_bundle(tmp_path, monkeypatch)
+    with ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("active_permits/manifest.json"))
+        bundle_manifest = json.loads(archive.read("bundle.json"))
+
+    snapshot_path = tmp_path / "active-permits-missing-status.parquet"
+    table = pa.table(
+        {
+            key: [value]
+            for key, value in FIELDS["active_permits"].items()
+            if key != "STATUS"
+        }
+    )
+    pq.write_table(table, snapshot_path)
+    columns = list(table.schema.names)
+    digest = _sha256(snapshot_path)
+    snapshot_bytes = snapshot_path.read_bytes()
+
+    manifest["sha256"] = digest
+    manifest["columns"] = columns
+    summary = bundle_manifest["sources"]["active_permits"]
+    summary["sha256"] = digest
+    summary["columns"] = columns
+
+    invalid_bundle = _rewrite_bundle(
+        bundle,
+        tmp_path / "missing-required-column.zip",
+        replacements={
+            "active_permits/data.parquet": snapshot_bytes,
+            "active_permits/manifest.json": json.dumps(manifest).encode("utf-8"),
+            "bundle.json": json.dumps(bundle_manifest).encode("utf-8"),
+        },
     )
 
     with pytest.raises(ValueError, match="missing required columns"):
-        _validate(bundle, tmp_path)
+        _validate(invalid_bundle, tmp_path)
 
 
 def test_validator_rejects_failed_load_manifest(

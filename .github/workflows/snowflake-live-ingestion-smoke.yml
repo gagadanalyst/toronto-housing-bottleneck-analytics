@@ -28,7 +28,7 @@ jobs:
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id }}_${{ github.run_id }}_${{ github.run_attempt }}
       SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id }}
       SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
       RUNTIME__DLTHUB_TELEMETRY: "false"

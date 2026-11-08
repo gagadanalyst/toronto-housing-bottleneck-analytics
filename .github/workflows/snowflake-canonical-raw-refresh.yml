@@ -1,13 +1,24 @@
 name: Snowflake Canonical RAW Refresh
 
 on:
-  workflow_run:
-    workflows: ["CD"]
-    types: [completed]
+  # Reconcile archives if a repository_dispatch handoff was missed.
+  schedule:
+    - cron: "23 8 * * *"
+  repository_dispatch:
+    types: [toronto_raw_snapshot_ready]
   workflow_dispatch:
     inputs:
       snapshot_run_id:
-        description: Successful, recent main-branch CD run that published the snapshot bundle
+        description: Recent main-branch CD run ID with an archived raw snapshot
+        required: true
+        type: string
+      snapshot_run_attempt:
+        description: CD workflow attempt number (normally 1)
+        required: true
+        default: "1"
+        type: string
+      release_tag:
+        description: Monthly GitHub Release tag containing the immutable bundle
         required: true
         type: string
       confirm_canonical_raw:
@@ -15,6 +26,7 @@ on:
         required: true
         default: false
         type: boolean
+
 
 permissions:
   contents: read
@@ -31,23 +43,33 @@ jobs:
     # Fail closed: only the explicit repository variable enables Snowflake compute.
     if: >-
       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' &&
+      vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' &&
+      vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != '' &&
+      github.ref == 'refs/heads/main' &&
       (
-        (github.event_name == 'workflow_run' &&
-         github.event.workflow_run.conclusion == 'success' &&
-         github.event.workflow_run.head_branch == 'main') ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'repository_dispatch' &&
+         github.event.action == 'toronto_raw_snapshot_ready') ||
         (github.event_name == 'workflow_dispatch' &&
-         github.ref == 'refs/heads/main')
+         inputs.confirm_canonical_raw == true)
       )
     name: Refresh and verify canonical Snowflake RAW
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       TORONTO_WAREHOUSE_DATASET: RAW
-      # Automatic runs consume the exact CD run that triggered this workflow.
-      SNAPSHOT_SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.snapshot_run_id }}
-      SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
+      TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
+      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID }}
+      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT }}
+      SNAPSHOT_SOURCE_RUN_ID: ${{ github.event.client_payload.run_id || inputs.snapshot_run_id }}
+      SNAPSHOT_SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.run_attempt || inputs.snapshot_run_attempt }}
+      SNAPSHOT_SOURCE_COMMIT: ${{ github.event.client_payload.source_commit || '' }}
+      SNAPSHOT_ARCHIVE_TAG: ${{ github.event.client_payload.release_tag || inputs.release_tag }}
+      SNAPSHOT_ARCHIVE_ASSET: ${{ github.event.client_payload.asset_name || format('toronto-raw-snapshot-bundle-{0}-{1}.zip', inputs.snapshot_run_id, inputs.snapshot_run_attempt) }}
+      SNAPSHOT_BUNDLE_PATH: data/snapshot-download/${{ github.event.client_payload.asset_name || format('toronto-raw-snapshot-bundle-{0}-{1}.zip', inputs.snapshot_run_id, inputs.snapshot_run_attempt) }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
 
@@ -76,67 +98,16 @@ jobs:
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -e ".[snowflake]"
 
-      - name: Validate successful main-branch CD run
+      - name: Replay approved archived snapshots in extraction order
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import re
-          import subprocess
-
-          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
-          if not re.fullmatch(r"[0-9]+", run_id):
-              raise ValueError("Snapshot source run ID must contain digits only.")
-          if not os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS"):
-              raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
-
-          result = subprocess.run(
-              [
-                  "gh", "run", "view", run_id,
-                  "--repo", os.environ["GITHUB_REPOSITORY"],
-                  "--json", "name,status,conclusion,headBranch,headSha,event",
-              ],
-              check=True,
-              capture_output=True,
-              text=True,
-          )
-          run = json.loads(result.stdout)
-          expected = {
-              "name": "CD",
-              "status": "completed",
-              "conclusion": "success",
-              "headBranch": "main",
-              "event": "workflow_run",
-          }
-          mismatches = {
-              key: (wanted, run.get(key))
-              for key, wanted in expected.items()
-              if run.get(key) != wanted
-          }
-          if mismatches:
-              raise ValueError(
-                  f"Selected run is not a successful main-branch CD run: {mismatches}"
-              )
-          commit = str(run.get("headSha", ""))
-          if not re.fullmatch(r"[0-9a-f]{40}", commit):
-              raise ValueError("Selected CD run did not return a valid source commit SHA.")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write(f"SNAPSHOT_SOURCE_COMMIT={commit}\n")
-          print(f"Verified successful CD run {run_id} on main at {commit}.")
-          PY
-
-      - name: Download the exact validated snapshot bundle
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p data/snapshot-download
-          gh run download "$SNAPSHOT_SOURCE_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name "toronto-snapshot-bundle-$SNAPSHOT_SOURCE_RUN_ID" \
-            --dir data/snapshot-download
-          test -s "$SNAPSHOT_BUNDLE_PATH"
-
-      - name: Refresh canonical SCD2 tables and verify load metadata
-        run: python scripts/snowflake_refresh_raw.py
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            python scripts/replay_snowflake_snapshot_backlog.py \
+              --run-id "$SNAPSHOT_SOURCE_RUN_ID" \
+              --attempt "$SNAPSHOT_SOURCE_RUN_ATTEMPT" \
+              --release-tag "$SNAPSHOT_ARCHIVE_TAG" \
+              --asset-name "$SNAPSHOT_ARCHIVE_ASSET"
+          else
+            python scripts/replay_snowflake_snapshot_backlog.py
+          fi

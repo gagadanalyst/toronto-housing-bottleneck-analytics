@@ -11,6 +11,7 @@ import shutil
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 from zipfile import ZipFile
 
@@ -38,6 +39,7 @@ PIPELINE_NAMES = {
 }
 MAX_SNAPSHOT_AGE = timedelta(hours=36)
 MAX_METADATA_AGE_SECONDS = 36 * 60 * 60
+SNAPSHOT_LEDGER_TABLE = "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
 
 
 def _read_json(value: bytes, label: str) -> dict:
@@ -86,6 +88,40 @@ def _validate_and_extract_bundle(
         bundle = _read_json(archive.read("bundle.json"), "bundle.json")
         if bundle.get("format_version") != 1:
             raise ValueError("Unsupported snapshot bundle format version.")
+        if bundle.get("snapshot_stage") != "raw":
+            raise ValueError(
+                "Canonical Snowflake refresh requires a raw snapshot bundle."
+            )
+        if bundle.get("complete") is not True:
+            raise ValueError("Raw snapshot bundle is incomplete.")
+        if bundle.get("approved_for_warehouse") is not True:
+            raise ValueError(
+                "Raw snapshot bundle is not approved for warehouse loading."
+            )
+        expected_attempt = os.environ.get("SNAPSHOT_SOURCE_RUN_ATTEMPT", "1")
+        if str(bundle.get("source_run_attempt")) != expected_attempt:
+            raise ValueError("Bundle workflow attempt does not match the selected run.")
+        if bundle.get("snapshot_stage") != "raw":
+            raise ValueError(
+                "Canonical Snowflake refresh requires a raw snapshot bundle."
+            )
+        if bundle.get("complete") is not True:
+            raise ValueError("Raw snapshot bundle is incomplete.")
+        if bundle.get("approved_for_warehouse") is not True:
+            raise ValueError(
+                "Raw snapshot bundle is not approved for warehouse loading."
+            )
+
+        expected_attempt = os.environ.get("SNAPSHOT_SOURCE_RUN_ATTEMPT", "")
+        if expected_attempt:
+            if not expected_attempt.isdigit():
+                raise ValueError(
+                    "SNAPSHOT_SOURCE_RUN_ATTEMPT must contain digits only."
+                )
+            if str(bundle.get("source_run_attempt")) != expected_attempt:
+                raise ValueError(
+                    "Bundle workflow attempt does not match the selected run."
+                )
         if str(bundle.get("source_run_id")) != expected_run_id:
             raise ValueError("Bundle run ID does not match the selected CD run.")
         if bundle.get("source_commit") != expected_commit:
@@ -100,11 +136,8 @@ def _validate_and_extract_bundle(
             raise ValueError(
                 "Snapshot extraction timestamp is unexpectedly in the future."
             )
-        if age > MAX_SNAPSHOT_AGE:
-            raise ValueError(
-                "Snapshot is older than 36 hours; select a recent successful CD run "
-                "rather than refreshing canonical RAW from stale data."
-            )
+        # Immutable archives are intentionally replayable beyond 36 hours.
+        # Chronological safety is enforced by the durable processing ledger below.
 
         summaries = bundle.get("sources")
         if not isinstance(summaries, dict):
@@ -161,11 +194,23 @@ def _validate_and_extract_bundle(
                     f"{name}: snapshot is missing required columns: {missing}"
                 )
             if (
-                manifest.get("status") != "success"
-                or manifest.get("warehouse_status") != "loaded"
+                manifest.get("source_name") != name
+                or manifest.get("status") != "success"
+                or manifest.get("warehouse_status") != "not_loaded"
+                or manifest.get("warehouse_eligible") is not True
+                or summary.get("warehouse_eligible") is not True
             ):
                 raise ValueError(
-                    f"{name}: manifest does not record a successful warehouse load."
+                    f"{name}: raw snapshot is not approved and ready for warehouse loading."
+                )
+            if (
+                manifest.get("validation_errors")
+                or manifest.get("warehouse_quality_blockers")
+                or summary.get("validation_errors")
+                or summary.get("warehouse_quality_blockers")
+            ):
+                raise ValueError(
+                    f"{name}: archived manifest/summary contains quality or validation blockers."
                 )
             if manifest.get("warehouse_since") != source.warehouse_since:
                 raise ValueError(
@@ -178,6 +223,14 @@ def _validate_and_extract_bundle(
             extracted_at = _timestamp(
                 manifest.get("extracted_at_utc", ""), f"{name} extracted_at_utc"
             )
+            summary_extracted_at = _timestamp(
+                summary.get("extracted_at_utc", ""),
+                f"{name} bundle summary extracted_at_utc",
+            )
+            if extracted_at != summary_extracted_at:
+                raise ValueError(
+                    f"{name}: manifest and bundle extraction timestamps disagree."
+                )
             if extracted_at < started_at:
                 raise ValueError(
                     f"{name}: snapshot predates this CD extraction marker."
@@ -286,12 +339,14 @@ def _connect_and_preflight(connection_options: dict) -> dict[str, datetime]:
 
 
 def _verify_refresh(
-    connection_options: dict, old_watermarks: dict[str, datetime]
+    connection_options: dict,
+    old_watermarks: dict[str, datetime],
+    expected_sources: tuple[str, ...] = SOURCE_NAMES,
 ) -> None:
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
-        for name in SOURCE_NAMES:
+        for name in expected_sources:
             table = EXPECTED_TABLES[name]
             cursor.execute(
                 f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), "
@@ -307,12 +362,10 @@ def _verify_refresh(
                     f"TORONTO.RAW.{table} post-load SCD2 counts do not reconcile: "
                     f"total={total}, current={current}, expired={expired}"
                 )
-
             cursor.execute(
                 "SELECT MAX(inserted_at), "
                 "DATEDIFF('second', MAX(inserted_at), CURRENT_TIMESTAMP()) "
-                "FROM TORONTO.RAW._DLT_LOADS "
-                "WHERE schema_name = %s AND status = 0",
+                "FROM TORONTO.RAW._DLT_LOADS WHERE schema_name = %s AND status = 0",
                 (PIPELINE_NAMES[name],),
             )
             latest_load, age_seconds = cursor.fetchone()
@@ -320,40 +373,427 @@ def _verify_refresh(
                 raise ValueError(
                     f"{PIPELINE_NAMES[name]} did not record a newer successful load."
                 )
-            if age_seconds is None or int(age_seconds) < 0:
+            if (
+                age_seconds is None
+                or int(age_seconds) < 0
+                or int(age_seconds) > MAX_METADATA_AGE_SECONDS
+            ):
                 raise ValueError(
-                    f"Invalid load-metadata age for {PIPELINE_NAMES[name]}."
-                )
-            if int(age_seconds) > MAX_METADATA_AGE_SECONDS:
-                raise ValueError(
-                    f"Load metadata for {PIPELINE_NAMES[name]} is still stale: "
-                    f"age={int(age_seconds)} seconds."
+                    f"Invalid/stale load metadata for {PIPELINE_NAMES[name]}: {age_seconds}"
                 )
             print(
                 f"Verified TORONTO.RAW.{table}: total={int(total):,}, "
                 f"current={int(current):,}, expired={int(expired or 0):,}; "
-                f"new successful load metadata age={int(age_seconds)} seconds"
+                f"new load metadata age={int(age_seconds)} seconds"
             )
     finally:
         cursor.close()
         connection.close()
 
 
+def _snapshot_order(extracted_at, run_id: str, attempt: str | int):
+    """Return a deterministic chronological key for a snapshot identity."""
+    if not str(run_id).isdigit() or not str(attempt).isdigit():
+        raise ValueError("Snapshot run ID and attempt must contain digits only.")
+    if isinstance(extracted_at, datetime):
+        parsed = extracted_at
+        if parsed.tzinfo is None:
+            raise ValueError("Snapshot timestamps must include a timezone.")
+        parsed = parsed.astimezone(UTC)
+    else:
+        parsed = _timestamp(str(extracted_at), "snapshot extraction timestamp")
+    return parsed, int(run_id), int(attempt)
+
+
+def _prepare_snapshot_ledger(
+    connection_options: dict,
+    *,
+    bundle: dict,
+    run_id: str,
+    attempt: str,
+    commit: str,
+    release_tag: str,
+    asset_name: str,
+) -> dict[str, str]:
+    """Create the durable per-source ledger and enforce chronological replay."""
+    started = _timestamp(
+        bundle.get("extraction_started_at_utc", ""),
+        "bundle extraction_started_at_utc",
+    )
+    current_order = _snapshot_order(started, run_id, attempt)
+    snapshot_id = f"{run_id}:{attempt}"
+    connection = snowflake.connector.connect(**connection_options)
+    cursor = connection.cursor()
+    try:
+        try:
+            cursor.execute(
+                f"""CREATE TABLE IF NOT EXISTS {SNAPSHOT_LEDGER_TABLE} (
+                    SNAPSHOT_ID VARCHAR NOT NULL,
+                    SOURCE_RUN_ID VARCHAR NOT NULL,
+                    SOURCE_RUN_ATTEMPT NUMBER(10,0) NOT NULL,
+                    EXTRACTION_STARTED_AT_UTC TIMESTAMP_TZ NOT NULL,
+                    SOURCE_NAME VARCHAR NOT NULL,
+                    SOURCE_COMMIT VARCHAR NOT NULL,
+                    RELEASE_TAG VARCHAR NOT NULL,
+                    ASSET_NAME VARCHAR NOT NULL,
+                    STATUS VARCHAR NOT NULL,
+                    ERROR VARCHAR,
+                    CREATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+                    UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+                )"""
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot create or access {SNAPSHOT_LEDGER_TABLE}. "
+                "The TORONTO_INGEST_ROLE needs USAGE on database TORONTO and "
+                "schema RAW, plus CREATE TABLE on schema TORONTO.RAW."
+            ) from exc
+
+        cursor.execute(
+            f"""SELECT SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
+                       EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS
+                FROM {SNAPSHOT_LEDGER_TABLE}"""
+        )
+        rows = cursor.fetchall()
+        current_statuses = {
+            str(source_name): str(status).lower()
+            for old_id, _old_run, _old_attempt, _old_started, source_name, status in rows
+            if old_id == snapshot_id
+        }
+        if set(current_statuses) == set(SOURCE_NAMES) and all(
+            status == "succeeded" for status in current_statuses.values()
+        ):
+            return current_statuses
+
+        grouped = {}
+        for row in rows:
+            old_id, old_run, old_attempt, old_started, old_source, old_status = row
+            if old_id == snapshot_id:
+                continue
+            entry = grouped.setdefault(
+                str(old_id),
+                {
+                    "order": _snapshot_order(
+                        old_started, str(old_run), str(old_attempt)
+                    ),
+                    "statuses": {},
+                },
+            )
+            entry["statuses"][str(old_source)] = str(old_status).lower()
+
+        earlier_incomplete = []
+        later_started = []
+        for old_id, entry in grouped.items():
+            statuses = entry["statuses"]
+            old_order = entry["order"]
+            if old_order < current_order:
+                missing = sorted(set(SOURCE_NAMES) - statuses.keys())
+                if missing or any(
+                    statuses.get(name) != "succeeded" for name in SOURCE_NAMES
+                ):
+                    earlier_incomplete.append((old_id, statuses, missing))
+            elif old_order > current_order:
+                later_started.extend(
+                    (old_id, name, status)
+                    for name, status in statuses.items()
+                    if status != "pending"
+                )
+
+        if earlier_incomplete:
+            raise RuntimeError(
+                "Snowflake replay blocked by earlier archived snapshots that do not "
+                "have both source loads recorded as succeeded: "
+                f"{earlier_incomplete}"
+            )
+        if later_started:
+            raise RuntimeError(
+                "Out-of-order Snowflake replay rejected because a newer snapshot has "
+                "a non-pending source status (its warehouse write may have committed): "
+                f"{later_started}"
+            )
+
+        for name in SOURCE_NAMES:
+            cursor.execute(
+                f"""MERGE INTO {SNAPSHOT_LEDGER_TABLE} AS target
+                    USING (
+                        SELECT %s AS SNAPSHOT_ID,
+                               %s AS SOURCE_RUN_ID,
+                               %s::NUMBER(10,0) AS SOURCE_RUN_ATTEMPT,
+                               TO_TIMESTAMP_TZ(%s) AS EXTRACTION_STARTED_AT_UTC,
+                               %s AS SOURCE_NAME,
+                               %s AS SOURCE_COMMIT,
+                               %s AS RELEASE_TAG,
+                               %s AS ASSET_NAME
+                    ) AS incoming
+                    ON target.SNAPSHOT_ID = incoming.SNAPSHOT_ID
+                       AND target.SOURCE_NAME = incoming.SOURCE_NAME
+                    WHEN MATCHED THEN UPDATE SET
+                        SOURCE_RUN_ID = incoming.SOURCE_RUN_ID,
+                        SOURCE_RUN_ATTEMPT = incoming.SOURCE_RUN_ATTEMPT,
+                        EXTRACTION_STARTED_AT_UTC = incoming.EXTRACTION_STARTED_AT_UTC,
+                        SOURCE_COMMIT = incoming.SOURCE_COMMIT,
+                        RELEASE_TAG = incoming.RELEASE_TAG,
+                        ASSET_NAME = incoming.ASSET_NAME,
+                        STATUS = IFF(LOWER(target.STATUS) = 'succeeded', target.STATUS, 'pending'),
+                        ERROR = IFF(LOWER(target.STATUS) = 'succeeded', target.ERROR, NULL),
+                        UPDATED_AT = CURRENT_TIMESTAMP()
+                    WHEN NOT MATCHED THEN INSERT (
+                        SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
+                        EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, SOURCE_COMMIT,
+                        RELEASE_TAG, ASSET_NAME, STATUS, ERROR
+                    ) VALUES (
+                        incoming.SNAPSHOT_ID, incoming.SOURCE_RUN_ID,
+                        incoming.SOURCE_RUN_ATTEMPT, incoming.EXTRACTION_STARTED_AT_UTC,
+                        incoming.SOURCE_NAME, incoming.SOURCE_COMMIT,
+                        incoming.RELEASE_TAG, incoming.ASSET_NAME, 'pending', NULL
+                    )""",
+                (
+                    snapshot_id,
+                    run_id,
+                    int(attempt),
+                    started.isoformat(),
+                    name,
+                    commit,
+                    release_tag,
+                    asset_name,
+                ),
+            )
+
+        cursor.execute(
+            f"SELECT SOURCE_NAME, STATUS FROM {SNAPSHOT_LEDGER_TABLE} WHERE SNAPSHOT_ID = %s",
+            (snapshot_id,),
+        )
+        statuses = {
+            str(name): str(status).lower() for name, status in cursor.fetchall()
+        }
+        missing = sorted(set(SOURCE_NAMES) - statuses.keys())
+        if missing:
+            raise RuntimeError(
+                f"Snowflake snapshot ledger did not register every source: {missing}"
+            )
+        return statuses
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def _completed_snapshot_ids(connection_options: dict) -> set[str]:
+    """Return only snapshots with both source loads durably marked succeeded."""
+    connection = snowflake.connector.connect(**connection_options)
+    cursor = connection.cursor()
+    try:
+        try:
+            cursor.execute(
+                f"""CREATE TABLE IF NOT EXISTS {SNAPSHOT_LEDGER_TABLE} (
+                SNAPSHOT_ID VARCHAR NOT NULL,
+                SOURCE_RUN_ID VARCHAR NOT NULL,
+                SOURCE_RUN_ATTEMPT NUMBER(10,0) NOT NULL,
+                EXTRACTION_STARTED_AT_UTC TIMESTAMP_TZ NOT NULL,
+                SOURCE_NAME VARCHAR NOT NULL,
+                SOURCE_COMMIT VARCHAR NOT NULL,
+                RELEASE_TAG VARCHAR NOT NULL,
+                ASSET_NAME VARCHAR NOT NULL,
+                STATUS VARCHAR NOT NULL,
+                ERROR VARCHAR,
+                CREATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+                UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+            )"""
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot create or access {SNAPSHOT_LEDGER_TABLE}. "
+                "TORONTO_INGEST_ROLE needs USAGE on database TORONTO and "
+                "schema RAW, plus CREATE TABLE on schema TORONTO.RAW."
+            ) from exc
+        cursor.execute(
+            f"SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS FROM {SNAPSHOT_LEDGER_TABLE}"
+        )
+        grouped: dict[str, dict[str, str]] = {}
+        for snapshot_id, source_name, status in cursor.fetchall():
+            grouped.setdefault(str(snapshot_id), {})[str(source_name)] = str(
+                status
+            ).lower()
+        return {
+            snapshot_id
+            for snapshot_id, statuses in grouped.items()
+            if set(statuses) == set(SOURCE_NAMES)
+            and all(statuses[name] == "succeeded" for name in SOURCE_NAMES)
+        }
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def _set_snapshot_source_status(
+    connection_options: dict,
+    *,
+    snapshot_id: str,
+    source_name: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Update and verify one per-source ledger status."""
+    allowed = {"pending", "loading", "succeeded", "failed"}
+    if status not in allowed:
+        raise ValueError(f"Unsupported snapshot ledger status: {status!r}")
+    connection = snowflake.connector.connect(**connection_options)
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            f"""UPDATE {SNAPSHOT_LEDGER_TABLE}
+                SET STATUS = %s, ERROR = %s, UPDATED_AT = CURRENT_TIMESTAMP()
+                WHERE SNAPSHOT_ID = %s AND SOURCE_NAME = %s""",
+            (status, error, snapshot_id, source_name),
+        )
+        cursor.execute(
+            f"SELECT STATUS FROM {SNAPSHOT_LEDGER_TABLE} "
+            "WHERE SNAPSHOT_ID = %s AND SOURCE_NAME = %s",
+            (snapshot_id, source_name),
+        )
+        row = cursor.fetchone()
+        if not row or str(row[0]).lower() != status:
+            raise RuntimeError(
+                f"Could not verify ledger status {status!r} for "
+                f"{snapshot_id}/{source_name}."
+            )
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def _assert_canonical_replay_baseline(connection_options: dict) -> None:
+    """Require an explicitly identified, complete promoted Snowflake baseline."""
+    if os.environ.get("TORONTO_CANONICAL_REPLAY_ENABLED", "").lower() != "true":
+        raise RuntimeError(
+            "Canonical Snowflake replay is disabled until the isolated historical "
+            "rebuild, DuckDB/Snowflake parity validation, and controlled promotion "
+            "are complete."
+        )
+
+    baseline_id = os.environ.get("TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID", "")
+    expected_count_text = os.environ.get(
+        "TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT", ""
+    )
+    if not re.fullmatch(r"[0-9]+:[0-9]+", baseline_id):
+        raise RuntimeError(
+            "TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID must be run_id:attempt."
+        )
+    if not expected_count_text.isdigit() or int(expected_count_text) < 1:
+        raise RuntimeError(
+            "TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT must be a positive integer."
+        )
+    expected_count = int(expected_count_text)
+
+    connection = snowflake.connector.connect(**connection_options)
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM TORONTO.INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = 'RAW' "
+            "AND TABLE_NAME = 'TORONTO_SNAPSHOT_LEDGER'"
+        )
+        row = cursor.fetchone()
+        if not row or int(row[0] or 0) != 1:
+            raise RuntimeError(
+                "TORONTO.RAW has no promoted snapshot ledger. Do not bootstrap the "
+                "canonical ledger from an empty state; rebuild in an isolated schema."
+            )
+        cursor.execute(
+            "SELECT SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT, "
+            "EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS "
+            "FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
+        )
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        connection.close()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for snapshot_id, run_id, attempt, started, source_name, status in rows:
+        if isinstance(started, datetime):
+            timestamp = started.astimezone(UTC)
+        else:
+            timestamp = _timestamp(str(started), "ledger extraction timestamp")
+        entry = grouped.setdefault(
+            str(snapshot_id),
+            {
+                "order": (timestamp, int(run_id), int(attempt)),
+                "statuses": {},
+            },
+        )
+        row_order = (timestamp, int(run_id), int(attempt))
+        if entry["order"] != row_order:
+            raise RuntimeError(
+                f"Inconsistent identity metadata for Snowflake snapshot {snapshot_id}."
+            )
+        source_key = str(source_name)
+        if source_key in entry["statuses"]:
+            raise RuntimeError(
+                f"Duplicate Snowflake baseline ledger entry for {snapshot_id}/{source_key}."
+            )
+        if source_key not in SOURCE_NAMES:
+            raise RuntimeError(
+                f"Unexpected source name in Snowflake snapshot ledger: {source_key}."
+            )
+        entry["statuses"][source_key] = str(status).lower()
+
+    baseline = grouped.get(baseline_id)
+    if baseline is None:
+        raise RuntimeError(
+            f"Promoted baseline snapshot {baseline_id} is absent from the Snowflake ledger."
+        )
+    baseline_order = baseline["order"]
+    through_baseline = {
+        snapshot_id: entry
+        for snapshot_id, entry in grouped.items()
+        if entry["order"] <= baseline_order
+    }
+    completed = {
+        snapshot_id
+        for snapshot_id, entry in through_baseline.items()
+        if set(entry["statuses"]) == set(SOURCE_NAMES)
+        and all(entry["statuses"].get(name) == "succeeded" for name in SOURCE_NAMES)
+    }
+    if len(through_baseline) != expected_count or len(completed) != expected_count:
+        raise RuntimeError(
+            "Promoted Snowflake baseline ledger coverage does not match the declared "
+            f"baseline: expected {expected_count} complete snapshots through "
+            f"{baseline_id}, found {len(through_baseline)} ledger snapshots and "
+            f"{len(completed)} fully completed snapshots."
+        )
+    if baseline_id not in completed:
+        raise RuntimeError(
+            f"Promoted baseline snapshot {baseline_id} is not complete for both sources."
+        )
+
+
 def main() -> None:
     credentials = os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS", "")
+    dataset = os.environ.get("TORONTO_WAREHOUSE_DATASET", "RAW").upper()
     if not credentials:
-        raise ValueError("TORONTO_WAREHOUSE_CREDENTIALS is required.")
+        raise ValueError("SNOWFLAKE_DLT_CONNECTION is missing.")
     if os.environ.get("TORONTO_WAREHOUSE_KIND", "").lower() != "snowflake":
-        raise ValueError("TORONTO_WAREHOUSE_KIND must be snowflake.")
-    if os.environ.get("TORONTO_WAREHOUSE_DATASET", "").upper() != "RAW":
+        raise ValueError("TORONTO_WAREHOUSE_KIND must be 'snowflake'.")
+    if dataset != "RAW":
         raise ValueError("Refusing to load outside canonical dataset TORONTO.RAW.")
 
     run_id = os.environ.get("SNAPSHOT_SOURCE_RUN_ID", "")
+    attempt = os.environ.get("SNAPSHOT_SOURCE_RUN_ATTEMPT", "1")
     commit = os.environ.get("SNAPSHOT_SOURCE_COMMIT", "")
-    if not re.fullmatch(r"[0-9]+", run_id):
-        raise ValueError("SNAPSHOT_SOURCE_RUN_ID must contain digits only.")
+    release_tag = os.environ.get("SNAPSHOT_ARCHIVE_TAG", "")
+    asset_name = os.environ.get("SNAPSHOT_ARCHIVE_ASSET", "")
+    if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
+        raise ValueError("Snapshot source run ID and attempt must contain digits only.")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("SNAPSHOT_SOURCE_COMMIT must be a full commit SHA.")
+    if not re.fullmatch(r"toronto-raw-snapshot-archive-[0-9]{4}-[0-9]{2}", release_tag):
+        raise ValueError(
+            "SNAPSHOT_ARCHIVE_TAG must identify a monthly raw archive Release."
+        )
+    if asset_name != f"toronto-raw-snapshot-bundle-{run_id}-{attempt}.zip":
+        raise ValueError(
+            "Archive asset name does not match the selected run and attempt."
+        )
 
     app = load_config(Path("open_data_config.yml"))
     sources = {source.name: source for source in app.sources}
@@ -371,35 +811,106 @@ def main() -> None:
 
     bundle_path = Path(os.environ.get("SNAPSHOT_BUNDLE_PATH", ""))
     if not bundle_path.is_file() or bundle_path.stat().st_size == 0:
-        raise FileNotFoundError(f"Snapshot bundle is missing or empty: {bundle_path}")
+        raise FileNotFoundError(
+            f"Validated raw snapshot archive is missing: {bundle_path}"
+        )
 
     with tempfile.TemporaryDirectory(prefix="toronto-snowflake-raw-refresh-") as temp:
         root = Path(temp)
         extracted = root / "snapshot"
-        _validate_and_extract_bundle(bundle_path, extracted, sources, run_id, commit)
+        bundle = _validate_and_extract_bundle(
+            bundle_path, extracted, sources, run_id, commit
+        )
+        bundle_started = _timestamp(
+            bundle.get("extraction_started_at_utc", ""),
+            "bundle extraction_started_at_utc",
+        )
+        expected_tag = f"toronto-raw-snapshot-archive-{bundle_started:%Y-%m}"
+        if release_tag != expected_tag:
+            raise ValueError(
+                f"Monthly archive Release does not match bundle UTC month: "
+                f"{release_tag!r} != {expected_tag!r}."
+            )
+
         key_path = root / "snowflake_key.p8"
         connection_options = _snowflake_connection_options(credentials, key_path)
+        _assert_canonical_replay_baseline(connection_options)
         old_watermarks = _connect_and_preflight(connection_options)
+        statuses = _prepare_snapshot_ledger(
+            connection_options,
+            bundle=bundle,
+            run_id=run_id,
+            attempt=attempt,
+            commit=commit,
+            release_tag=release_tag,
+            asset_name=asset_name,
+        )
+        snapshot_id = f"{run_id}:{attempt}"
+        failures: list[str] = []
 
         for name in SOURCE_NAMES:
-            result = load_scd2(
-                credentials=credentials,
-                snapshot_path=extracted / name / "data.parquet",
-                source=sources[name],
-                dataset_name="RAW",
-                destination_kind="snowflake",
-                pipeline_name=PIPELINE_NAMES[name],
-            )
-            print(
-                f"Loaded {name} into TORONTO.RAW.{result.table_name} "
-                "using the validated CD snapshot."
-            )
+            if statuses[name] == "succeeded":
+                print(
+                    f"Skipping {name}: immutable snapshot {snapshot_id} is already loaded."
+                )
+                continue
 
-        _verify_refresh(connection_options, old_watermarks)
+            _set_snapshot_source_status(
+                connection_options,
+                snapshot_id=snapshot_id,
+                source_name=name,
+                status="loading",
+            )
+            try:
+                manifest_path = extracted / name / "manifest.json"
+                manifest = _read_json(manifest_path.read_bytes(), manifest_path.name)
+                boundary_timestamp = _timestamp(
+                    manifest.get("extracted_at_utc", ""),
+                    f"{name} extracted_at_utc",
+                ).isoformat()
+                result = load_scd2(
+                    credentials=credentials,
+                    snapshot_path=extracted / name / "data.parquet",
+                    source=sources[name],
+                    dataset_name="RAW",
+                    destination_kind="snowflake",
+                    pipeline_name=PIPELINE_NAMES[name],
+                    boundary_timestamp=boundary_timestamp,
+                )
+                _verify_refresh(connection_options, old_watermarks, (name,))
+                _set_snapshot_source_status(
+                    connection_options,
+                    snapshot_id=snapshot_id,
+                    source_name=name,
+                    status="succeeded",
+                )
+                print(
+                    f"Loaded {name} into TORONTO.RAW.{result.table_name} "
+                    f"with boundary_timestamp={boundary_timestamp}."
+                )
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"[:4000]
+                try:
+                    _set_snapshot_source_status(
+                        connection_options,
+                        snapshot_id=snapshot_id,
+                        source_name=name,
+                        status="failed",
+                        error=message,
+                    )
+                except Exception as ledger_exc:
+                    message += f"; ledger update also failed: {type(ledger_exc).__name__}: {ledger_exc}"
+                failures.append(f"{name}: {message}")
+
+        if failures:
+            raise RuntimeError(
+                "Snowflake snapshot was only partially processed; retrying the same "
+                "immutable archive resumes unfinished sources. " + "; ".join(failures)
+            )
 
     print(
-        f"SNOWFLAKE CANONICAL RAW REFRESH PASSED: source CD run {run_id}; "
-        "both SCD2 tables and successful load metadata verified."
+        f"SNOWFLAKE CANONICAL RAW REFRESH PASSED: run {run_id}, attempt {attempt}; "
+        "both source ledger entries are succeeded."
     )
 
 

@@ -18,7 +18,7 @@ from toronto_housing_ingestion.config import SourceConfig, load_config
 from toronto_housing_ingestion.dlt_loader import load_scd2
 
 SOURCE_NAMES = ("active_permits", "cleared_permits")
-DATASET_PATTERN = re.compile(r"SNOWFLAKE_BASELINE_[0-9]+")
+DATASET_PATTERN = re.compile(r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+_[0-9]+")
 
 
 def _sha256(path: Path) -> str:
@@ -363,8 +363,23 @@ def main() -> None:
         )
     )
     dataset = os.environ.get("TORONTO_WAREHOUSE_DATASET", "").upper()
-    if not DATASET_PATTERN.fullmatch(dataset):
-        raise ValueError("Refusing to load outside SNOWFLAKE_BASELINE_<source-run-id>.")
+    run_id = os.environ.get("SNAPSHOT_SOURCE_RUN_ID", "")
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+
+    for label, value in (
+        ("snapshot run ID", run_id),
+        ("GitHub workflow run ID", workflow_run_id),
+        ("GitHub workflow attempt", attempt),
+    ):
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError(f"{label} must contain digits only.")
+
+    expected_dataset = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
+    if not DATASET_PATTERN.fullmatch(dataset) or dataset != expected_dataset:
+        raise ValueError(
+            f"Refusing to load outside the unique expected schema {expected_dataset}."
+        )
 
     app = load_config(Path("open_data_config.yml"))
     if app.warehouse_kind != "snowflake" or not app.warehouse_credentials:
@@ -384,7 +399,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="toronto-snowflake-baseline-") as temp:
         bundle = _validate_and_extract(bundle_path, Path(temp), sources)
         probe = dlt.pipeline(
-            pipeline_name=f"toronto_baseline_probe_{dataset.lower()}",
+            pipeline_name=f"toronto_baseline_probe_{workflow_run_id}_{attempt}",
             destination=dlt.destinations.snowflake(
                 credentials=app.warehouse_credentials, use_timestamp_tz=False
             ),
@@ -402,6 +417,7 @@ def main() -> None:
                 source=source,
                 dataset_name=dataset,
                 destination_kind="snowflake",
+                pipeline_name=f"toronto_{name}_baseline_{workflow_run_id}_{attempt}",
             )
             counts = _count_rows(probe, source.warehouse_table)
             if counts[0] < 1 or counts[1] < 1 or counts[0] != counts[1] + counts[2]:
@@ -423,6 +439,7 @@ def main() -> None:
                 source=source,
                 dataset_name=dataset,
                 destination_kind="snowflake",
+                pipeline_name=f"toronto_{name}_baseline_{workflow_run_id}_{attempt}",
             )
             after = _count_rows(probe, source.warehouse_table)
             if after != baseline_counts[name]:

@@ -112,7 +112,10 @@ def _write_bundle(
         manifest = {
             "source_name": name,
             "status": "success",
-            "warehouse_status": "loaded",
+            "warehouse_status": "not_loaded",
+            "warehouse_eligible": True,
+            "warehouse_quality_blockers": [],
+            "validation_errors": [],
             "sha256": digest,
             "row_count": 1,
             "columns": columns,
@@ -126,10 +129,18 @@ def _write_bundle(
             "sha256": digest,
             "row_count": 1,
             "columns": columns,
+            "warehouse_eligible": True,
+            "warehouse_quality_blockers": [],
+            "validation_errors": [],
+            "extracted_at_utc": extracted.isoformat(),
         }
 
     bundle = {
         "format_version": 1,
+        "snapshot_stage": "raw",
+        "complete": True,
+        "approved_for_warehouse": True,
+        "source_run_attempt": "1",
         "source_run_id": RUN_ID,
         "source_commit": COMMIT,
         "extraction_started_at_utc": started.isoformat(),
@@ -165,6 +176,16 @@ def _rewrite_bundle(
     return destination
 
 
+def test_snapshot_order_uses_timestamp_then_run_and_attempt() -> None:
+    first = refresh._snapshot_order(
+        datetime(2026, 11, 7, 15, 0, tzinfo=UTC), "100", "1"
+    )
+    second = refresh._snapshot_order(
+        datetime(2026, 11, 7, 15, 1, tzinfo=UTC), "99", "9"
+    )
+    assert first < second
+
+
 def test_valid_recent_bundle_is_validated_and_extracted(tmp_path: Path) -> None:
     bundle_path = _write_bundle(tmp_path / "bundle.zip")
 
@@ -184,12 +205,82 @@ def test_validator_rejects_wrong_selected_run_id(tmp_path: Path) -> None:
         _validate(bundle_path, tmp_path, run_id="999999999")
 
 
-def test_validator_rejects_stale_snapshot(tmp_path: Path) -> None:
-    started = datetime.now(UTC) - timedelta(hours=37)
-    bundle_path = _write_bundle(tmp_path / "stale.zip", extraction_started_at=started)
+def test_validator_rejects_unapproved_raw_bundle(tmp_path: Path) -> None:
+    bundle_path = _write_bundle(tmp_path / "bundle.zip")
+    with ZipFile(bundle_path) as archive:
+        bundle = json.loads(archive.read("bundle.json"))
 
-    with pytest.raises(ValueError, match="older than 36 hours"):
-        _validate(bundle_path, tmp_path)
+    bundle["approved_for_warehouse"] = False
+    bad_bundle = _rewrite_bundle(
+        bundle_path,
+        tmp_path / "unapproved.zip",
+        replacements={"bundle.json": json.dumps(bundle).encode()},
+    )
+
+    with pytest.raises(ValueError, match="not approved"):
+        _validate(bad_bundle, tmp_path)
+
+
+def test_validator_accepts_historical_snapshot_for_ordered_replay(
+    tmp_path: Path,
+) -> None:
+    started = datetime.now(UTC) - timedelta(days=45)
+    bundle_path = _write_bundle(
+        tmp_path / "historical.zip", extraction_started_at=started
+    )
+
+    bundle = _validate(bundle_path, tmp_path)
+
+    assert bundle["source_run_id"] == RUN_ID
+    assert bundle["extraction_started_at_utc"] == started.isoformat()
+
+
+def _rewrite_json_member(
+    original: Path, destination: Path, member: str, mutate
+) -> Path:
+    with (
+        ZipFile(original) as source,
+        ZipFile(destination, "w", compression=ZIP_STORED) as target,
+    ):
+        for name in source.namelist():
+            value = source.read(name)
+            if name == member:
+                payload = json.loads(value)
+                mutate(payload)
+                value = json.dumps(payload).encode()
+            target.writestr(name, value)
+    return destination
+
+
+def test_validator_rejects_manifest_timestamp_mismatch(tmp_path: Path) -> None:
+    bundle_path = _write_bundle(tmp_path / "bundle.zip")
+    bad_bundle = _rewrite_json_member(
+        bundle_path,
+        tmp_path / "timestamp-mismatch.zip",
+        "active_permits/manifest.json",
+        lambda manifest: manifest.update(
+            {"extracted_at_utc": "2026-11-07T16:00:00+00:00"}
+        ),
+    )
+    with pytest.raises(ValueError, match="timestamps disagree"):
+        _validate(bad_bundle, tmp_path)
+
+
+def test_validator_rejects_quality_blocker_even_when_bundle_claims_approval(
+    tmp_path: Path,
+) -> None:
+    bundle_path = _write_bundle(tmp_path / "bundle.zip")
+    bad_bundle = _rewrite_json_member(
+        bundle_path,
+        tmp_path / "quality-blocked.zip",
+        "active_permits/manifest.json",
+        lambda manifest: manifest.update(
+            {"warehouse_quality_blockers": ["test_blocker"]}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="quality or validation blockers"):
+        _validate(bad_bundle, tmp_path)
 
 
 def test_validator_rejects_snapshot_checksum_mismatch(tmp_path: Path) -> None:
@@ -291,11 +382,20 @@ def test_failed_preflight_prevents_both_table_loads(
     monkeypatch.setattr(
         refresh, "load_config", lambda path: SimpleNamespace(sources=sources)
     )
-    monkeypatch.setattr(refresh, "_validate_and_extract_bundle", lambda *args: {})
+    monkeypatch.setattr(
+        refresh,
+        "_validate_and_extract_bundle",
+        lambda *args: {"extraction_started_at_utc": "2026-11-07T15:00:00+00:00"},
+    )
     monkeypatch.setattr(
         refresh,
         "_snowflake_connection_options",
         lambda credentials, key_path: {},
+    )
+    monkeypatch.setattr(
+        refresh,
+        "_assert_canonical_replay_baseline",
+        lambda options: None,
     )
     monkeypatch.setattr(
         refresh,
@@ -317,7 +417,13 @@ def test_failed_preflight_prevents_both_table_loads(
     monkeypatch.setenv("TORONTO_WAREHOUSE_KIND", "snowflake")
     monkeypatch.setenv("TORONTO_WAREHOUSE_DATASET", "RAW")
     monkeypatch.setenv("SNAPSHOT_SOURCE_RUN_ID", RUN_ID)
+    monkeypatch.setenv("SNAPSHOT_SOURCE_RUN_ATTEMPT", "1")
     monkeypatch.setenv("SNAPSHOT_SOURCE_COMMIT", COMMIT)
+    monkeypatch.setenv("SNAPSHOT_ARCHIVE_TAG", "toronto-raw-snapshot-archive-2026-11")
+    monkeypatch.setenv(
+        "SNAPSHOT_ARCHIVE_ASSET",
+        f"toronto-raw-snapshot-bundle-{RUN_ID}-1.zip",
+    )
     monkeypatch.setenv("SNAPSHOT_BUNDLE_PATH", str(bundle))
 
     with pytest.raises(RuntimeError, match="preflight failed"):

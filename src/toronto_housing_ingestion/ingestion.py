@@ -60,19 +60,27 @@ def check_freshness(
     return "fresh" if age <= timedelta(hours=48) else "stale"
 
 
-def load_latest_manifest(
+def load_latest_manifest_entry(
     manifest_root: Path, source_name: str
-) -> dict[str, Any] | None:
-    """Return the newest successful/skipped/extracted manifest."""
+) -> tuple[Path, dict[str, Any]] | None:
+    """Return the newest usable manifest together with its file path."""
     paths = sorted((manifest_root / source_name).glob("*.json"), reverse=True)
     for path in paths:
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except OSError, json.JSONDecodeError:
             continue
         if value.get("status") in {"success", "skipped", "extracted", "load_failed"}:
-            return value
+            return path, value
     return None
+
+
+def load_latest_manifest(
+    manifest_root: Path, source_name: str
+) -> dict[str, Any] | None:
+    """Return the newest usable manifest."""
+    entry = load_latest_manifest_entry(manifest_root, source_name)
+    return entry[1] if entry else None
 
 
 def source_has_changed(
@@ -87,8 +95,15 @@ def source_has_changed(
     if not previous:
         return True
 
-    # A failed warehouse load must not be treated as an unchanged successful run.
+    # Extracted snapshots not yet loaded, or whose load failed, must be retried.
     if previous.get("status") == "load_failed":
+        return True
+    if previous.get("warehouse_status") in {
+        "not_loaded",
+        "loading",
+        "failed",
+        "blocked",
+    }:
         return True
 
     for key in ("resource_id",):
@@ -112,6 +127,38 @@ def source_has_changed(
         if str(old) != str(new):
             return True
     return not compared
+
+
+def load_persisted_snapshot_manifest(
+    app: config.AppConfig, source_name: str
+) -> dict[str, Any] | None:
+    """Load the last successfully published DuckDB source manifest, if present."""
+    if app.warehouse_kind != "duckdb":
+        return None
+    try:
+        import duckdb
+
+        with duckdb.connect(app.warehouse_credentials, read_only=True) as connection:
+            connection.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = 'raw' AND table_name = 'toronto_source_snapshot_metadata'"
+            )
+            if not connection.fetchone()[0]:
+                return None
+            row = connection.execute(
+                "SELECT manifest_json FROM raw.toronto_source_snapshot_metadata "
+                "WHERE source_name = ?",
+                [source_name],
+            ).fetchone()
+        return json.loads(row[0]) if row else None
+    except Exception as exc:
+        utils.log_event(
+            logging.WARNING,
+            "persisted_snapshot_metadata_unavailable",
+            source_name=source_name,
+            error=str(exc),
+        )
+        return None
 
 
 def detect_schema_drift(
@@ -263,6 +310,13 @@ def ingest_source(
         )
 
     previous = load_latest_manifest(manifest_root, source.name)
+    if (
+        previous is None
+        or previous.get("baseline_kind") == "previous_published_full_source_parquet"
+    ):
+        persisted_previous = load_persisted_snapshot_manifest(app, source.name)
+        if persisted_previous is not None:
+            previous = persisted_previous
     columns = probe["field_names"] if probe else []
     if columns:
         missing = [
@@ -349,11 +403,29 @@ def ingest_source(
     for warning in warnings:
         utils.log_event(logging.WARNING, warning["type"], **warning)
 
+    quality_blockers: list[str] = []
+    row_count_change_percent: float | None = None
+
+    missing_required_columns = sorted(
+        column
+        for column in source.required_columns
+        if column.lower() not in {name.lower() for name in columns}
+    )
+    if missing_required_columns:
+        quality_blockers.append("missing_required_columns")
+
     if source.min_row_count is not None and row_count < source.min_row_count:
-        raise RuntimeError(
-            f"{source.name}: only {row_count} rows extracted; "
-            f"minimum is {source.min_row_count}."
+        quality_blockers.append("below_minimum_row_count")
+        utils.log_event(
+            logging.WARNING,
+            "row_count_below_minimum",
+            source_name=source.name,
+            minimum_rows=source.min_row_count,
+            current_rows=row_count,
         )
+
+    if row_count == 0:
+        quality_blockers.append("empty_snapshot")
 
     if (
         previous
@@ -362,15 +434,28 @@ def ingest_source(
     ):
         previous_rows = int(previous["row_count"])
         change = abs(row_count - previous_rows) / previous_rows * 100
+        row_count_change_percent = round(change, 2)
+
         if change > source.max_row_change_percent:
+            quality_blockers.append("row_count_change_exceeded")
             utils.log_event(
                 logging.WARNING,
                 "row_count_anomaly",
                 source_name=source.name,
                 previous_rows=previous_rows,
                 current_rows=row_count,
-                change_percent=round(change, 2),
+                change_percent=row_count_change_percent,
             )
+
+    # Conflicting duplicates are handled by the loader's SCD2 quarantine.
+    # Null or missing business-key values are not safe to merge.
+    if any(
+        warning.get("type") in {"missing_key", "missing_key_columns"}
+        for warning in warnings
+    ):
+        quality_blockers.append("invalid_business_keys")
+
+    warehouse_eligible = not quality_blockers
 
     manifest = {
         "status": "extracted",
@@ -389,6 +474,11 @@ def ingest_source(
         "column_count": len(columns),
         "columns": columns,
         "primary_key": list(source.primary_key),
+        "required_columns": list(source.required_columns),
+        "warehouse_eligible": warehouse_eligible,
+        "warehouse_quality_blockers": quality_blockers,
+        "missing_required_columns": missing_required_columns,
+        "row_count_change_percent": row_count_change_percent,
         "warehouse_since": source.warehouse_since,
         "warehouse_date_column": source.warehouse_date_column,
         "quality_warnings": warnings,
@@ -409,6 +499,20 @@ def ingest_source(
         manifest["status"] = "success"
         _write_manifest(manifest_path, manifest)
         return manifest
+
+    if not warehouse_eligible:
+        manifest.update(
+            {
+                "status": "success",
+                "warehouse_status": "blocked",
+                "warehouse_blocked_at_utc": datetime.now(UTC).isoformat(),
+            }
+        )
+        _write_manifest(manifest_path, manifest)
+        raise RuntimeError(
+            f"{source.name}: raw snapshot was preserved, but quality checks "
+            f"blocked its warehouse load: {quality_blockers}"
+        )
 
     try:
         result = load_scd2(
@@ -451,8 +555,50 @@ def ingest_source(
             "duration_seconds": round(time.monotonic() - started_monotonic, 3),
         }
     )
+
+    if result.quarantined_business_keys:
+        manifest["scd2_quarantine"] = {
+            "reason": "conflicting_scd2_tracked_values",
+            "business_key_count": len(result.quarantined_business_keys),
+            "source_row_count": result.quarantined_row_count,
+            "business_keys": list(result.quarantined_business_keys),
+        }
+        utils.log_event(
+            logging.WARNING,
+            "scd2_keys_quarantined",
+            source_name=source.name,
+            business_key_count=len(result.quarantined_business_keys),
+            source_row_count=result.quarantined_row_count,
+        )
+
     _write_manifest(manifest_path, manifest)
     return manifest
+
+
+def _reject_direct_canonical_load(app: config.AppConfig, *, extract_only: bool) -> None:
+    """Force canonical warehouse mutations through the archive-first replay path."""
+    if extract_only:
+        return
+
+    project_root = Path(__file__).resolve().parents[2]
+    if app.warehouse_kind.lower() == "duckdb":
+        configured_path = Path(app.warehouse_credentials)
+        if not configured_path.is_absolute():
+            configured_path = project_root / configured_path
+        canonical_path = project_root / "data/warehouse/toronto.duckdb"
+        if configured_path.resolve() == canonical_path.resolve():
+            raise RuntimeError(
+                "Direct toronto-ingest writes to the canonical DuckDB database are "
+                "disabled. Use --extract-only for extraction, then replay the immutable "
+                "archive with scripts/load_duckdb_snapshot.py --backlog."
+            )
+
+    if app.warehouse_kind.lower() == "snowflake" and app.dataset_name.upper() == "RAW":
+        raise RuntimeError(
+            "Direct toronto-ingest writes to canonical Snowflake TORONTO.RAW are "
+            "disabled. Use the archive-first Snowflake replay workflow so its baseline "
+            "gate, per-source ledger, and chronological checks run."
+        )
 
 
 def main() -> int:
@@ -463,6 +609,7 @@ def main() -> int:
         raise SystemExit("--extract-only and --local-load cannot be used together.")
 
     app = config.load_config(args.config)
+    _reject_direct_canonical_load(app, extract_only=args.extract_only)
     source_map = {source.name: source for source in app.sources}
     selected_names = args.source or list(source_map)
     unknown = sorted(set(selected_names) - set(source_map))
@@ -475,19 +622,139 @@ def main() -> int:
             ensure_duckdb_database(app.warehouse_credentials, app.dataset_name)
 
         if args.local_load:
+            load_failures = 0
+
             for name in selected_names:
                 source = source_map[name]
-                manifest = load_latest_manifest(args.manifest_root, name)
-                if not manifest or not manifest.get("raw_path"):
-                    raise RuntimeError(f"{name}: no local snapshot is available.")
-                load_scd2(
-                    credentials=app.warehouse_credentials,
-                    snapshot_path=manifest["raw_path"],
-                    source=source,
-                    dataset_name=app.dataset_name,
-                    destination_kind=app.warehouse_kind,
-                )
-            return 0
+                if not source.warehouse_load:
+                    continue
+
+                manifest_path: Path | None = None
+                manifest: dict[str, Any] | None = None
+
+                try:
+                    entry = load_latest_manifest_entry(args.manifest_root, name)
+                    if entry is None:
+                        raise RuntimeError(
+                            f"{name}: no local extraction manifest is available."
+                        )
+
+                    manifest_path, manifest = entry
+
+                    if manifest.get("status") != "success":
+                        raise RuntimeError(
+                            f"{name}: latest extraction was not successful."
+                        )
+
+                    if manifest.get("warehouse_status") == "loaded":
+                        utils.log_event(
+                            logging.INFO,
+                            "warehouse_load_already_complete",
+                            source_name=name,
+                        )
+                        continue
+
+                    if not manifest.get("warehouse_eligible", False):
+                        raise RuntimeError(
+                            f"{name}: snapshot is not approved for warehouse loading; "
+                            f"blockers={manifest.get('warehouse_quality_blockers', [])}"
+                        )
+
+                    raw_path = Path(str(manifest.get("raw_path", "")))
+                    if not raw_path.is_file():
+                        raise FileNotFoundError(
+                            f"{name}: extracted Parquet is missing: {raw_path}"
+                        )
+
+                    boundary_timestamp = manifest.get("extracted_at_utc")
+                    if not boundary_timestamp:
+                        raise ValueError(f"{name}: extraction timestamp is missing.")
+
+                    manifest.update(
+                        {
+                            "warehouse_status": "loading",
+                            "warehouse_load_started_at_utc": datetime.now(
+                                UTC
+                            ).isoformat(),
+                        }
+                    )
+                    _write_manifest(manifest_path, manifest)
+
+                    result = load_scd2(
+                        credentials=app.warehouse_credentials,
+                        snapshot_path=raw_path,
+                        source=source,
+                        dataset_name=app.dataset_name,
+                        destination_kind=app.warehouse_kind,
+                        boundary_timestamp=str(boundary_timestamp),
+                    )
+
+                    manifest.update(
+                        {
+                            "status": "success",
+                            "warehouse_status": "loaded",
+                            "warehouse_table": source.warehouse_table,
+                            "warehouse_row_count": result.total_rows,
+                            "warehouse_current_rows": result.current_rows,
+                            "warehouse_loaded_at_utc": datetime.now(UTC).isoformat(),
+                        }
+                    )
+
+                    for field in (
+                        "warehouse_error",
+                        "warehouse_error_type",
+                        "warehouse_failed_at_utc",
+                        "warehouse_blocked_at_utc",
+                    ):
+                        manifest.pop(field, None)
+
+                    if result.quarantined_business_keys:
+                        manifest["scd2_quarantine"] = {
+                            "reason": "conflicting_scd2_tracked_values",
+                            "business_key_count": len(result.quarantined_business_keys),
+                            "source_row_count": result.quarantined_row_count,
+                            "business_keys": list(result.quarantined_business_keys),
+                        }
+
+                    _write_manifest(manifest_path, manifest)
+
+                    utils.log_event(
+                        logging.INFO,
+                        "warehouse_load_complete",
+                        source_name=name,
+                        warehouse_table=source.warehouse_table,
+                        warehouse_row_count=result.total_rows,
+                        warehouse_current_rows=result.current_rows,
+                        quarantined_business_keys=len(result.quarantined_business_keys),
+                    )
+
+                except Exception as exc:
+                    if manifest_path is not None and manifest is not None:
+                        # Keep extraction status successful. Only the destination
+                        # outcome changes when a warehouse load fails.
+                        manifest.update(
+                            {
+                                "status": "success",
+                                "warehouse_status": "failed",
+                                "warehouse_error": str(exc),
+                                "warehouse_error_type": type(exc).__name__,
+                                "warehouse_failed_at_utc": datetime.now(
+                                    UTC
+                                ).isoformat(),
+                            }
+                        )
+                        _write_manifest(manifest_path, manifest)
+
+                    utils.log_event(
+                        logging.ERROR,
+                        "warehouse_load_failed",
+                        source_name=name,
+                        error=str(exc),
+                        exception_type=type(exc).__name__,
+                    )
+                    load_failures += 1
+
+            return 1 if load_failures else 0
 
         with TorontoCKANClient(
             app.ckan_base_url,
