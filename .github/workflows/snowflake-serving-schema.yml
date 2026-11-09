@@ -1,9 +1,6 @@
 name: Snowflake Serving Schema Build
 
 on:
-  workflow_run:
-    workflows: ["Snowflake Canonical RAW Refresh"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       confirm_serving_schema:
@@ -11,6 +8,11 @@ on:
         required: true
         default: false
         type: boolean
+      raw_refresh_run_id:
+        description: "Successful canonical RAW refresh run ID (provided automatically; optional for deliberate manual rebuilds)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -24,17 +26,12 @@ concurrency:
 
 jobs:
   build:
-    # Trigger automatically only after a successful main-branch RAW workflow.
-    # Manual runs are still limited to main; the following step requires confirmation.
+    # Every serving build is an explicit workflow_dispatch. The RAW workflow
+    # dispatches this only after its replay job succeeds; manual runs stay gated.
     if: >-
       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
-      (
-        (github.event_name == 'workflow_run' &&
-         github.event.workflow_run.conclusion == 'success' &&
-         github.event.workflow_run.head_branch == 'main') ||
-        (github.event_name == 'workflow_dispatch' &&
-         github.ref == 'refs/heads/main')
-      )
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
     name: Build and verify Snowflake dashboard models
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -47,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Require explicit serving-schema confirmation
         if: github.event_name == 'workflow_dispatch'
@@ -60,10 +57,10 @@ jobs:
           fi
 
       - name: Verify upstream canonical RAW refresh succeeded
-        if: github.event_name == 'workflow_run'
+        if: inputs.raw_refresh_run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          RAW_REFRESH_RUN_ID: ${{ github.event.workflow_run.id }}
+          RAW_REFRESH_RUN_ID: ${{ inputs.raw_refresh_run_id }}
         run: |
           python - <<'PY'
           import json
