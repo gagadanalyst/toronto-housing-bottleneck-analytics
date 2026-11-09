@@ -144,6 +144,22 @@ def _ensure_ledger(database: Path) -> None:
             "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP"
         )
         connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS quarantined_row_count BIGINT DEFAULT 0"
+        )
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS quarantined_bad_row_count BIGINT DEFAULT 0"
+        )
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS quarantined_business_key_count BIGINT DEFAULT 0"
+        )
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS quarantine_sha256 VARCHAR"
+        )
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS raw.toronto_source_snapshot_metadata (
                 source_name VARCHAR PRIMARY KEY,
@@ -195,6 +211,10 @@ def _record_state(
     release_tag: str | None = None,
     asset_name: str | None = None,
     error: str | None = None,
+    quarantined_row_count: int = 0,
+    quarantined_bad_row_count: int = 0,
+    quarantined_business_key_count: int = 0,
+    quarantine_sha256: str | None = None,
 ) -> None:
     with duckdb.connect(str(database)) as connection:
         connection.execute(
@@ -202,15 +222,21 @@ def _record_state(
             INSERT INTO raw.toronto_snapshot_ledger
                 (snapshot_id, source_run_id, source_run_attempt,
                  extraction_started_at_utc, source_name, status, source_commit,
-                 release_tag, asset_name, error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 release_tag, asset_name, error, updated_at,
+                quarantined_row_count, quarantined_bad_row_count,
+                quarantined_business_key_count, quarantine_sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (snapshot_id, source_name) DO UPDATE SET
                 status = excluded.status,
                 source_commit = excluded.source_commit,
                 release_tag = excluded.release_tag,
                 asset_name = excluded.asset_name,
                 error = excluded.error,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                quarantined_row_count = excluded.quarantined_row_count,
+                quarantined_bad_row_count = excluded.quarantined_bad_row_count,
+                quarantined_business_key_count = excluded.quarantined_business_key_count,
+                quarantine_sha256 = excluded.quarantine_sha256
             """,
             [
                 snapshot_id,
@@ -224,6 +250,10 @@ def _record_state(
                 asset_name,
                 error,
                 datetime.now(UTC),
+                quarantined_row_count,
+                quarantined_bad_row_count,
+                quarantined_business_key_count,
+                quarantine_sha256,
             ],
         )
 
@@ -698,6 +728,9 @@ def _load_archive(
                 )
 
                 try:
+                    audit_database = os.environ.get(
+                        "TORONTO_QUARANTINE_AUDIT_DUCKDB_PATH"
+                    )
                     result = load_scd2(
                         credentials=app.warehouse_credentials,
                         snapshot_path=parquet_path,
@@ -705,6 +738,17 @@ def _load_archive(
                         dataset_name=app.dataset_name,
                         destination_kind="duckdb",
                         boundary_timestamp=boundary,
+                        snapshot_context={
+                            "snapshot_id": snapshot_id,
+                            "source_run_id": run_id,
+                            "source_run_attempt": int(attempt),
+                            "extracted_at_utc": manifest["extracted_at_utc"],
+                            "source_commit": commit,
+                            "release_tag": release_tag,
+                            "asset_name": asset_name,
+                            "parquet_sha256": digest,
+                        },
+                        quarantine_audit_credentials=audit_database,
                     )
                     persisted_manifest = {
                         **manifest,
@@ -725,11 +769,16 @@ def _load_archive(
                             "member": f"{name}/data.parquet",
                         },
                     }
-                    if result.quarantined_business_keys:
+                    if result.quarantined_row_count:
                         persisted_manifest["scd2_quarantine"] = {
-                            "reason": "conflicting_scd2_tracked_values",
-                            "business_key_count": len(result.quarantined_business_keys),
+                            "business_key_count": result.quarantined_business_key_count,
                             "source_row_count": result.quarantined_row_count,
+                            "bad_row_count": result.quarantined_bad_row_count,
+                            "identical_duplicate_row_count": (
+                                result.quarantined_row_count
+                                - result.quarantined_bad_row_count
+                            ),
+                            "quarantine_sha256": result.quarantine_sha256,
                             "business_keys": list(result.quarantined_business_keys),
                         }
                     _persist_manifest(
@@ -751,6 +800,10 @@ def _load_archive(
                         commit=commit,
                         release_tag=release_tag,
                         asset_name=asset_name,
+                        quarantined_row_count=result.quarantined_row_count,
+                        quarantined_bad_row_count=result.quarantined_bad_row_count,
+                        quarantined_business_key_count=result.quarantined_business_key_count,
+                        quarantine_sha256=result.quarantine_sha256,
                     )
                     print(
                         f"Loaded {name} from {release_tag}/{asset_name} "

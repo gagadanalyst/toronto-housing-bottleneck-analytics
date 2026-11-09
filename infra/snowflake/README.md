@@ -56,7 +56,20 @@ Then verify its state. Resource monitors measure credits, not dollars. They do n
 
 ## Security and credentials
 
-The bootstrap uses `ACCOUNTADMIN` for initial provisioning. The ingestion role is intended to write source objects in `RAW`; the dbt role reads raw data and creates models in `ANALYTICS`. The bootstrap SQL does not create or rotate application service users or private keys.
+The bootstrap uses `ACCOUNTADMIN` for initial provisioning. The ingestion role owns `RAW` and creates run-specific cloned RAW candidates; the dbt role owns `ANALYTICS` and creates run-specific serving candidates. The dashboard role is read-only. The bootstrap SQL does not create or rotate application service users or private keys.
+
+The automated schema-swap path requires these one-time privileges and owners. Run as `ACCOUNTADMIN` only after checking the current owners and preserving the intended dashboard access:
+
+```sql
+USE ROLE ACCOUNTADMIN;
+
+GRANT CREATE SCHEMA ON DATABASE TORONTO TO ROLE TORONTO_DBT_ROLE;
+GRANT OWNERSHIP ON SCHEMA TORONTO.ANALYTICS
+    TO ROLE TORONTO_DBT_ROLE
+    COPY CURRENT GRANTS;
+```
+
+`TORONTO_INGEST_ROLE` must continue to own `TORONTO.RAW` and already has `CREATE SCHEMA ON DATABASE TORONTO` from `00_bootstrap.sql`. Do not grant account-level `MANAGE GRANTS`, and do not add future-table grants as part of promotion. The workflows grant the dbt and dashboard roles only the schema/table access needed for the specific candidate.
 
 Never commit passwords, account identifiers that are intended to be secret, tokens, or private keys. Use GitHub Actions secrets for workflow authentication and the deployment's secret manager for dashboard credentials. Keep ingestion, dbt, and dashboard service identities separate. The dashboard role should be read-only and must not have access to `TORONTO.RAW`.
 
@@ -67,9 +80,9 @@ Routine CI/CD does not require Snowflake credentials. The CI/CD path builds and 
 After an eligible successful CD run on `main`, setting the GitHub repository variable `SNOWFLAKE_OPERATIONS_ENABLED` to the exact string `true` enables the following chain:
 
 1. `cd.yml` sends a `repository_dispatch` containing the exact CD run ID, attempt, source commit, monthly Release tag, and immutable raw-bundle asset name. The RAW workflow replays the approved Release backlog in extraction order; the daily schedule reconciles any missed CD handoff.
-2. `snowflake-canonical-raw-refresh.yml` validates the immutable archive and the promoted replay baseline, checks the canonical Snowflake role/schema/tables and SCD2 counts, then processes Active and Cleared in extraction order. Both source-ledger entries must be `succeeded` for the refresh job to complete.
-3. After that job succeeds, its final step explicitly runs `gh workflow run snowflake-serving-schema.yml --ref main` with `confirm_serving_schema=true` and its own `raw_refresh_run_id`. This uses the supported `workflow_dispatch` event and the workflow's `actions: write` permission; it does not depend on a `workflow_run` trigger from a workflow created with `GITHUB_TOKEN`.
-4. The serving workflow verifies the supplied RAW run ID through GitHub and requires the `Snowflake Canonical RAW Refresh` workflow and `Refresh and verify canonical Snowflake RAW` job to have completed successfully. It then checks RAW freshness, builds and tests dbt, reapplies dashboard read-only grants, verifies the four dashboard relations, and records refresh metadata.
+2. `snowflake-canonical-raw-refresh.yml` validates the immutable archive backlog and the promoted replay baseline, then clones `TORONTO.RAW` into `TORONTO.RAW_STAGE_<run_id>_<attempt>`. The ingestion role rebases the cloned DLT state, replays pending archives in extraction order, and validates both source ledgers, SCD2 integrity and quarantine reconciliation in the candidate. It swaps the candidate into `RAW` only after all checks pass; the previous RAW remains under the candidate schema name.
+3. After RAW promotion succeeds, the workflow explicitly runs `gh workflow run snowflake-serving-schema.yml --ref main` with `confirm_serving_schema=true` and its own `raw_refresh_run_id`. This uses `workflow_dispatch` and the workflow's `actions: write` permission; it does not depend on a `workflow_run` event from a workflow created with `GITHUB_TOKEN`.
+4. The serving workflow verifies the supplied RAW run ID through GitHub, creates a fresh `ANALYTICS_STAGE_<run_id>_<attempt>` schema, and points dbt at that candidate. It builds and tests the full project, verifies the four dashboard relations and refresh metadata, grants the dashboard role access only to those relations, and swaps the candidate into `TORONTO.ANALYTICS`. The previous serving schema remains under the candidate name.
 
 The variable is an **operational gate, not a secret and not the dashboard backend setting**. Six workflows apply it:
 
@@ -84,17 +97,58 @@ When the variable is `false` or unset, the guarded jobs skip before their steps 
 
 Manual Snowflake runs remain available for deliberate validation and maintenance. A manual canonical RAW refresh requires a successful CD run ID and the `confirm_canonical_raw` input. A manual serving build requires `confirm_serving_schema`; the automated serving dispatch also supplies `raw_refresh_run_id`, which is verified against the upstream RAW workflow run. The baseline/replay and dbt-baseline workflows require their relevant run inputs. All remain behind the shared variable gate. When the gate is `true`, a parity workflow triggered by a relevant pull request may consume Snowflake compute; ordinary pull-request CI itself does not require Snowflake.
 
-### Retry behavior and production write guarantees
+### Staging, quarantine and promotion guarantees
 
-The same immutable RAW archive can be retried. The canonical Snowflake application ledger records each source independently using the snapshot identity `run_id:attempt` and verifies the archive's commit, extraction timestamp, Release tag, and asset name. A source already marked `succeeded` is skipped on retry; a failed or incomplete source is retried with the original manifest `extracted_at_utc` as its SCD2 boundary. The replay backlog is chronological and the RAW workflow is serialized with a non-cancelling queue, so a later snapshot is blocked when an earlier snapshot is incomplete or a newer write may already have started.
+Each Snowflake RAW run works in an isolated schema cloned from production. Both
+Active and Cleared are replayed there with the original archive boundary timestamps.
+The candidate must have complete per-source ledgers, valid DLT state, no invalid
+SCD2 intervals/overlaps/duplicate current keys, and a reconciled quarantine table
+before the RAW schema swap. A failed load, validation or threshold check leaves
+`TORONTO.RAW` untouched; the candidate schema remains available for inspection.
+After the swap, the old RAW schema is retained under the run-specific candidate name.
+The DLT state rebase is guarded by a generation marker so a run interrupted after
+the swap can finish that state-only recovery on the next attempt.
 
-For a failed RAW run, rerun its failed job rather than dispatching a new load from a different archive:
+Serving is built in a separate, empty `ANALYTICS_STAGE_<run_id>_<attempt>` schema.
+The dashboard's existing `TORONTO.ANALYTICS` schema remains untouched while dbt
+builds, tests, metadata recording and dashboard access checks run. Only then is the
+serving schema swapped into place. A failed dbt or pre-promotion validation leaves
+the previous serving schema active; the previous version is retained after a swap.
+RAW and ANALYTICS are separate atomic schema swaps, not a single Snowflake
+transaction. If RAW promotes successfully but serving fails, retry the serving
+workflow with the successful RAW run ID; do not replay RAW solely to rebuild dbt.
 
-```bash
-gh run rerun RAW_REFRESH_RUN_ID --failed
-```
+Quarantine handling is identical in DuckDB and Snowflake. Rows with NULL/blank
+business keys and every row belonging to a conflicting duplicate-key group are
+excluded from clean SCD2 and retained with the full source record, physical Parquet
+row ordinal, row hash, archive identity, Release asset and Parquet checksum.
+Redundant identical duplicate occurrences are also retained; the first identical
+record is loaded, and redundant occurrences do not count toward the bad-row limit.
+For the candidate generation, newly quarantined bad rows are aggregated across
+all newly replayed archives for each source independently. Promotion is blocked
+when that source total is **at least 25%** of its pre-run production current-row
+count. Active and Cleared are checked separately. Quarantine rows already present
+in the promoted baseline do not accumulate toward this test.
+The full record is still retained in the failed candidate for investigation.
+After a successful swap, the queryable table is `TORONTO.RAW.TORONTO_SCD2_QUARANTINE`.
+DuckDB also publishes rejected candidate quarantine rows to a separate audit
+Release, which is not used by the production recovery restore process. Snowflake
+retains the rejected RAW candidate schema. No historical quarantine backfill is
+performed; the existing immutable Parquet archives remain the record of prior
+snapshots.
 
-This replays the same workflow event and immutable archive. Already-succeeded sources remain skipped. It also retries the explicit serving dispatch if the RAW data loads completed but the dispatch step itself failed. If RAW is already successful and only the serving build failed, rerun serving with the verified upstream RAW run ID:
+A successful Snowflake swap is not coupled transactionally to the DuckDB
+publication. The two engines promote independently by design; a failure in one
+does not roll back a successful promotion in the other. This is an explicit
+independent-backend boundary rather than a distributed transaction guarantee.
+
+For a failed RAW run, a rerun starts from the last promoted RAW schema, creates a
+fresh run/attempt candidate, and replays the still-unpromoted immutable archives in
+extraction order. A failed candidate is retained for inspection but is never used
+as the next production baseline. Stable archive identity, physical row ordinals,
+and quarantine IDs make replay deterministic; reprocessing a previously completed
+source in a rejected candidate cannot create production duplicates. After successful
+RAW promotion, a serving-only retry uses:
 
 ```bash
 gh workflow run snowflake-serving-schema.yml \
@@ -102,12 +156,6 @@ gh workflow run snowflake-serving-schema.yml \
   -f confirm_serving_schema=true \
   -f raw_refresh_run_id=RAW_REFRESH_RUN_ID
 ```
-
-The serving workflow verifies the upstream run before it connects to Snowflake. This retry does not reload or replay `TORONTO.RAW`.
-
-**Important production boundary:** the workflow validates both archived source files, manifests, checksums, required columns, approval flags, and quality blockers before starting either source load. It then merges Active and Cleared separately into the production `TORONTO.RAW` tables; this is not a single cross-table transaction or an atomic two-table promotion. If one table commits and the other fails, RAW can temporarily be at different snapshot levels. The RAW job fails and does not dispatch serving, so `TORONTO.ANALYTICS` is not intentionally rebuilt from that partial refresh; rerunning the same archive resumes only the unfinished source. This provides resumable per-source recovery, not a guarantee that no semantically bad source values can ever be written or that both RAW tables always change together.
-
-The serving build is also not a schema-wide atomic transaction: dbt builds its models individually. If it fails partway through, some `ANALYTICS` objects may have been rebuilt while others remain from the previous run. The dashboard refresh metadata is recorded only after the serving relations and grants pass validation. An all-or-nothing production guarantee would require loading and validating both source tables in an isolated Snowflake schema and promoting them atomically, plus a corresponding serving-schema promotion strategy; that stronger design is not implemented by this workflow.
 
 ### Disable Snowflake or switch back at trial end
 
@@ -202,7 +250,7 @@ The reader checks that required relations exist, reads dashboard-facing data, an
 - `TORONTO_XS_WH` was X-Small, suspended, configured with 60-second auto-suspend and auto-resume, and assigned `TORONTO_WH_MONITOR`.
 - `TORONTO_ACCOUNT_MONITOR` was assigned at account level with a 30-credit monthly quota; `TORONTO_WH_MONITOR` was assigned to the project warehouse with a 20-credit quota.
 - Both monitors had notification triggers at 50% and 75%, suspension at 90%, and immediate suspension at 100%. Both showed zero credits used at the time of verification.
-- Ingestion and dbt role grants were inspected, including the future-table SELECT grant for RAW.
+- Ingestion and dbt role privileges were inspected. The current candidate promotion path uses explicit schema and table grants; it does not request or depend on a future-table SELECT grant. Any pre-existing future grants are separate account state and are not modified by this workflow.
 - Resource-monitor notifications were enabled for the account administrator. `NOTIFY_USERS` was empty, and actual alert delivery was not independently tested.
 
 A fresh `TORONTO.RAW` baseline was loaded from a complete, validated Active/Cleared snapshot. The fresh-baseline replay test confirmed that an unchanged replay added no SCD2 versions and a controlled tracked-attribute change created the expected version ([successful Snapshot Baseline and Replay run](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40491637116), added in [test PR #76](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/pull/76)). The legacy DuckDB SCD2 timeline was deliberately not migrated.

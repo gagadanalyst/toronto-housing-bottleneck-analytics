@@ -34,7 +34,8 @@ concurrency:
 
 jobs:
   promote:
-    if: github.ref == 'refs/heads/main' && inputs.confirm_production_promotion == true
+    # Retained for history; all production promotions now use candidate validation.
+    if: false
     name: Validate and promote both recovered SCD2 warehouses
     runs-on: ubuntu-latest
     timeout-minutes: 180

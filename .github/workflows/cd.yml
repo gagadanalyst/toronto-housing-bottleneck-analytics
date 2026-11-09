@@ -290,8 +290,20 @@ jobs:
           print("Dispatched Snowflake refresh independently of DuckDB.")
           PY
 
+      - name: Prepare isolated DuckDB candidate and quarantine audit copy
+        if: steps.raw_warehouse_gate.outcome == 'success' && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        id: prepare_duckdb_candidate
+        run: |
+          candidate="data/staging/duckdb/candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.duckdb"
+          audit_copy="data/staging/duckdb/quarantine-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.duckdb"
+          python scripts/prepare_duckdb_candidate.py \
+            --source data/warehouse/toronto.duckdb \
+            --candidate "$candidate" \
+            --audit-copy "$audit_copy" \
+            --github-env "$GITHUB_ENV"
+
       - name: Load the archived raw snapshot backlog into DuckDB SCD2
-        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        if: steps.prepare_duckdb_candidate.outcome == 'success' && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         id: duckdb_snapshot_replay
         env:
           TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
@@ -300,11 +312,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/load_duckdb_snapshot.py --backlog
 
-      - name: Persist immutable DuckDB SCD2 recovery checkpoint immediately after replay
-        if: steps.duckdb_snapshot_replay.outcome == 'success' && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/publish_duckdb_recovery.py
 
       - name: Run Active Permits SCD2 integration test
         if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
@@ -317,7 +324,7 @@ jobs:
           set -euo pipefail
 
           test "$(find data/raw -type f -name 'data.parquet' | wc -l)" -eq 2
-          test -s data/warehouse/toronto.duckdb
+          test -s "$TORONTO_WAREHOUSE_CREDENTIALS"
 
           for file in $(find data/raw -type f -name 'data.parquet'); do
             test -s "$file"
@@ -326,8 +333,8 @@ jobs:
           echo "Parquet assets:"
           find data/raw -type f -name 'data.parquet' -print
 
-          echo "DuckDB:"
-          ls -lh data/warehouse/toronto.duckdb
+          echo "DuckDB candidate:"
+          ls -lh "$TORONTO_WAREHOUSE_CREDENTIALS"
 
       #- name: Run permit business-key tests
       #  run: python -m pytest -q tests/test_business_keys.py
@@ -337,7 +344,7 @@ jobs:
           python - <<'PY'
           import duckdb
           import os
-          db = "data/warehouse/toronto.duckdb"
+          db = os.environ["TORONTO_WAREHOUSE_CREDENTIALS"]
           print(os.listdir('data/warehouse/'))
           with duckdb.connect(db, read_only=True) as con:
               tables = {
@@ -377,6 +384,13 @@ jobs:
         if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: python -m pytest -s tests/test_warehouse_load.py
 
+      - name: Validate DuckDB SCD2 and quarantine before dbt
+        if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        run: >-
+          python scripts/promote_duckdb_candidate.py
+          --candidate "$TORONTO_WAREHOUSE_CREDENTIALS"
+          --validate-only
+
       - name: Create isolated dbt environment
         if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         run: |
@@ -389,7 +403,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/warehouse/dbt-ci
-          cp data/warehouse/toronto.duckdb data/warehouse/dbt-ci/toronto.duckdb
+          cp "$TORONTO_WAREHOUSE_CREDENTIALS" data/warehouse/dbt-ci/toronto.duckdb
           echo "DBT_DUCKDB_PATH=${GITHUB_WORKSPACE}/data/warehouse/dbt-ci/toronto.duckdb" >> "$GITHUB_ENV"
           sha256sum data/warehouse/dbt-ci/toronto.duckdb
 
@@ -511,13 +525,14 @@ jobs:
               print(f"Recorded successful DuckDB refresh at {row[0]} UTC.")
           PY
 
-      - name: Promote dbt-built warehouse for publication
+      - name: Validate and promote DuckDB candidate
         if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        id: promote_duckdb_candidate
         run: |
-          set -euo pipefail
           test -s data/warehouse/dbt-ci/toronto.duckdb
-          cp data/warehouse/dbt-ci/toronto.duckdb data/warehouse/toronto.duckdb
-          test -s data/warehouse/toronto.duckdb
+          python scripts/promote_duckdb_candidate.py \
+            --candidate data/warehouse/dbt-ci/toronto.duckdb \
+            --production data/warehouse/toronto.duckdb
           sha256sum data/warehouse/toronto.duckdb
 
       - name: Package dbt documentation for publication
@@ -619,6 +634,12 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+      - name: Preserve immutable DuckDB recovery checkpoint after candidate validation
+        if: steps.promote_duckdb_candidate.outcome == 'success' && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/publish_duckdb_recovery.py
+
       - name: Publish durable data assets
         if: vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
         id: publish_assets
@@ -627,6 +648,28 @@ jobs:
           WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
           WAREHOUSE_LATEST_TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
         run: python scripts/publish_release_assets.py
+
+      - name: Preserve quarantine rows when candidate publication is rejected
+        if: failure() && steps.prepare_duckdb_candidate.outcome == 'success' && steps.publish_assets.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: publish_quarantine_audit
+        run: |
+          if [ -s "$TORONTO_QUARANTINE_AUDIT_DUCKDB_PATH" ]; then
+            python scripts/publish_duckdb_quarantine_audit.py
+          else
+            echo "No quarantine audit copy was prepared; nothing to preserve."
+          fi
+
+      - name: Retain DuckDB quarantine audit database if Release export fails
+        if: failure() && steps.prepare_duckdb_candidate.outcome == 'success' && steps.publish_quarantine_audit.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: duckdb-quarantine-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TORONTO_QUARANTINE_AUDIT_DUCKDB_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
 
       - name: Preserve recovery backup if rollback fails
         if: (always() && steps.publish_assets.outcome != 'success') && vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''

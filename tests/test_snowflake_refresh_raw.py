@@ -353,14 +353,14 @@ class _FakeConnection:
 def test_preflight_wrong_role_stops_before_table_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = _FakeCursor(("ACCOUNTADMIN", "TORONTO", "RAW"))
+    cursor = _FakeCursor(("ACCOUNTADMIN", "TORONTO", "RAW_STAGE_123456789_1"))
     connection = _FakeConnection(cursor)
     monkeypatch.setattr(
         refresh.snowflake.connector, "connect", lambda **kwargs: connection
     )
 
     with pytest.raises(ValueError, match="Unexpected Snowflake role"):
-        refresh._connect_and_preflight({})
+        refresh._connect_and_preflight({}, "RAW_STAGE_123456789_1")
 
     assert len(cursor.queries) == 1
     assert cursor.closed
@@ -400,7 +400,9 @@ def test_failed_preflight_prevents_both_table_loads(
     monkeypatch.setattr(
         refresh,
         "_connect_and_preflight",
-        lambda options: (_ for _ in ()).throw(RuntimeError("preflight failed")),
+        lambda options, dataset: (_ for _ in ()).throw(
+            RuntimeError("preflight failed")
+        ),
     )
     load_calls: list[str] = []
     monkeypatch.setattr(
@@ -415,7 +417,7 @@ def test_failed_preflight_prevents_both_table_loads(
         "snowflake://user@account/?private_key=ZmFrZQ==",
     )
     monkeypatch.setenv("TORONTO_WAREHOUSE_KIND", "snowflake")
-    monkeypatch.setenv("TORONTO_WAREHOUSE_DATASET", "RAW")
+    monkeypatch.setenv("TORONTO_WAREHOUSE_DATASET", "RAW_STAGE_123456789_1")
     monkeypatch.setenv("SNAPSHOT_SOURCE_RUN_ID", RUN_ID)
     monkeypatch.setenv("SNAPSHOT_SOURCE_RUN_ATTEMPT", "1")
     monkeypatch.setenv("SNAPSHOT_SOURCE_COMMIT", COMMIT)
@@ -430,3 +432,20 @@ def test_failed_preflight_prevents_both_table_loads(
         refresh.main()
 
     assert load_calls == []
+
+
+def test_canonical_raw_is_not_an_allowed_refresh_target() -> None:
+    assert (
+        refresh._validated_dataset_schema("RAW_STAGE_123456789_1")
+        == "RAW_STAGE_123456789_1"
+    )
+    with pytest.raises(ValueError, match="run-scoped"):
+        refresh._validated_dataset_schema("RAW")
+
+
+def test_candidate_ledger_table_is_derived_from_validated_stage() -> None:
+    assert refresh._snapshot_ledger_table("RAW_STAGE_123456789_1") == (
+        "TORONTO.RAW_STAGE_123456789_1.TORONTO_SNAPSHOT_LEDGER"
+    )
+    with pytest.raises(ValueError, match="run-scoped"):
+        refresh._snapshot_ledger_table("RAW")

@@ -20,6 +20,15 @@ def _pending_archives(archives, completed_snapshot_ids: set[str]):
     return [item for item in archives if item.snapshot_id not in completed_snapshot_ids]
 
 
+def _write_pending_output(value: bool) -> None:
+    """Expose whether this run actually replayed archives to GitHub Actions."""
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    with Path(output_path).open("a", encoding="utf-8") as output:
+        output.write(f"has_pending_archives={'true' if value else 'false'}\n")
+
+
 def _archives_through_selection(archives, *, run_id: str, attempt: str):
     """Return the chronological backlog through the requested manual archive."""
     selected_index = next(
@@ -77,19 +86,28 @@ def main() -> int:
             from snowflake_refresh_raw import (
                 _assert_canonical_replay_baseline,
                 _completed_snapshot_ids,
+                _snapshot_ledger_table,
                 _snowflake_connection_options,
+                _validated_dataset_schema,
             )
         except ImportError:
             from scripts.snowflake_refresh_raw import (
                 _assert_canonical_replay_baseline,
                 _completed_snapshot_ids,
+                _snapshot_ledger_table,
                 _snowflake_connection_options,
+                _validated_dataset_schema,
             )
         credentials = os.environ["TORONTO_WAREHOUSE_CREDENTIALS"]
         key_path = Path(temp) / "snowflake_backlog_key.p8"
         connection_options = _snowflake_connection_options(credentials, key_path)
         _assert_canonical_replay_baseline(connection_options)
-        completed_ids = _completed_snapshot_ids(connection_options)
+        dataset = _validated_dataset_schema(
+            os.environ.get("TORONTO_WAREHOUSE_DATASET", "")
+        )
+        completed_ids = _completed_snapshot_ids(
+            connection_options, _snapshot_ledger_table(dataset)
+        )
         include_ids = {f"{args.run_id}:{args.attempt}"} if manual else set()
 
         archives = discover_archives(
@@ -151,11 +169,13 @@ def main() -> int:
 
         if not archives:
             print("No approved raw snapshot archives are waiting for Snowflake replay.")
+            _write_pending_output(False)
             return 0
 
         pending = _pending_archives(archives, completed_ids)
         if not pending:
             print("All approved Snowflake archives are already fully loaded.")
+            _write_pending_output(False)
             return 0
 
         for item in pending:
@@ -181,6 +201,8 @@ def main() -> int:
             )
 
     print("Snowflake approved snapshot backlog replay completed in extraction order.")
+    # Downstream promotion is enabled only after every pending archive succeeded.
+    _write_pending_output(True)
     return 0
 
 

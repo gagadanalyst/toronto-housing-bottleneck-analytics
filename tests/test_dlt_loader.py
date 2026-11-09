@@ -5,7 +5,9 @@ import pyarrow as pa
 from pyarrow import parquet as pq
 
 from toronto_housing_ingestion.dlt_loader import (
+    _analyze_scd2_snapshot,
     _destination_scope_excluding_keys,
+    _destination_scope_matching_snapshot_keys,
     _iter_scd2_snapshot_rows,
     _record_in_warehouse_window,
     _resolve_scd2_key_columns,
@@ -26,6 +28,19 @@ def test_destination_scope_preserves_resolved_column_names() -> None:
     assert '"REVISION_NUM"' in scope
     assert '"PERMIT_TYPE"' in scope
     assert '"permit_num"' not in scope
+
+
+def test_destination_scope_matches_staged_keys_for_invalid_key_snapshot() -> None:
+    scope = _destination_scope_matching_snapshot_keys(
+        ("PERMIT_NUM", "REVISION_NUM", "PERMIT_TYPE"),
+        {("26 184407 BLD", "00", "New Houses")},
+    )
+
+    assert "EXISTS (SELECT 1 FROM {staging_table} AS source" in scope
+    assert 'source."PERMIT_NUM" = {table}."PERMIT_NUM"' in scope
+    assert 'source."REVISION_NUM" = {table}."REVISION_NUM"' in scope
+    assert 'source."PERMIT_TYPE" = {table}."PERMIT_TYPE"' in scope
+    assert "NOT ((" in scope
 
 
 def test_warehouse_date_filter_keeps_2020_and_later() -> None:
@@ -224,3 +239,189 @@ def test_scd2_quarantines_conflict_and_preserves_history(tmp_path) -> None:
 
         # A new permit is still inserted.
         assert history("26 100003 BLD") == (1, 1, "INSERTED BUILDER")
+
+
+def test_quarantine_preserves_invalid_conflicting_and_identical_rows(tmp_path) -> None:
+    import json
+
+    import duckdb
+
+    source = _test_source()
+    snapshot = tmp_path / "mixed-quality.parquet"
+    baseline_snapshot = tmp_path / "baseline.parquet"
+    clean_snapshot = tmp_path / "clean-after-quarantine.parquet"
+    database = tmp_path / "mixed-quality.duckdb"
+    pipeline_name = f"test_scd2_mixed_quarantine_{tmp_path.name}"
+
+    def permit(source_id, permit_num, builder):
+        return {
+            "_id": source_id,
+            "PERMIT_NUM": permit_num,
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": builder,
+        }
+
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                permit(10, "26 100001 BLD", "SAME BUILDER"),
+                permit(11, "26 100002 BLD", "OLD CONFLICT BUILDER"),
+                permit(12, "26 100003 BLD", "POTENTIALLY MISSING BUILDER"),
+                permit(13, "26 100004 BLD", "ALSO POTENTIALLY MISSING"),
+            ]
+        ),
+        baseline_snapshot,
+    )
+    load_scd2(
+        credentials=str(database),
+        snapshot_path=baseline_snapshot,
+        source=source,
+        dataset_name="raw",
+        destination_kind="duckdb",
+        pipeline_name=pipeline_name,
+    )
+
+    rows = [
+        {
+            "_id": 1,
+            "PERMIT_NUM": "26 100001 BLD",
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "SAME BUILDER",
+        },
+        {
+            "_id": 2,
+            "PERMIT_NUM": "26 100001 BLD",
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "SAME BUILDER",
+        },
+        {
+            "_id": 3,
+            "PERMIT_NUM": "26 100002 BLD",
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "OLD BUILDER",
+        },
+        {
+            "_id": 4,
+            "PERMIT_NUM": "26 100002 BLD",
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "NEW BUILDER",
+        },
+        {
+            "_id": 5,
+            "PERMIT_NUM": None,
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "INVALID NULL KEY",
+        },
+        {
+            "_id": 6,
+            "PERMIT_NUM": "   ",
+            "REVISION_NUM": "00",
+            "PERMIT_TYPE": "New Houses",
+            "BUILDER_NAME": "INVALID BLANK KEY",
+        },
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), snapshot)
+    key_columns = _resolve_scd2_key_columns(snapshot, source)
+    analysis = _analyze_scd2_snapshot(
+        snapshot, source=source, key_columns=key_columns, preserve_row_hash=False
+    )
+
+    assert analysis.bad_row_count == 4
+    assert analysis.business_key_count == 1
+    assert analysis.duplicate_row_count == 1
+    assert analysis.invalid_key_row_count == 2
+    assert len(analysis.quarantine_rows) == 5
+    assert {item["reason"] for item in analysis.quarantine_rows} == {
+        "identical_duplicate_record",
+        "conflicting_duplicate_business_key",
+        "invalid_business_key",
+    }
+
+    result = load_scd2(
+        credentials=str(database),
+        snapshot_path=snapshot,
+        source=source,
+        dataset_name="raw",
+        destination_kind="duckdb",
+        pipeline_name=pipeline_name,
+        snapshot_context={
+            "snapshot_id": "12345:1",
+            "source_run_id": "12345",
+            "source_run_attempt": 1,
+            "extracted_at_utc": "2026-11-09T01:00:00+00:00",
+            "source_commit": "a" * 40,
+            "release_tag": "toronto-raw-snapshot-archive-2026-11",
+            "asset_name": "toronto-raw-snapshot-bundle-12345-1.zip",
+            "parquet_sha256": "b" * 64,
+        },
+    )
+    assert result.quarantined_row_count == 5
+    assert result.quarantined_bad_row_count == 4
+    assert result.quarantined_business_key_count == 1
+    assert result.quarantine_sha256
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        stored = connection.execute(
+            "SELECT row_ordinal, reason, raw_record_json, snapshot_id, "
+            "source_commit, release_tag, asset_name, parquet_sha256 "
+            "FROM raw.toronto_scd2_quarantine ORDER BY row_ordinal"
+        ).fetchall()
+        clean = connection.execute(
+            "SELECT permit_num, builder_name FROM raw.raw_active_permits "
+            "WHERE _dlt_valid_to IS NULL ORDER BY permit_num"
+        ).fetchall()
+
+    assert len(stored) == 5
+    assert all(row[2] for row in stored)
+    assert all(row[3] == "12345:1" and row[4] == "a" * 40 for row in stored)
+    assert all(row[5].endswith("2026-11") for row in stored)
+    assert all(row[7] == "b" * 64 for row in stored)
+    assert any(
+        json.loads(row[2]).get("BUILDER_NAME") == "INVALID NULL KEY" for row in stored
+    )
+    assert any(
+        json.loads(row[2]).get("BUILDER_NAME") == "INVALID BLANK KEY" for row in stored
+    )
+    # The invalid source keys make the snapshot incomplete. Do not retire any
+    # destination key that is absent from the clean staged rows; the malformed
+    # source row cannot identify which prior permit it represents.
+    assert clean == [
+        ("26 100001 BLD", "SAME BUILDER"),
+        ("26 100002 BLD", "OLD CONFLICT BUILDER"),
+        ("26 100003 BLD", "POTENTIALLY MISSING BUILDER"),
+        ("26 100004 BLD", "ALSO POTENTIALLY MISSING"),
+    ]
+
+    # A later clean full snapshot restores normal SCD2 retirement semantics.
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                permit(20, "26 100001 BLD", "SAME BUILDER"),
+                permit(21, "26 100005 BLD", "NEW CLEAN PERMIT"),
+            ]
+        ),
+        clean_snapshot,
+    )
+    load_scd2(
+        credentials=str(database),
+        snapshot_path=clean_snapshot,
+        source=source,
+        dataset_name="raw",
+        destination_kind="duckdb",
+        pipeline_name=pipeline_name,
+    )
+    with duckdb.connect(str(database), read_only=True) as connection:
+        current_after_clean = connection.execute(
+            "SELECT permit_num, builder_name FROM raw.raw_active_permits "
+            "WHERE _dlt_valid_to IS NULL ORDER BY permit_num"
+        ).fetchall()
+    assert current_after_clean == [
+        ("26 100001 BLD", "SAME BUILDER"),
+        ("26 100005 BLD", "NEW CLEAN PERMIT"),
+    ]

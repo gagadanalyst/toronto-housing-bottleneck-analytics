@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_serving_schema:
-        description: "Confirm dbt may create or replace project models in TORONTO.ANALYTICS"
+        description: "Confirm dbt may build an isolated serving candidate and promote it to TORONTO.ANALYTICS"
         required: true
         default: false
         type: boolean
@@ -20,7 +20,7 @@ permissions:
 
 # Queue up to 100 pending serving builds instead of replacing the prior pending run.
 concurrency:
-  group: toronto-snowflake-serving-schema
+  group: toronto-snowflake-production-promotion
   cancel-in-progress: false
   queue: max
 
@@ -157,7 +157,6 @@ jobs:
               "SNOWFLAKE_USER": unquote(parts.username),
               "SNOWFLAKE_PRIVATE_KEY_PATH": str(key_path),
               "TORONTO_DBT_SOURCE_SCHEMA": "RAW",
-              "TORONTO_DBT_TARGET_SCHEMA": "ANALYTICS",
               "TORONTO_DBT_AS_OF_DATE": datetime.now(timezone.utc).date().isoformat(),
           }
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
@@ -243,6 +242,9 @@ jobs:
               connection.close()
           PY
 
+      - name: Prepare isolated Snowflake serving candidate
+        run: python scripts/prepare_snowflake_serving_candidate.py --github-env "$GITHUB_ENV"
+
       - name: Configure dbt profile
         working-directory: dbt
         run: cp profiles.yml.example profiles.yml
@@ -273,6 +275,7 @@ jobs:
         run: |
           python - <<'PYMETA'
           import os
+          import re
           import snowflake.connector
 
           connection = snowflake.connector.connect(
@@ -282,12 +285,15 @@ jobs:
               role="TORONTO_DBT_ROLE",
               warehouse="TORONTO_XS_WH",
               database="TORONTO",
-              schema="ANALYTICS",
+              schema=os.environ["TORONTO_DBT_TARGET_SCHEMA"],
           )
+          schema = os.environ["TORONTO_DBT_TARGET_SCHEMA"]
+          if not re.fullmatch(r"ANALYTICS_STAGE_[0-9]+_[0-9]+", schema):
+              raise ValueError(f"Unsafe serving candidate schema: {schema!r}.")
           cursor = connection.cursor()
           try:
               cursor.execute(
-                  """CREATE TABLE IF NOT EXISTS TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA (
+                  f"""CREATE TABLE IF NOT EXISTS TORONTO.\"{schema}\".DASHBOARD_REFRESH_METADATA (
                       REFRESH_ID NUMBER(1,0) NOT NULL,
                       LAST_SUCCESSFUL_REFRESH_UTC TIMESTAMP_TZ NOT NULL,
                       SOURCE_COMMIT VARCHAR NOT NULL,
@@ -300,13 +306,16 @@ jobs:
               connection.close()
           PYMETA
 
-      - name: Regrant dashboard read-only access after dbt rebuild
+      - name: Grant dashboard read-only access to serving candidate
         run: |
           python - <<'PYGRANT'
           import os
-
+          import re
           import snowflake.connector
 
+          schema = os.environ["TORONTO_DBT_TARGET_SCHEMA"]
+          if not re.fullmatch(r"ANALYTICS_STAGE_[0-9]+_[0-9]+", schema):
+              raise ValueError(f"Unsafe serving candidate schema: {schema!r}.")
           connection = snowflake.connector.connect(
               account=os.environ["SNOWFLAKE_ACCOUNT"],
               user=os.environ["SNOWFLAKE_USER"],
@@ -314,10 +323,14 @@ jobs:
               role="TORONTO_DBT_ROLE",
               warehouse="TORONTO_XS_WH",
               database="TORONTO",
-              schema="ANALYTICS",
+              schema=schema,
           )
           cursor = connection.cursor()
           try:
+              cursor.execute(
+                  f'GRANT USAGE ON SCHEMA TORONTO."{schema}" '
+                  "TO ROLE TORONTO_DASHBOARD_ROLE"
+              )
               tables = (
                   "MART_ACTIVE_PERMIT_AGE",
                   "FCT_ACTIVE_PERMIT_REVISION",
@@ -327,10 +340,10 @@ jobs:
               )
               for table in tables:
                   cursor.execute(
-                      f"GRANT SELECT ON TABLE TORONTO.ANALYTICS.{table} "
+                      f'GRANT SELECT ON TABLE TORONTO."{schema}".{table} '
                       "TO ROLE TORONTO_DASHBOARD_ROLE"
                   )
-                  print(f"Granted dashboard SELECT on TORONTO.ANALYTICS.{table}")
+                  print(f"Granted dashboard SELECT on TORONTO.{schema}.{table}")
           finally:
               cursor.close()
               connection.close()
@@ -340,7 +353,12 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import re
           import snowflake.connector
+
+          schema = os.environ["TORONTO_DBT_TARGET_SCHEMA"]
+          if not re.fullmatch(r"ANALYTICS_STAGE_[0-9]+_[0-9]+", schema):
+              raise ValueError(f"Unsafe serving candidate schema: {schema!r}.")
 
           connection = snowflake.connector.connect(
               account=os.environ["SNOWFLAKE_ACCOUNT"],
@@ -349,7 +367,7 @@ jobs:
               role="TORONTO_DBT_ROLE",
               warehouse="TORONTO_XS_WH",
               database="TORONTO",
-              schema="ANALYTICS",
+              schema=schema,
           )
           cursor = connection.cursor()
           try:
@@ -363,7 +381,7 @@ jobs:
                   "SELECT TABLE_NAME "
                   "FROM TORONTO.INFORMATION_SCHEMA.TABLES "
                   "WHERE TABLE_SCHEMA = %s",
-                  ("ANALYTICS",),
+                  (schema,),
               )
               available = {str(row[0]).upper() for row in cursor.fetchall()}
               if "DASHBOARD_REFRESH_METADATA" not in available:
@@ -373,11 +391,11 @@ jobs:
                   raise ValueError(f"Serving relations are missing: {sorted(missing)}")
 
               for table in required:
-                  cursor.execute(f"SELECT COUNT(*) FROM TORONTO.ANALYTICS.{table}")
+                  cursor.execute(f'SELECT COUNT(*) FROM TORONTO."{schema}".{table}')
                   count = int(cursor.fetchone()[0])
                   if count == 0:
                       raise ValueError(f"Serving relation is empty: {table}")
-                  print(f"TORONTO.ANALYTICS.{table}: {count:,} rows")
+                  print(f"TORONTO.{schema}.{table}: {count:,} rows")
               print("Snowflake serving-schema build and relation checks passed.")
           finally:
               cursor.close()
@@ -391,7 +409,12 @@ jobs:
         run: |
           python - <<'PYREFRESH'
           import os
+          import re
           import snowflake.connector
+
+          schema = os.environ["TORONTO_DBT_TARGET_SCHEMA"]
+          if not re.fullmatch(r"ANALYTICS_STAGE_[0-9]+_[0-9]+", schema):
+              raise ValueError(f"Unsafe serving candidate schema: {schema!r}.")
 
           connection = snowflake.connector.connect(
               account=os.environ["SNOWFLAKE_ACCOUNT"],
@@ -400,13 +423,13 @@ jobs:
               role="TORONTO_DBT_ROLE",
               warehouse="TORONTO_XS_WH",
               database="TORONTO",
-              schema="ANALYTICS",
+              schema=schema,
               autocommit=False,
           )
           cursor = connection.cursor()
           try:
               cursor.execute(
-                  """MERGE INTO TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA AS target
+                  f"""MERGE INTO TORONTO.\"{schema}\".DASHBOARD_REFRESH_METADATA AS target
                   USING (
                       SELECT 1 AS REFRESH_ID,
                              CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()) AS LAST_SUCCESSFUL_REFRESH_UTC,
@@ -427,8 +450,7 @@ jobs:
                   (os.environ["SOURCE_COMMIT"], os.environ["SOURCE_RUN_ID"]),
               )
               cursor.execute(
-                  "SELECT LAST_SUCCESSFUL_REFRESH_UTC "
-                  "FROM TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA WHERE REFRESH_ID = 1"
+                  f'SELECT LAST_SUCCESSFUL_REFRESH_UTC FROM TORONTO."{schema}".DASHBOARD_REFRESH_METADATA WHERE REFRESH_ID = 1'
               )
               row = cursor.fetchone()
               if not row or row[0] is None:
@@ -442,3 +464,6 @@ jobs:
               cursor.close()
               connection.close()
           PYREFRESH
+
+      - name: Promote validated Snowflake serving candidate
+        run: python scripts/promote_snowflake_serving_candidate.py --stage-schema "$TORONTO_DBT_TARGET_SCHEMA"

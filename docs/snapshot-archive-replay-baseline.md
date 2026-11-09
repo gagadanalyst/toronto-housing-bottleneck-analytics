@@ -1,5 +1,11 @@
 # Snapshot replay baseline safety
 
+The legacy `promote-scd2-rebuild.yml` workflow is disabled. Production promotion
+must use the isolated candidate-validation workflows. If a RAW schema swap has
+already completed but its follow-up validation fails, retrying the same candidate
+will attempt to restore the previous RAW schema; inspect both schemas if the
+automatic rollback itself fails.
+
 ## Default operating mode
 
 The repository Actions variables below must remain unset or `false` until the
@@ -58,11 +64,10 @@ The joint recovery validator checks both 56-entry application ledgers against ar
 
 ## Snowflake historical rebuild and promotion
 
-The current canonical backlog loader targets `TORONTO.RAW`. Do not enable it or
-point it at production before the baseline contract has been established. Rebuild
-Snowflake history in a separate validation schema using the project's controlled
-isolated-replay procedure and the same archived Parquet files and extraction-time
-boundaries.
+The historical rebuild described here established the original production
+baseline. The current canonical backlog workflow no longer writes directly to
+`TORONTO.RAW`: each run clones RAW into a run-specific staging schema, loads and
+validates there, then promotes through an atomic schema swap.
 
 Before promotion, verify at minimum:
 
@@ -113,22 +118,33 @@ The serving workflow verifies that run and its RAW refresh job before building
 `TORONTO.ANALYTICS`. This avoids relying on a `workflow_run` event after a
 `GITHUB_TOKEN`-created workflow run.
 
-For a failed RAW run, rerun the failed job for the same run ID with
-`gh run rerun RAW_REFRESH_RUN_ID --failed`. The per-source ledger preserves a
-source already marked `succeeded`, and the immutable archive plus fixed SCD2
-boundary lets the loader resume only the failed/incomplete source. If RAW already
-passed but serving failed, dispatch serving again with the successful RAW run ID;
-do not reload RAW solely to retry dbt.
+For a failed RAW run, rerunning creates a fresh run/attempt candidate cloned from
+the last promoted RAW schema, then replays all still-unpromoted archives in
+extraction order. A rejected candidate remains available for diagnosis but does
+not become the next baseline; production contains neither partial source writes nor
+partial ledger updates. Stable archive identity and the original SCD2 boundary make
+the replay idempotent. If RAW already passed but serving failed, dispatch serving
+again with the successful RAW run ID; do not reload RAW solely to retry dbt.
 
-These are retry guarantees, not cross-table transaction guarantees. Both source
-bundles are validated before writes, and serving is not dispatched unless the
-whole RAW job succeeds. However, Active and Cleared are merged independently into
-production RAW, so one may commit while the other fails. `TORONTO.RAW` can be
-temporarily partially advanced; retries resume from the ledger. The serving dbt
-models are also built individually rather than published through a schema-wide
-atomic swap. Absolute all-or-nothing protection against every bad source value or
-mid-build failure would require separate staging and atomic promotion workflows;
-that stronger isolation is not implemented here.
+These are retry guarantees with separate promotion boundaries. Active and Cleared
+are loaded into the same RAW candidate; if either source load or candidate
+validation fails, canonical `TORONTO.RAW` is not swapped. Successful RAW promotion
+is followed by a separate dbt candidate build and ANALYTICS schema swap. A serving
+failure leaves the prior `TORONTO.ANALYTICS` active and can be retried without
+reloading RAW. DuckDB and Snowflake also promote independently; there is no
+distributed transaction across engines.
+
+New row-level quarantine is retained in a dedicated queryable table. NULL/blank
+keys and all rows from conflicting duplicate-key groups are excluded from clean
+SCD2. Redundant identical duplicate occurrences are retained but do not count as
+bad rows. Across the candidate generation, newly quarantined bad rows are
+aggregated across all newly replayed archives for each source independently.
+Promotion fails when either source total reaches 25% of that source's pre-run
+production current-row count. Quarantine rows already present in the promoted
+baseline are not counted. Quarantine rows remain in a rejected candidate for
+investigation; rejected DuckDB candidates also export an audit-only Release separate
+from recovery checkpoints. No historical quarantine backfill is done: the 28
+historical Parquet archives remain the source record for that period.
 
 Future successful backlog loads will add ledger entries beyond the fixed baseline
 and remain ordered by extraction timestamp. If any required variable is removed

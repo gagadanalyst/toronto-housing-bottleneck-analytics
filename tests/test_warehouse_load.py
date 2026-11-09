@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import duckdb
 import pytest
 
 SOURCES = ("active_permits", "cleared_permits")
-WAREHOUSE_PATH = Path("data/warehouse/toronto.duckdb")
+WAREHOUSE_PATH = Path(
+    os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS", "data/warehouse/toronto.duckdb")
+)
 
 
 def _latest_manifest(source_name: str) -> Path | None:
