@@ -73,8 +73,8 @@ def _assert_schema_baseline(cursor, schema: str, allowed_datasets: set[str]) -> 
 
     for table, expected in EXPECTED_METRICS.items():
         cursor.execute(
-            f'SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), '
-            f'COUNT_IF(_DLT_VALID_TO IS NOT NULL) '
+            f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), "
+            f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) "
             f'FROM TORONTO."{schema}".{table}'
         )
         total, current, expired = (int(value or 0) for value in cursor.fetchone())
@@ -86,10 +86,10 @@ def _assert_schema_baseline(cursor, schema: str, allowed_datasets: set[str]) -> 
             )
 
     cursor.execute(
-        f'SELECT COUNT(*), COUNT(DISTINCT SNAPSHOT_ID), '
-        f'COUNT(DISTINCT SOURCE_NAME), '
-        f'COUNT_IF(LOWER(STATUS) = \'succeeded\'), '
-        f'COUNT_IF(ERROR IS NOT NULL) '
+        f"SELECT COUNT(*), COUNT(DISTINCT SNAPSHOT_ID), "
+        f"COUNT(DISTINCT SOURCE_NAME), "
+        f"COUNT_IF(LOWER(STATUS) = 'succeeded'), "
+        f"COUNT_IF(ERROR IS NOT NULL) "
         f'FROM TORONTO."{schema}".TORONTO_SNAPSHOT_LEDGER'
     )
     rows, snapshots, sources, succeeded, errors = (
@@ -152,7 +152,7 @@ def _assert_schema_baseline(cursor, schema: str, allowed_datasets: set[str]) -> 
         raise ValueError(f"DLT pipeline state is incomplete: {state_counts}.")
 
     cursor.execute(
-        f'SELECT SCHEMA_NAME, COUNT_IF(STATUS = 0) '
+        f"SELECT SCHEMA_NAME, COUNT_IF(STATUS = 0) "
         f'FROM TORONTO."{schema}"._DLT_LOADS GROUP BY SCHEMA_NAME'
     )
     load_counts = {
@@ -185,8 +185,8 @@ def _rebase_pipeline_state(cursor, schema: str, source_schema: str) -> int:
             new_state = compress_state(payload)
             cursor.execute(
                 f'UPDATE TORONTO."{schema}"._DLT_PIPELINE_STATE '
-                'SET STATE = %s, VERSION = %s, ENGINE_VERSION = %s, VERSION_HASH = %s '
-                'WHERE PIPELINE_NAME = %s AND _DLT_LOAD_ID = %s',
+                "SET STATE = %s, VERSION = %s, ENGINE_VERSION = %s, VERSION_HASH = %s "
+                "WHERE PIPELINE_NAME = %s AND _DLT_LOAD_ID = %s",
                 (
                     new_state,
                     int(payload["_state_version"]),
