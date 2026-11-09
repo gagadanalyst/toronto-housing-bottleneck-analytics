@@ -156,6 +156,16 @@ def _manifest_records(manifest_root: Path, source_name: str) -> dict:
             "extracted_at_utc": str(manifest.get("extracted_at_utc", "")),
             "source_rows": row_count,
             "sha256": digest,
+            "extraction_started_at_utc": str(
+                manifest.get("extraction_started_at_utc", "")
+            ),
+            "source_commit": str(manifest.get("source_commit", "")),
+            "release_tag": str(
+                manifest.get("archive_reference", {}).get("release_tag", "")
+            ),
+            "asset_name": str(
+                manifest.get("archive_reference", {}).get("asset_name", "")
+            ),
         }
 
     expected = {

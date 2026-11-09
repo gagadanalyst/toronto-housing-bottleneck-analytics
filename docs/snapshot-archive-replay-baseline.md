@@ -5,7 +5,7 @@
 The repository Actions variables below must remain unset or `false` until the
 historical rebuild has been completed in isolated targets, DuckDB/Snowflake parity
 has passed, and the validated state and complete ledgers have been promoted to the
-canonical warehouses with rollback copies preserved:
+canonical warehouses with the immutable source archives and repeatable replay path retained:
 
 - `TORONTO_CANONICAL_REPLAY_ENABLED=true`
 - `TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID=<run_id>:<attempt>`
@@ -43,6 +43,19 @@ This is an isolated replay target. Do not publish it as `warehouse-latest` until
 the historical history, current-state counts, keys, SCD2 interval overlaps,
 quarantines, and parity checks have been reviewed.
 
+## Unified isolated recovery contract
+
+The isolated DuckDB and Snowflake historical replays use the same immutable archive
+selection, extraction-time ordering, per-source ledger lifecycle, and canonical dlt
+pipeline names (`toronto_active_permits_scd2` and
+`toronto_cleared_permits_scd2`). Before either source is written for a snapshot,
+both ledger rows are registered as `pending`; each source then transitions through
+`loading` to `succeeded` or `failed`. A retry preserves succeeded source rows and
+retries only an incomplete/failed source in the same isolated target.
+
+The joint recovery validator checks both 56-entry application ledgers against archive evidence, then validates DLT metadata in both targets. For these loaders, DLT 1.31.0 derives each pipeline's default DLT schema name from its canonical pipeline name; the validator therefore attributes `_dlt_loads.schema_name` to the matching canonical pipeline and requires at least 28 completed loads for each. Completed loads are checked against `_dlt_version` using both `schema_name` and `version_hash`. Existing `_dlt_pipeline_state` checkpoints are decoded with DLT's `decompress_state()` and validated against their pipeline, destination dataset, default schema, schema list, and completed load references. At least one checkpoint per pipeline is required, but a checkpoint is not required for every completed load. The workflow retains joint validation summaries as run artifacts. This validates the recovery process itself, not just equality of the final SCD2 tables.
+
+
 ## Snowflake historical rebuild and promotion
 
 The current canonical backlog loader targets `TORONTO.RAW`. Do not enable it or
@@ -59,7 +72,7 @@ Before promotion, verify at minimum:
 4. Full SCD2 validity intervals contain no overlaps or duplicate current keys.
 5. DuckDB and Snowflake historical validity timestamps and current state pass the
    agreed parity checks.
-6. A last-known-good copy of each canonical warehouse is available for rollback.
+6. The immutable approved snapshot archives and unified replay workflow remain available to reconstruct either warehouse; a known-corrupted production copy is not treated as a rollback baseline.
 
 Promotion is a separate controlled operation. This patch does not automate a
 Snowflake schema swap or replace canonical warehouse data. The baseline variables

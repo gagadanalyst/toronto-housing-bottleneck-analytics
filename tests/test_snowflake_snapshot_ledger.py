@@ -333,3 +333,139 @@ def test_prepare_snapshot_ledger_blocks_older_replay_when_newer_write_may_have_c
             release_tag="toronto-raw-snapshot-archive-2026-11",
             asset_name="toronto-raw-snapshot-bundle-100-1.zip",
         )
+
+
+def test_isolated_snapshot_ledger_name_is_validated():
+    assert (
+        refresh._validated_snapshot_ledger_table(
+            "TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER"
+        )
+        == "TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER"
+    )
+    with pytest.raises(ValueError, match="Unsafe Snowflake snapshot ledger table"):
+        refresh._validated_snapshot_ledger_table(
+            "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER; DROP TABLE X"
+        )
+
+
+def test_prepare_snapshot_ledger_uses_isolated_schema(monkeypatch):
+    cursor = FakeCursor(
+        statuses={"active_permits": "pending", "cleared_permits": "pending"}
+    )
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        refresh.snowflake.connector, "connect", lambda **kwargs: connection
+    )
+    table = "TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER"
+    refresh._prepare_snapshot_ledger(
+        {},
+        bundle=_bundle(),
+        run_id="100",
+        attempt="1",
+        commit="a" * 40,
+        release_tag="toronto-raw-snapshot-archive-2026-11",
+        asset_name="toronto-raw-snapshot-bundle-100-1.zip",
+        ledger_table=table,
+    )
+    sql = "\n".join(query for query, _ in cursor.queries)
+    assert table in sql
+    assert "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER" not in sql
+    assert cursor.closed and connection.closed
+
+
+def test_set_snapshot_source_status_uses_isolated_schema(monkeypatch):
+    cursor = FakeCursor()
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        refresh.snowflake.connector, "connect", lambda **kwargs: connection
+    )
+    table = "TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER"
+
+    refresh._set_snapshot_source_status(
+        {},
+        snapshot_id="100:1",
+        source_name="active_permits",
+        status="loading",
+        ledger_table=table,
+    )
+
+    update_queries = [
+        query
+        for query, _ in cursor.queries
+        if query.lstrip().upper().startswith("UPDATE")
+    ]
+    assert len(update_queries) == 1
+    assert table in update_queries[0]
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("invalid_status", ["unknown", "completed"])
+def test_prepare_snapshot_ledger_rejects_unsupported_status(
+    monkeypatch, invalid_status
+):
+    started = datetime(2026, 11, 7, 15, 0, tzinfo=UTC)
+    existing = [
+        (
+            "100:1",
+            "100",
+            1,
+            started,
+            "active_permits",
+            invalid_status,
+            "a" * 40,
+            "toronto-raw-snapshot-archive-2026-11",
+            "toronto-raw-snapshot-bundle-100-1.zip",
+        )
+    ]
+    cursor = FakeCursor(existing=existing)
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        refresh.snowflake.connector, "connect", lambda **kwargs: connection
+    )
+    with pytest.raises(RuntimeError, match="unsupported status"):
+        refresh._prepare_snapshot_ledger(
+            {},
+            bundle=_bundle(),
+            run_id="100",
+            attempt="1",
+            commit="a" * 40,
+            release_tag="toronto-raw-snapshot-archive-2026-11",
+            asset_name="toronto-raw-snapshot-bundle-100-1.zip",
+            ledger_table="TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER",
+        )
+    assert not any("MERGE INTO" in query for query, _ in cursor.queries)
+    assert cursor.closed and connection.closed
+
+
+def test_prepare_snapshot_ledger_rejects_changed_immutable_archive(monkeypatch):
+    started = datetime(2026, 11, 7, 15, 0, tzinfo=UTC)
+    existing = [
+        (
+            "100:1",
+            "100",
+            1,
+            started,
+            "active_permits",
+            "succeeded",
+            "b" * 40,
+            "toronto-raw-snapshot-archive-2026-11",
+            "toronto-raw-snapshot-bundle-100-1.zip",
+        )
+    ]
+    cursor = FakeCursor(existing=existing)
+    connection = FakeConnection(cursor)
+    monkeypatch.setattr(
+        refresh.snowflake.connector, "connect", lambda **kwargs: connection
+    )
+    with pytest.raises(RuntimeError, match="conflicts with immutable archive"):
+        refresh._prepare_snapshot_ledger(
+            {},
+            bundle=_bundle(),
+            run_id="100",
+            attempt="1",
+            commit="a" * 40,
+            release_tag="toronto-raw-snapshot-archive-2026-11",
+            asset_name="toronto-raw-snapshot-bundle-100-1.zip",
+            ledger_table="TORONTO.SNOWFLAKE_SCD2_REBUILD_20261108_12345.TORONTO_SNAPSHOT_LEDGER",
+        )
+    assert cursor.closed and connection.closed

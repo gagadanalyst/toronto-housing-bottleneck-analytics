@@ -405,6 +405,17 @@ def _snapshot_order(extracted_at, run_id: str, attempt: str | int):
     return parsed, int(run_id), int(attempt)
 
 
+def _validated_snapshot_ledger_table(value: str) -> str:
+    # Restrict the override to a fully qualified ledger in the TORONTO database.
+    if not re.fullmatch(
+        r"TORONTO\.[A-Z_][A-Z0-9_]*\.TORONTO_SNAPSHOT_LEDGER",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError(f"Unsafe Snowflake snapshot ledger table: {value!r}")
+    return value.upper()
+
+
 def _prepare_snapshot_ledger(
     connection_options: dict,
     *,
@@ -414,6 +425,7 @@ def _prepare_snapshot_ledger(
     commit: str,
     release_tag: str,
     asset_name: str,
+    ledger_table: str = SNAPSHOT_LEDGER_TABLE,
 ) -> dict[str, str]:
     """Create the durable per-source ledger and enforce chronological replay."""
     started = _timestamp(
@@ -422,12 +434,13 @@ def _prepare_snapshot_ledger(
     )
     current_order = _snapshot_order(started, run_id, attempt)
     snapshot_id = f"{run_id}:{attempt}"
+    ledger_table = _validated_snapshot_ledger_table(ledger_table)
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
         try:
             cursor.execute(
-                f"""CREATE TABLE IF NOT EXISTS {SNAPSHOT_LEDGER_TABLE} (
+                f"""CREATE TABLE IF NOT EXISTS {ledger_table} (
                     SNAPSHOT_ID VARCHAR NOT NULL,
                     SOURCE_RUN_ID VARCHAR NOT NULL,
                     SOURCE_RUN_ATTEMPT NUMBER(10,0) NOT NULL,
@@ -444,22 +457,50 @@ def _prepare_snapshot_ledger(
             )
         except Exception as exc:
             raise RuntimeError(
-                f"Cannot create or access {SNAPSHOT_LEDGER_TABLE}. "
+                f"Cannot create or access {ledger_table}. "
                 "The TORONTO_INGEST_ROLE needs USAGE on database TORONTO and "
                 "schema RAW, plus CREATE TABLE on schema TORONTO.RAW."
             ) from exc
 
         cursor.execute(
             f"""SELECT SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
-                       EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS
-                FROM {SNAPSHOT_LEDGER_TABLE}"""
+                       EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS,
+                       SOURCE_COMMIT, RELEASE_TAG, ASSET_NAME
+                FROM {ledger_table}"""
         )
         rows = cursor.fetchall()
-        current_statuses = {
-            str(source_name): str(status).lower()
-            for old_id, _old_run, _old_attempt, _old_started, source_name, status in rows
-            if old_id == snapshot_id
-        }
+        current_statuses = {}
+        for row in rows:
+            old_id, old_run, old_attempt, old_started, source_name, status = row[:6]
+            if old_id != snapshot_id:
+                continue
+            source_key = str(source_name)
+            if source_key not in SOURCE_NAMES or source_key in current_statuses:
+                raise RuntimeError(
+                    f"Snowflake ledger has an unexpected or duplicate source for {snapshot_id}: {source_key!r}."
+                )
+            old_timestamp = (
+                old_started.astimezone(UTC)
+                if isinstance(old_started, datetime)
+                else _timestamp(str(old_started), "ledger extraction timestamp")
+            )
+            if (
+                str(old_run) != run_id
+                or int(old_attempt) != int(attempt)
+                or old_timestamp != started.astimezone(UTC)
+                or (len(row) > 6 and row[6] is not None and str(row[6]) != commit)
+                or (len(row) > 7 and row[7] is not None and str(row[7]) != release_tag)
+                or (len(row) > 8 and row[8] is not None and str(row[8]) != asset_name)
+            ):
+                raise RuntimeError(
+                    f"Snowflake ledger identity conflicts with immutable archive {snapshot_id}/{source_key}."
+                )
+            normalized_status = str(status).lower()
+            if normalized_status not in {"pending", "loading", "succeeded", "failed"}:
+                raise RuntimeError(
+                    f"Snowflake ledger has unsupported status {status!r} for {snapshot_id}/{source_key}."
+                )
+            current_statuses[source_key] = normalized_status
         if set(current_statuses) == set(SOURCE_NAMES) and all(
             status == "succeeded" for status in current_statuses.values()
         ):
@@ -467,7 +508,7 @@ def _prepare_snapshot_ledger(
 
         grouped = {}
         for row in rows:
-            old_id, old_run, old_attempt, old_started, old_source, old_status = row
+            old_id, old_run, old_attempt, old_started, old_source, old_status = row[:6]
             if old_id == snapshot_id:
                 continue
             entry = grouped.setdefault(
@@ -514,7 +555,7 @@ def _prepare_snapshot_ledger(
 
         for name in SOURCE_NAMES:
             cursor.execute(
-                f"""MERGE INTO {SNAPSHOT_LEDGER_TABLE} AS target
+                f"""MERGE INTO {ledger_table} AS target
                     USING (
                         SELECT %s AS SNAPSHOT_ID,
                                %s AS SOURCE_RUN_ID,
@@ -560,7 +601,7 @@ def _prepare_snapshot_ledger(
             )
 
         cursor.execute(
-            f"SELECT SOURCE_NAME, STATUS FROM {SNAPSHOT_LEDGER_TABLE} WHERE SNAPSHOT_ID = %s",
+            f"SELECT SOURCE_NAME, STATUS FROM {ledger_table} WHERE SNAPSHOT_ID = %s",
             (snapshot_id,),
         )
         statuses = {
@@ -631,22 +672,24 @@ def _set_snapshot_source_status(
     source_name: str,
     status: str,
     error: str | None = None,
+    ledger_table: str = SNAPSHOT_LEDGER_TABLE,
 ) -> None:
     """Update and verify one per-source ledger status."""
     allowed = {"pending", "loading", "succeeded", "failed"}
     if status not in allowed:
         raise ValueError(f"Unsupported snapshot ledger status: {status!r}")
+    ledger_table = _validated_snapshot_ledger_table(ledger_table)
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
         cursor.execute(
-            f"""UPDATE {SNAPSHOT_LEDGER_TABLE}
+            f"""UPDATE {ledger_table}
                 SET STATUS = %s, ERROR = %s, UPDATED_AT = CURRENT_TIMESTAMP()
                 WHERE SNAPSHOT_ID = %s AND SOURCE_NAME = %s""",
             (status, error, snapshot_id, source_name),
         )
         cursor.execute(
-            f"SELECT STATUS FROM {SNAPSHOT_LEDGER_TABLE} "
+            f"SELECT STATUS FROM {ledger_table} "
             "WHERE SNAPSHOT_ID = %s AND SOURCE_NAME = %s",
             (snapshot_id, source_name),
         )

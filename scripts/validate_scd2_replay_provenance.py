@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 try:  # CLI execution
@@ -87,11 +88,20 @@ def _snapshot_map(summary: dict, source_name: str, label: str) -> dict:
             )
         rows = int(item.get("source_rows", 0))
         extracted_at = str(item.get("extracted_at_utc", ""))
-        if rows < 1 or not extracted_at:
+        commit = str(item.get("source_commit", ""))
+        release_tag = str(item.get("release_tag", ""))
+        asset_name = str(item.get("asset_name", ""))
+        if (
+            rows < 1
+            or not extracted_at
+            or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not release_tag.startswith("toronto-raw-snapshot-archive-")
+            or asset_name != f"toronto-raw-snapshot-bundle-{run_id}-{attempt}.zip"
+        ):
             raise ValueError(
                 f"{label}: incomplete source metadata for {source_name} {key}."
             )
-        result[key] = (digest, rows, extracted_at)
+        result[key] = (digest, rows, extracted_at, commit, release_tag, asset_name)
 
     expected_keys = {
         tuple(snapshot_id.split(":")) for snapshot_id in EXPECTED_SNAPSHOT_ID_SET
