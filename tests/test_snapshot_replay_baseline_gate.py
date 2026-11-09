@@ -259,9 +259,11 @@ def test_workflows_require_enabled_flag_and_baseline_contract():
     assert "always() && steps.duckdb_snapshot_replay.outcome != 'skipped'" not in cd
     assert "actions: write" in snowflake
     assert "if: success() && vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake
-    assert snowflake.index("Replay approved archived snapshots") < snowflake.index("Dispatch Snowflake serving build")
+    assert snowflake.index("Replay approved archived snapshots") < snowflake.index(
+        "Dispatch Snowflake serving build"
+    )
     assert "gh workflow run snowflake-serving-schema.yml" in snowflake
-    assert 'raw_refresh_run_id=\"$RAW_REFRESH_RUN_ID\"' in snowflake
+    assert 'raw_refresh_run_id="$RAW_REFRESH_RUN_ID"' in snowflake
     assert "workflow_run:" not in serving
     assert "raw_refresh_run_id:" in serving
     assert "inputs.raw_refresh_run_id != ''" in serving
