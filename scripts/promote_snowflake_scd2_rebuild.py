@@ -301,10 +301,6 @@ def promote(source_schema: str) -> None:
                 f'GRANT SELECT ON ALL TABLES IN SCHEMA TORONTO."{source_schema}" '
                 "TO ROLE TORONTO_DBT_ROLE"
             )
-            cursor.execute(
-                f'GRANT SELECT ON FUTURE TABLES IN SCHEMA TORONTO."{source_schema}" '
-                "TO ROLE TORONTO_DBT_ROLE"
-            )
 
             # Atomic cutover. The old RAW contents remain available under the
             # isolated schema name, which becomes the rollback copy.
