@@ -116,7 +116,10 @@ def _ensure_ledger(database: Path) -> None:
                 source_name VARCHAR NOT NULL,
                 status VARCHAR NOT NULL,
                 source_commit VARCHAR NOT NULL,
+                release_tag VARCHAR,
+                asset_name VARCHAR,
                 error VARCHAR,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (snapshot_id, source_name)
             )
@@ -124,6 +127,18 @@ def _ensure_ledger(database: Path) -> None:
         )
         # Upgrade ledgers created by earlier patch versions before using
         # ``excluded.updated_at`` in the ON CONFLICT update below.
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS release_tag VARCHAR"
+        )
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS asset_name VARCHAR"
+        )
+        connection.execute(
+            "ALTER TABLE raw.toronto_snapshot_ledger "
+            "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP"
+        )
         connection.execute(
             "ALTER TABLE raw.toronto_snapshot_ledger "
             "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP"
@@ -177,6 +192,8 @@ def _record_state(
     source_name: str,
     status: str,
     commit: str,
+    release_tag: str | None = None,
+    asset_name: str | None = None,
     error: str | None = None,
 ) -> None:
     with duckdb.connect(str(database)) as connection:
@@ -184,12 +201,14 @@ def _record_state(
             """
             INSERT INTO raw.toronto_snapshot_ledger
                 (snapshot_id, source_run_id, source_run_attempt,
-                 extraction_started_at_utc, source_name, status, source_commit, error,
-                 updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 extraction_started_at_utc, source_name, status, source_commit,
+                 release_tag, asset_name, error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (snapshot_id, source_name) DO UPDATE SET
                 status = excluded.status,
                 source_commit = excluded.source_commit,
+                release_tag = excluded.release_tag,
+                asset_name = excluded.asset_name,
                 error = excluded.error,
                 updated_at = excluded.updated_at
             """,
@@ -201,6 +220,8 @@ def _record_state(
                 source_name,
                 status,
                 commit,
+                release_tag,
+                asset_name,
                 error,
                 datetime.now(UTC),
             ],
@@ -275,6 +296,133 @@ def _assert_replay_order(
             "non-pending source status (its warehouse write may have committed): "
             f"{later_started}"
         )
+
+
+def _prepare_snapshot_ledger(
+    database: Path,
+    *,
+    snapshot_id: str,
+    run_id: str,
+    attempt: int,
+    started: datetime,
+    order: tuple[datetime, int, int],
+    commit: str,
+    release_tag: str,
+    asset_name: str,
+) -> dict[str, str]:
+    """Register both sources before writes, preserving successful source rows."""
+    _assert_replay_order(database, snapshot_id=snapshot_id, order=order)
+    with duckdb.connect(str(database)) as connection:
+        existing_rows = connection.execute(
+            """SELECT snapshot_id, source_run_id, source_run_attempt,
+                      extraction_started_at_utc, source_name, status,
+                      source_commit, release_tag, asset_name
+               FROM raw.toronto_snapshot_ledger WHERE snapshot_id = ?""",
+            [snapshot_id],
+        ).fetchall()
+        existing: dict[str, tuple] = {}
+        for row in existing_rows:
+            (
+                old_snapshot_id,
+                old_run_id,
+                old_attempt,
+                old_started,
+                old_source,
+                old_status,
+                old_commit,
+                old_release,
+                old_asset,
+            ) = row
+            source_name = str(old_source)
+            if source_name not in SOURCE_NAMES or source_name in existing:
+                raise RuntimeError(
+                    f"DuckDB ledger has an unexpected or duplicate source for {snapshot_id}: {source_name!r}."
+                )
+            old_timestamp = (
+                old_started.astimezone(UTC)
+                if isinstance(old_started, datetime)
+                else _utc_timestamp(str(old_started))
+            )
+            if (
+                str(old_snapshot_id) != snapshot_id
+                or str(old_run_id) != run_id
+                or int(old_attempt) != int(attempt)
+                or old_timestamp != started.astimezone(UTC)
+                or str(old_commit) != commit
+                or (old_release is not None and str(old_release) != release_tag)
+                or (old_asset is not None and str(old_asset) != asset_name)
+            ):
+                raise RuntimeError(
+                    f"DuckDB ledger identity conflicts with immutable archive {snapshot_id}/{source_name}."
+                )
+            if str(old_status).lower() not in {
+                "pending",
+                "loading",
+                "succeeded",
+                "failed",
+            }:
+                raise RuntimeError(
+                    f"DuckDB ledger has unsupported status {old_status!r} for {snapshot_id}/{source_name}."
+                )
+            existing[source_name] = row
+
+        now = datetime.now(UTC)
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            for source_name in SOURCE_NAMES:
+                if source_name in existing:
+                    connection.execute(
+                        """UPDATE raw.toronto_snapshot_ledger
+                           SET status = CASE WHEN lower(status) = 'succeeded'
+                                             THEN status ELSE 'pending' END,
+                               source_commit = ?, release_tag = ?, asset_name = ?,
+                               error = CASE WHEN lower(status) = 'succeeded'
+                                            THEN error ELSE NULL END,
+                               updated_at = ?
+                           WHERE snapshot_id = ? AND source_name = ?""",
+                        [
+                            commit,
+                            release_tag,
+                            asset_name,
+                            now,
+                            snapshot_id,
+                            source_name,
+                        ],
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO raw.toronto_snapshot_ledger
+                           (snapshot_id, source_run_id, source_run_attempt,
+                            extraction_started_at_utc, source_name, status,
+                            source_commit, release_tag, asset_name, error, updated_at)
+                           VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, ?)""",
+                        [
+                            snapshot_id,
+                            run_id,
+                            int(attempt),
+                            started,
+                            source_name,
+                            commit,
+                            release_tag,
+                            asset_name,
+                            now,
+                        ],
+                    )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        rows = connection.execute(
+            "SELECT source_name, status FROM raw.toronto_snapshot_ledger WHERE snapshot_id = ?",
+            [snapshot_id],
+        ).fetchall()
+
+    statuses = {str(name): str(status).lower() for name, status in rows}
+    if set(statuses) != set(SOURCE_NAMES):
+        raise RuntimeError(
+            f"DuckDB ledger did not register exactly both sources for {snapshot_id}: {statuses}."
+        )
+    return statuses
 
 
 def _update_matching_local_manifest(
@@ -416,7 +564,6 @@ def _load_archive(
                 f"extra={sorted(actual_members - expected_members)}"
             )
 
-        _assert_replay_order(database, snapshot_id=snapshot_id, order=order)
         failures: list[str] = []
         import tempfile
 
@@ -520,17 +667,21 @@ def _load_archive(
                     (name, source, manifest, parquet_path, boundary)
                 )
 
-            # Both Active and Cleared archives are fully validated before the
-            # first SCD2 write. A corrupt second source cannot leave the first
-            # source partially applied.
+            # Both source files passed preflight. Register both pending rows
+            # before the first SCD2 write, matching Snowflake's lifecycle.
+            statuses = _prepare_snapshot_ledger(
+                database,
+                snapshot_id=snapshot_id,
+                run_id=run_id,
+                attempt=int(attempt),
+                started=started,
+                order=order,
+                commit=commit,
+                release_tag=release_tag,
+                asset_name=asset_name,
+            )
             for name, source, manifest, parquet_path, boundary in prepared_sources:
-                with duckdb.connect(str(database), read_only=True) as connection:
-                    existing = connection.execute(
-                        "SELECT status FROM raw.toronto_snapshot_ledger "
-                        "WHERE snapshot_id = ? AND source_name = ?",
-                        [snapshot_id, name],
-                    ).fetchone()
-                if existing and existing[0] == "succeeded":
+                if statuses.get(name) == "succeeded":
                     print(f"Skipping {name}: archive {snapshot_id} is already loaded.")
                     continue
                 _record_state(
@@ -542,6 +693,8 @@ def _load_archive(
                     source_name=name,
                     status="loading",
                     commit=commit,
+                    release_tag=release_tag,
+                    asset_name=asset_name,
                 )
 
                 try:
@@ -558,6 +711,7 @@ def _load_archive(
                         "source_run_id": run_id,
                         "source_run_attempt": attempt,
                         "source_commit": commit,
+                        "extraction_started_at_utc": started.isoformat(),
                         "status": "success",
                         "warehouse_status": "loaded",
                         "warehouse_table": source.warehouse_table,
@@ -595,6 +749,8 @@ def _load_archive(
                         source_name=name,
                         status="succeeded",
                         commit=commit,
+                        release_tag=release_tag,
+                        asset_name=asset_name,
                     )
                     print(
                         f"Loaded {name} from {release_tag}/{asset_name} "
@@ -610,6 +766,8 @@ def _load_archive(
                         source_name=name,
                         status="failed",
                         commit=commit,
+                        release_tag=release_tag,
+                        asset_name=asset_name,
                         error=f"{type(exc).__name__}: {exc}"[:4000],
                     )
                     failures.append(f"{name}: {type(exc).__name__}: {exc}")

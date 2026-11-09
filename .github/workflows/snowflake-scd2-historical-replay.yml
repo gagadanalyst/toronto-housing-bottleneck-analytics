@@ -38,6 +38,40 @@ jobs:
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -e .
 
+      - name: Restore previous-attempt DuckDB replay state
+        if: ${{ github.run_attempt > 1 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/recovery/scd2-rebuild/duckdb-replay
+          restored=false
+          for ((candidate=GITHUB_RUN_ATTEMPT - 1; candidate >= 1; candidate--)); do
+            candidate_dir="$(mktemp -d)"
+            if gh run download "$GITHUB_RUN_ID" \
+              --name "duckdb-scd2-replay-${GITHUB_RUN_ID}-${candidate}" \
+              --dir "$candidate_dir"; then
+              if test -s "$candidate_dir/toronto-rebuilt.duckdb"; then
+                if python - "$candidate_dir/toronto-rebuilt.duckdb" <<'PY'
+          import sys
+          import duckdb
+          with duckdb.connect(sys.argv[1], read_only=True) as db:
+              db.execute("SELECT 1 FROM raw.toronto_snapshot_ledger LIMIT 1")
+          PY
+                then
+                  cp -a "$candidate_dir/." data/recovery/scd2-rebuild/duckdb-replay/
+                  restored=true
+                  echo "Restored DuckDB state from workflow attempt ${candidate}."
+                  rm -rf "$candidate_dir"
+                  break
+                fi
+              fi
+            fi
+            rm -rf "$candidate_dir"
+          done
+          if [[ "$restored" == false ]]; then
+            echo "No usable previous DuckDB replay artifact; starting fresh."
+          fi
+
       - name: Replay the exact historical baseline into isolated DuckDB
         run: |
           python scripts/load_duckdb_snapshot.py \
@@ -75,7 +109,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: duckdb-scd2-replay-${{ github.run_id }}
+          name: duckdb-scd2-replay-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb
             data/recovery/scd2-rebuild/duckdb-replay/manifests/
@@ -92,7 +126,7 @@ jobs:
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_SCD2_REBUILD_20261107_${{ github.run_id }}_${{ github.run_attempt }}
+      TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_SCD2_REBUILD_20261107_${{ github.run_id }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
       GH_TOKEN: ${{ github.token }}
@@ -137,7 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: snowflake-scd2-replay-evidence-${{ github.run_id }}
+          name: snowflake-scd2-replay-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: data/recovery/scd2-rebuild/snowflake-replay-evidence/
           if-no-files-found: warn
           compression-level: 6
@@ -163,16 +197,41 @@ jobs:
       - name: Install comparison dependencies
         run: |
           python -m pip install --upgrade "pip>=26.2.1,<27"
-          python -m pip install -e .
+          python -m pip install -e ".[snowflake]"
 
-      - name: Download both independent replay artifacts
+      - name: Download latest available DuckDB and Snowflake replay artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh run download "$GITHUB_RUN_ID" \
-            --name "duckdb-scd2-replay-${GITHUB_RUN_ID}" \
-            --dir data/recovery/scd2-rebuild/duckdb-replay
-          gh run download "$GITHUB_RUN_ID" \
-            --name "snowflake-scd2-replay-evidence-${GITHUB_RUN_ID}" \
-            --dir data/recovery/scd2-rebuild/snowflake-replay-evidence
+          download_latest_attempt_artifact() {
+            local prefix="$1" destination="$2"; shift 2
+            local candidate candidate_dir required_file complete
+            mkdir -p "$destination"
+            for ((candidate=GITHUB_RUN_ATTEMPT; candidate >= 1; candidate--)); do
+              candidate_dir="$(mktemp -d)"
+              if gh run download "$GITHUB_RUN_ID" \
+                --name "${prefix}-${GITHUB_RUN_ID}-${candidate}" \
+                --dir "$candidate_dir"; then
+                complete=true
+                for required_file in "$@"; do
+                  if [[ ! -s "$candidate_dir/$required_file" ]]; then complete=false; break; fi
+                done
+                if [[ "$complete" == true ]]; then
+                  cp -a "$candidate_dir/." "$destination/"
+                  rm -rf "$candidate_dir"
+                  echo "Downloaded ${prefix} from workflow attempt ${candidate}."
+                  return 0
+                fi
+              fi
+              rm -rf "$candidate_dir"
+            done
+            echo "No complete artifact found for ${prefix} in attempts 1..${GITHUB_RUN_ATTEMPT}." >&2
+            return 1
+          }
+          download_latest_attempt_artifact \
+            "duckdb-scd2-replay" data/recovery/scd2-rebuild/duckdb-replay toronto-rebuilt.duckdb replay-summary.json
+          download_latest_attempt_artifact \
+            "snowflake-scd2-replay-evidence" data/recovery/scd2-rebuild/snowflake-replay-evidence replay-summary.json raw_active_permits_history.csv.gz raw_cleared_permits_history.csv.gz
 
       - name: Prove both jobs loaded identical archived source snapshots
         id: provenance
@@ -181,6 +240,20 @@ jobs:
             --duckdb-summary data/recovery/scd2-rebuild/duckdb-replay/replay-summary.json \
             --snowflake-summary data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json \
             --output data/recovery/scd2-rebuild/replay-provenance-summary.json
+
+      - name: Validate both application ledgers and DLT metadata together
+        id: recovery
+        env:
+          SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+        run: |
+          SNOWFLAKE_SCHEMA="$(python -c 'import json; from pathlib import Path; print(json.loads(Path("data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json").read_text())["schema"])')"
+          python scripts/validate_scd2_replay_recovery.py \
+            --database data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb \
+            --dataset raw \
+            --snowflake-schema "$SNOWFLAKE_SCHEMA" \
+            --duckdb-summary data/recovery/scd2-rebuild/duckdb-replay/replay-summary.json \
+            --snowflake-summary data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json \
+            --output data/recovery/scd2-rebuild/recovery-metadata-summary.json
 
       - name: Compare exact SCD2 history multisets
         id: parity
@@ -195,18 +268,33 @@ jobs:
         env:
           PROVENANCE_RESULT: ${{ steps.provenance.outcome }}
           PARITY_RESULT: ${{ steps.parity.outcome }}
+          RECOVERY_RESULT: ${{ steps.recovery.outcome }}
         run: |
           {
             echo "## Historical SCD2 parity result"
             echo "- Archive provenance validation: \`${PROVENANCE_RESULT:-not_run}\`"
+            echo "- Joint ledger/DLT metadata validation: \`${RECOVERY_RESULT:-not_run}\`"
             echo "- Exact SCD2 history comparison: \`${PARITY_RESULT:-not_run}\`"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$PROVENANCE_RESULT" == "success" && "$PARITY_RESULT" == "success" ]]; then
-            echo "- **Overall result: PASS** — both warehouses consumed the approved archives and their SCD2 histories match exactly." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PROVENANCE_RESULT" == "success" && "$RECOVERY_RESULT" == "success" && "$PARITY_RESULT" == "success" ]]; then
+            echo "- **Overall result: PASS** — both ledgers and DLT metadata sets are valid, both warehouses consumed the approved archives, and their SCD2 histories match exactly." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- **Overall result: NOT PASSED** — inspect the failed or skipped validation step above." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Upload joint replay validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: historical-scd2-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            data/recovery/scd2-rebuild/replay-provenance-summary.json
+            data/recovery/scd2-rebuild/recovery-metadata-summary.json
+            data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json
+            data/recovery/scd2-rebuild/duckdb-replay/replay-summary.json
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 30
   final_outcome:
     needs: [duckdb_replay, snowflake_replay, compare_histories]
     if: ${{ always() }}
@@ -264,7 +352,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: historical-scd2-final-outcome-${{ github.run_id }}
+          name: historical-scd2-final-outcome-${{ github.run_id }}-${{ github.run_attempt }}
           path: data/recovery/scd2-rebuild/final-outcome/replay-outcome.json
           if-no-files-found: error
           compression-level: 6

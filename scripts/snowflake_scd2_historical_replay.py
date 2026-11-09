@@ -21,6 +21,19 @@ import snowflake.connector
 from pyarrow import Table
 
 try:  # CLI execution (python scripts/snowflake_scd2_historical_replay.py)
+    from snowflake_refresh_raw import (
+        PIPELINE_NAMES,
+        _prepare_snapshot_ledger,
+        _set_snapshot_source_status,
+    )
+except ImportError:  # pytest/module execution
+    from scripts.snowflake_refresh_raw import (
+        PIPELINE_NAMES,
+        _prepare_snapshot_ledger,
+        _set_snapshot_source_status,
+    )
+
+try:  # CLI execution (python scripts/snowflake_scd2_historical_replay.py)
     from snapshot_archive_backlog import SnapshotArchive, discover_archives
 except ImportError:  # pytest/module execution
     from scripts.snapshot_archive_backlog import SnapshotArchive, discover_archives
@@ -71,6 +84,10 @@ class Snapshot:
     row_count: int
     sha256: str
     manifest: dict
+    source_commit: str
+    extraction_started_at: str
+    release_tag: str
+    asset_name: str
 
 
 def _identifier(value: str, label: str) -> str:
@@ -347,6 +364,10 @@ def _extract_and_validate_bundles(
                         row_count=row_count,
                         sha256=digest,
                         manifest=manifest,
+                        source_commit=commit,
+                        extraction_started_at=started_at.isoformat(),
+                        release_tag=archived.release_tag,
+                        asset_name=archived.asset_name,
                     )
                 )
                 print(
@@ -407,6 +428,7 @@ class SnowflakeSession:
         self.uri = uri
         self.temp_dir: tempfile.TemporaryDirectory | None = None
         self.connection = None
+        self.connection_options: dict | None = None
 
     def __enter__(self):
         values, key_bytes = _connection_parameters(self.uri)
@@ -415,6 +437,7 @@ class SnowflakeSession:
         key_path.write_bytes(key_bytes)
         key_path.chmod(0o600)
         values["private_key_file"] = str(key_path)
+        self.connection_options = values
         passphrase = parse_qs(urlsplit(self.uri).query).get(
             "private_key_passphrase", [None]
         )[0]
@@ -473,14 +496,13 @@ class SnowflakeSession:
                 "SELECT COUNT(*) FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = %s",
                 (schema,),
             )
-            if int(cursor.fetchone()[0]) != 0:
-                raise ValueError(
-                    f"Refusing to reuse existing schema TORONTO.{schema}; choose a fresh replay run."
-                )
-            cursor.execute(f'CREATE SCHEMA TORONTO."{schema}"')
+            exists = int(cursor.fetchone()[0]) != 0
+            if not exists:
+                cursor.execute(f'CREATE SCHEMA TORONTO."{schema}"')
         finally:
             cursor.close()
-        print(f"Created isolated schema TORONTO.{schema}.", flush=True)
+        action = "Reusing" if exists else "Created"
+        print(f"{action} isolated schema TORONTO.{schema}.", flush=True)
 
     def drop_schema(self, schema: str) -> None:
         schema = _identifier(schema, "Snowflake schema")
@@ -778,7 +800,7 @@ def main() -> None:
         raise ValueError("TORONTO_WAREHOUSE_CREDENTIALS is missing.")
 
     schema = _identifier(app.dataset_name, "target dataset")
-    if not re.fullmatch(r"SNOWFLAKE_SCD2_REBUILD_20261107_[0-9]+_[0-9]+", schema):
+    if not re.fullmatch(r"SNOWFLAKE_SCD2_REBUILD_20261107_[0-9]+", schema):
         raise ValueError(
             "Refusing to replay outside the isolated historical-rebuild schema."
         )
@@ -837,41 +859,104 @@ def main() -> None:
         summary["timestamp_smoke_schema_cleaned"] = smoke_schema
 
         session.create_schema(schema)
+        ledger_table = f"TORONTO.{schema}.TORONTO_SNAPSHOT_LEDGER"
+        load_logs = {source_name: [] for source_name in SOURCE_NAMES}
+
+        # Match DuckDB's archive-at-a-time contract: register both source rows,
+        # then process Active and Cleared for that snapshot before advancing.
+        for snapshot_index, archived in enumerate(archives):
+            snapshot_pair = {
+                name: prepared[name][snapshot_index] for name in SOURCE_NAMES
+            }
+            first_snapshot = snapshot_pair[SOURCE_NAMES[0]]
+            statuses = _prepare_snapshot_ledger(
+                session.connection_options,
+                bundle=archived.bundle,
+                run_id=archived.run_id,
+                attempt=archived.attempt,
+                commit=first_snapshot.source_commit,
+                release_tag=archived.release_tag,
+                asset_name=archived.asset_name,
+                ledger_table=ledger_table,
+            )
+            failures = []
+            for source_name in SOURCE_NAMES:
+                source = sources[source_name]
+                snapshot = snapshot_pair[source_name]
+                log_record = {
+                    "run_id": snapshot.run_id,
+                    "run_attempt": snapshot.run_attempt,
+                    "extracted_at_utc": snapshot.extracted_at,
+                    "extraction_started_at_utc": snapshot.extraction_started_at,
+                    "source_commit": snapshot.source_commit,
+                    "release_tag": snapshot.release_tag,
+                    "asset_name": snapshot.asset_name,
+                    "source_rows": snapshot.row_count,
+                    "sha256": snapshot.sha256,
+                }
+                if statuses.get(source_name) == "succeeded":
+                    log_record["resumed_existing_success"] = True
+                    load_logs[source_name].append(log_record)
+                    print(
+                        f"Skipping {source_name}: archive {archived.snapshot_id} "
+                        "is already marked succeeded.",
+                        flush=True,
+                    )
+                    continue
+                _set_snapshot_source_status(
+                    session.connection_options,
+                    snapshot_id=archived.snapshot_id,
+                    source_name=source_name,
+                    status="loading",
+                    ledger_table=ledger_table,
+                )
+                try:
+                    result = load_scd2(
+                        credentials=credentials,
+                        snapshot_path=snapshot.path,
+                        source=source,
+                        dataset_name=schema,
+                        destination_kind="snowflake",
+                        pipeline_name=PIPELINE_NAMES[source_name],
+                        boundary_timestamp=snapshot.extracted_at,
+                    )
+                    log_record["quarantined_business_keys"] = len(
+                        result.quarantined_business_keys
+                    )
+                    log_record["quarantined_rows"] = result.quarantined_row_count
+                    load_logs[source_name].append(log_record)
+                    _set_snapshot_source_status(
+                        session.connection_options,
+                        snapshot_id=archived.snapshot_id,
+                        source_name=source_name,
+                        status="succeeded",
+                        ledger_table=ledger_table,
+                    )
+                    print(
+                        f"LOADED {source_name} snapshot {snapshot_index + 1}/"
+                        f"{len(archives)} run={snapshot.run_id} rows={snapshot.row_count:,}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    _set_snapshot_source_status(
+                        session.connection_options,
+                        snapshot_id=archived.snapshot_id,
+                        source_name=source_name,
+                        status="failed",
+                        error=f"{type(exc).__name__}: {exc}"[:4000],
+                        ledger_table=ledger_table,
+                    )
+                    failures.append(f"{source_name}: {type(exc).__name__}: {exc}")
+            if failures:
+                raise RuntimeError(
+                    f"Snowflake archive {archived.snapshot_id} was partially processed; "
+                    "retry the same isolated target to resume unfinished sources: "
+                    + "; ".join(failures)
+                )
+
         for source_name in SOURCE_NAMES:
             source = sources[source_name]
             snapshots = prepared[source_name]
-            load_log = []
-            for index, snapshot in enumerate(snapshots, start=1):
-                result = load_scd2(
-                    credentials=credentials,
-                    snapshot_path=snapshot.path,
-                    source=source,
-                    dataset_name=schema,
-                    destination_kind="snowflake",
-                    pipeline_name=f"toronto_replay_{source_name}_20261107_{workflow_run_id}_{attempt}",
-                    boundary_timestamp=snapshot.extracted_at,
-                )
-                load_log.append(
-                    {
-                        "run_id": snapshot.run_id,
-                        "run_attempt": snapshot.run_attempt,
-                        "extracted_at_utc": snapshot.extracted_at,
-                        "source_rows": snapshot.row_count,
-                        "sha256": snapshot.sha256,
-                        "quarantined_business_keys": len(
-                            result.quarantined_business_keys
-                        ),
-                        "quarantined_rows": result.quarantined_row_count,
-                    }
-                )
-                print(
-                    f"LOADED {source_name} snapshot {index}/{len(snapshots)} "
-                    f"run={snapshot.run_id} rows={snapshot.row_count:,} "
-                    f"quarantined_keys={len(result.quarantined_business_keys)} "
-                    f"quarantined_rows={result.quarantined_row_count}",
-                    flush=True,
-                )
-
             metrics = _table_metrics(session, schema, source)
             expected = EXPECTED_METRICS[source_name]
             actual_counts = {
@@ -933,7 +1018,7 @@ def main() -> None:
                 "latest_source_unambiguous_rows": len(expected_current),
                 "latest_source_quarantined_keys": len(latest_quarantined),
                 "latest_current_key_hash_parity": "passed",
-                "snapshot_loads": load_log,
+                "snapshot_loads": load_logs[source_name],
                 "history_export": str(export_path),
                 "history_export_rows": export_count,
             }

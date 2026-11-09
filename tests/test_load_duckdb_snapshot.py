@@ -473,3 +473,103 @@ def test_provenance_validator_rejects_a_shared_but_unapproved_snapshot_set():
 
     with pytest.raises(ValueError, match="approved 28-run baseline"):
         provenance_validation._validate_snapshot_scope(summary, "DuckDB")
+
+
+def test_prepare_snapshot_ledger_registers_both_sources_pending(tmp_path):
+    database = tmp_path / "pending-ledger.duckdb"
+    loader._ensure_ledger(database)
+    started = datetime(2026, 10, 27, 14, 0, tzinfo=UTC)
+
+    statuses = loader._prepare_snapshot_ledger(
+        database,
+        snapshot_id="40470002594:1",
+        run_id="40470002594",
+        attempt=1,
+        started=started,
+        order=loader.snapshot_order(started, "40470002594", "1"),
+        commit="a" * 40,
+        release_tag="toronto-raw-snapshot-archive-2026-10",
+        asset_name="toronto-raw-snapshot-bundle-40470002594-1.zip",
+    )
+
+    assert statuses == {"active_permits": "pending", "cleared_permits": "pending"}
+    with duckdb.connect(str(database), read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT source_name, status, release_tag, asset_name "
+            "FROM raw.toronto_snapshot_ledger ORDER BY source_name"
+        ).fetchall()
+    assert rows == [
+        (
+            "active_permits",
+            "pending",
+            "toronto-raw-snapshot-archive-2026-10",
+            "toronto-raw-snapshot-bundle-40470002594-1.zip",
+        ),
+        (
+            "cleared_permits",
+            "pending",
+            "toronto-raw-snapshot-archive-2026-10",
+            "toronto-raw-snapshot-bundle-40470002594-1.zip",
+        ),
+    ]
+
+
+def test_prepare_snapshot_ledger_preserves_success_and_resets_failure(tmp_path):
+    database = tmp_path / "retry-ledger.duckdb"
+    loader._ensure_ledger(database)
+    started = datetime(2026, 10, 27, 14, 0, tzinfo=UTC)
+    common = {
+        "database": database,
+        "snapshot_id": "40470002594:1",
+        "run_id": "40470002594",
+        "attempt": 1,
+        "started": started,
+        "order": loader.snapshot_order(started, "40470002594", "1"),
+        "commit": "a" * 40,
+        "release_tag": "toronto-raw-snapshot-archive-2026-10",
+        "asset_name": "toronto-raw-snapshot-bundle-40470002594-1.zip",
+    }
+    loader._prepare_snapshot_ledger(**common)
+    for name, status in (
+        ("active_permits", "succeeded"),
+        ("cleared_permits", "failed"),
+    ):
+        loader._record_state(
+            database,
+            snapshot_id=common["snapshot_id"],
+            run_id=common["run_id"],
+            attempt=1,
+            started=started,
+            source_name=name,
+            status=status,
+            commit=common["commit"],
+            release_tag=common["release_tag"],
+            asset_name=common["asset_name"],
+            error="simulated failure" if status == "failed" else None,
+        )
+
+    statuses = loader._prepare_snapshot_ledger(**common)
+    assert statuses == {"active_permits": "succeeded", "cleared_permits": "pending"}
+
+
+def test_prepare_snapshot_ledger_rejects_archive_identity_change(tmp_path):
+    database = tmp_path / "identity-ledger.duckdb"
+    loader._ensure_ledger(database)
+    started = datetime(2026, 10, 27, 14, 0, tzinfo=UTC)
+    common = {
+        "database": database,
+        "snapshot_id": "40470002594:1",
+        "run_id": "40470002594",
+        "attempt": 1,
+        "started": started,
+        "order": loader.snapshot_order(started, "40470002594", "1"),
+        "commit": "a" * 40,
+        "asset_name": "toronto-raw-snapshot-bundle-40470002594-1.zip",
+    }
+    loader._prepare_snapshot_ledger(
+        **common, release_tag="toronto-raw-snapshot-archive-2026-10"
+    )
+    with pytest.raises(RuntimeError, match="conflicts with immutable archive"):
+        loader._prepare_snapshot_ledger(
+            **common, release_tag="toronto-raw-snapshot-archive-2026-11"
+        )
