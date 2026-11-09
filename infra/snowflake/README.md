@@ -157,6 +157,66 @@ gh workflow run snowflake-serving-schema.yml \
   -f raw_refresh_run_id=RAW_REFRESH_RUN_ID
 ```
 
+### Failed-run recovery checklist
+
+Before retrying, inspect the failed workflow's job steps and identify the last
+successful promotion step. A failed workflow run does not by itself prove that
+production was unchanged. The RAW and serving promotion scripts attempt rollback
+after post-swap verification failures, but a reported rollback failure requires
+manual inspection before another write.
+
+| Failure point | Expected production state | Recovery action |
+|---|---|---|
+| RAW candidate preparation, archive replay, or validation fails before the RAW promotion step succeeds | Existing `TORONTO.RAW` remains active; the rejected run-scoped candidate is not the next baseline | Rerun the failed RAW workflow with a new attempt, or manually dispatch it using an approved CD archive identity as shown below. The new attempt creates a fresh candidate and replays still-pending approved archives in extraction order. |
+| RAW swap succeeds but the DLT state rebase is interrupted | The generation marker and retained prior schema identify the in-progress promotion | The next RAW preparation/promotion path can finish the matching state-only rebase when the retained stage schema is present. If logs report a failed automatic rollback, a missing retained schema, or a generation mismatch, stop and inspect `TORONTO.RAW`, the corresponding `RAW_STAGE_<run_id>_<attempt>` schema, its candidate-control marker, and DLT state before retrying. |
+| RAW promotion succeeds and the separate serving workflow fails | Promoted `TORONTO.RAW` remains active; the prior `TORONTO.ANALYTICS` remains active until a serving candidate passes | Retry only the serving workflow with the successful RAW run ID. Do not replay RAW solely to rebuild dbt. |
+| Serving candidate build or pre-promotion validation fails | Existing `TORONTO.ANALYTICS` remains active | Retry the serving workflow against the same successful RAW run ID. It creates a fresh serving candidate for the new attempt. |
+| Serving swap verification or automatic rollback fails | The active and retained serving schemas may need reconciliation | Stop and inspect `TORONTO.ANALYTICS` and the corresponding `ANALYTICS_STAGE_<run_id>_<attempt>` schema before another serving promotion. |
+
+For a pre-promotion RAW failure, rerun the failed refresh job as a new workflow
+attempt (which creates a fresh run-scoped candidate):
+
+```bash
+gh run rerun RAW_WORKFLOW_RUN_ID --failed \
+  --repo gagadanalyst/toronto-housing-bottleneck-analytics
+```
+
+Use the manual-dispatch command below when the original automatic handoff was
+missed or when you need to select the latest approved archive to reconcile. Do
+not use a RAW rerun just to retry serving after RAW has already been promoted.
+
+To manually retry RAW when the automatic repository-dispatch handoff was missed,
+select the approved CD snapshot through which the backlog should be reconciled.
+The workflow replays incomplete archives up to and including that selected snapshot;
+it verifies the Release tag and immutable asset name. Use the CD run ID, its
+workflow attempt, and the monthly archive Release tag:
+
+```bash
+gh workflow run snowflake-canonical-raw-refresh.yml \
+  --ref main \
+  -f snapshot_run_id=CD_RUN_ID \
+  -f snapshot_run_attempt=CD_RUN_ATTEMPT \
+  -f release_tag=toronto-raw-snapshot-archive-YYYY-MM \
+  -f confirm_canonical_raw=true
+```
+
+If the RAW promotion step succeeded but only the subsequent serving-dispatch step
+failed, first verify that the intended generation is now canonical in
+`TORONTO.RAW`. The RAW workflow may be marked failed because the dispatch failed,
+so the serving workflow's upstream-run verification will reject that run ID. In
+that specific case, use the deliberate manual serving path without
+`raw_refresh_run_id` (the empty input skips upstream-run verification):
+
+```bash
+gh workflow run snowflake-serving-schema.yml \
+  --ref main \
+  -f confirm_serving_schema=true
+```
+
+All manual runs still require `SNOWFLAKE_OPERATIONS_ENABLED=true`; canonical RAW
+also requires the canonical replay gate and baseline variables. The two warehouses
+remain independent: a successful promotion in one does not roll back the other.
+
 ### Disable Snowflake or switch back at trial end
 
 Perform these as separate steps; disabling the workflow gate does not change the dashboard backend.
@@ -259,4 +319,6 @@ The same-snapshot [DuckDB/Snowflake parity run](https://github.com/gagadanalyst/
 
 After PR #82, the full automatic chain succeeded on commit [`e8bb994`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/e8bb994c8ec664d2da7d12d1c296a1b15da3dc49) on **October 27, 2026, Toronto time**: [CI](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622105661), [CD/publication](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622186735), [automatic RAW refresh](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40622867433), and [automatic serving build](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/40623059248). These runs verify workflow chaining, not parity between old DuckDB SCD2 history and the intentionally fresh Snowflake baseline.
 
-The latest automated chain succeeded on **November 2, 2026**: [CD #92](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396374837), [canonical RAW refresh #37](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396850955), and [serving build #38](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41397052684) completed successfully on commit `bf27af2`. The serving build passed 52/52 dbt resources and verified all four dashboard relations were non-empty. This records that run's result; it does not establish the setting's state after that date.
+An earlier automated chain succeeded on **November 2, 2026**: [CD #92](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396374837), [canonical RAW refresh #37](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41396850955), and [serving build #38](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/41397052684) completed successfully on commit `bf27af2`. The serving build passed 52/52 dbt resources and verified all four dashboard relations were non-empty.
+
+The latest verified production chain succeeded on **November 9, 2026**, on merge commit [`6999487`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/69994872b36df99970d734abeaad9b9bd6dc2444): [canonical RAW refresh run 42612648618](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42612648618) prepared, replayed, validated, and promoted the isolated RAW candidate, then dispatched the serving build; [serving run 42613324641](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42613324641) verified the upstream RAW run, built and tested dbt, checked dashboard relations/metadata/read access, and promoted the serving candidate. The corresponding [CD run 42612402884](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42612402884) also succeeded. This is dated run evidence, not a guarantee about later refreshes.

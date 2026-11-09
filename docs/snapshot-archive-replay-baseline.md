@@ -1,27 +1,33 @@
 # Snapshot replay baseline safety
 
-The legacy `promote-scd2-rebuild.yml` workflow is disabled. Production promotion
-must use the isolated candidate-validation workflows. If a RAW schema swap has
-already completed but its follow-up validation fails, retrying the same candidate
-will attempt to restore the previous RAW schema; inspect both schemas if the
-automatic rollback itself fails.
+The legacy `promote-scd2-rebuild.yml` workflow is disabled. The one-time
+historical baseline promotion is complete; routine production refreshes must use
+the current isolated DuckDB CD and Snowflake RAW/serving candidate workflows. A
+post-swap validation failure triggers an automatic rollback attempt. If the workflow
+reports that rollback failed, do not blindly retry: inspect `TORONTO.RAW` and the
+retained run-specific RAW stage schema before any further promotion.
 
 ## Default operating mode
 
-The repository Actions variables below must remain unset or `false` until the
-historical rebuild has been completed in isolated targets, DuckDB/Snowflake parity
-has passed, and the validated state and complete ledgers have been promoted to the
-canonical warehouses with the immutable source archives and repeatable replay path retained:
+The historical rebuild has now been completed in isolated targets, DuckDB/Snowflake
+parity passed, and the validated history and complete ledgers were promoted to the
+canonical warehouses. The fixed promoted baseline is `42022028625:1`, containing
+28 distinct snapshots. Canonical backlog replay uses these baseline controls:
 
 - `TORONTO_CANONICAL_REPLAY_ENABLED=true`
-- `TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID=<run_id>:<attempt>`
-- `TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT=<number>`
+- `TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID=42022028625:1`
+- `TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT=28`
 
-The baseline ID must identify the final snapshot included in the promoted history.
-The count must equal the number of distinct snapshots at or before that baseline
-in the promoted ledgers. Both Active and Cleared must be marked `succeeded` for
-every snapshot in that range. The runtime guards verify the ID, count, and
-per-source completeness; an arbitrary single successful ledger row is insufficient.
+Keep the baseline ID and count fixed: they identify the final snapshot in the
+historical baseline, not the moving total of later production snapshots. Both
+Active and Cleared must be marked `succeeded` for every snapshot through that
+baseline. Runtime guards verify the ID, count, and per-source completeness; an
+arbitrary single successful ledger row is insufficient.
+
+If any canonical replay variable is unset, incomplete, or invalid, the workflows
+fail closed for warehouse replay. The separate `SNOWFLAKE_OPERATIONS_ENABLED`
+variable controls whether Snowflake compute is permitted; it does not replace the
+canonical replay baseline controls.
 
 While the variables are unset or incomplete:
 
@@ -79,23 +85,24 @@ Before promotion, verify at minimum:
    agreed parity checks.
 6. The immutable approved snapshot archives and unified replay workflow remain available to reconstruct either warehouse; a known-corrupted production copy is not treated as a rollback baseline.
 
-Production promotion is now carried out by the manually dispatched
-`promote-scd2-rebuild.yml` workflow with explicit confirmation and exact replay
-run inputs. It revalidates the isolated DuckDB/Snowflake recovery, builds and
-tests DuckDB dbt, atomically swaps the validated isolated Snowflake schema into
-`TORONTO.RAW` (retaining the previous RAW under the isolated schema name), rebases
-the DLT pipeline state, and validates promoted RAW against DuckDB and archive
-evidence before publishing the recovery checkpoint and four `warehouse-latest`
-assets. Set the baseline variables only after this controlled promotion and
-serving validation have succeeded.
+The one-time historical production promotion completed on November 9, 2026
+([promotion run 42562947635](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42562947635)).
+That historical rebuild workflow is now disabled; it is not the routine production
+refresh path. Routine DuckDB publication and Snowflake RAW/serving promotion use
+the current run-scoped candidate workflows described in the [Snowflake operations
+guide](../infra/snowflake/README.md). The fixed baseline variables above were
+activated only after the historical promotion and validation completed.
 
-## Enabling future canonical replay
+## Canonical replay baseline validation
 
-After promotion, configure all three repository Actions variables with the exact
-baseline values. The scripts verify that the canonical DuckDB ledger and
-`TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER` exist, that the declared baseline snapshot is
-fully complete for both sources, and that the number of snapshots through that
-baseline matches the declared count.
+The canonical replay baseline controls were configured after the
+November 9 historical promotion. The scripts verify that the canonical
+DuckDB ledger and Snowflake snapshot ledger exist, that the declared
+baseline snapshot is complete for both sources, and that the number
+of snapshots through that baseline matches the configured count.
+
+Keep these values fixed for routine replay. Changing the historical
+baseline requires a separately validated recovery and promotion.
 
 ## Production recovery and promotion completed
 
@@ -109,6 +116,7 @@ baseline rather than included in its count.
 - Production promotion: [run 42562947635](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42562947635). The isolated Snowflake rebuild was swapped into `TORONTO.RAW`; the previous RAW schema was retained as `TORONTO.SNOWFLAKE_SCD2_REBUILD_20261107_42547265259`. DuckDB recovery checkpoint and all four `warehouse-latest` assets were published and verified.
 - First post-recovery CD: [run 42564296816](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42564296816); its independent Snowflake RAW replay passed in [run 42564508188](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42564508188).
 - Snowflake serving rebuild after that RAW refresh: [run 42565279093](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42565279093), 52/52 dbt resources passed and the four dashboard-facing relations were verified.
+- Post-PR #107 reliability verification on merge commit [`6999487`](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/commit/69994872b36df99970d734abeaad9b9bd6dc2444): [CD / DuckDB publication run 42612402884](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42612402884), [Snowflake RAW run 42612648618](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42612648618), and [Snowflake serving run 42613324641](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/runs/42613324641) all succeeded. CD published the validated DuckDB recovery checkpoint and rolling assets; RAW and serving each passed isolated candidate validation and promotion.
 
 ## Serving workflow handoff and retry contract
 
@@ -133,6 +141,27 @@ is followed by a separate dbt candidate build and ANALYTICS schema swap. A servi
 failure leaves the prior `TORONTO.ANALYTICS` active and can be retried without
 reloading RAW. DuckDB and Snowflake also promote independently; there is no
 distributed transaction across engines.
+
+## Routine failure recovery
+
+Use the last successful promotion boundary, not just the overall workflow conclusion,
+to choose the recovery action. The detailed Snowflake commands and swap-recovery
+checks are in the [Snowflake operations guide](../infra/snowflake/README.md).
+
+| Failure point | Production boundary | Recovery guidance |
+|---|---|---|
+| CD extraction or snapshot approval fails | Warehouse loading is gated until both source snapshots are complete and approved; the raw evidence archive is independent | Rerun an eligible CD attempt after resolving the source/API issue. Do not load an incomplete or unapproved bundle. |
+| DuckDB candidate replay, SCD2/quarantine validation, or dbt fails before candidate promotion | The last immutable DuckDB recovery checkpoint remains the restore point | Rerun the failed CD data-publication job. The next attempt restores the latest verified checkpoint, creates a fresh candidate, and replays the approved archive backlog. Do not promote a failed runner-local candidate. |
+| DuckDB recovery-checkpoint publication fails before a complete checkpoint is verified | The latest checkpoint that passes integrity checks remains the restore point | Rerun the failed CD data-publication job. The next attempt restores the last verified checkpoint and replays the approved immutable archive backlog. Inspect Release assets if publication was partial; do not manually use an incomplete asset pair. |
+| DuckDB rolling `warehouse-latest` publication fails after the new recovery checkpoint was published | The validated immutable recovery checkpoint has already advanced | A later CD attempt restores that checkpoint and retries publication without replaying from an older warehouse state. If the publisher reports that rollback also failed, inspect its recovery backup artifact and Release assets before another publication attempt. |
+| Snowflake RAW candidate fails before promotion | Existing canonical `TORONTO.RAW` remains active; the rejected stage is not used as the next baseline | Retry RAW with a fresh workflow attempt so it clones the last promoted RAW and replays still-pending approved archives in extraction order. Do not reuse a stale candidate. |
+| Snowflake RAW fails during/after swap or reports rollback failure | A schema swap may have occurred; the old RAW schema is retained under the run-specific stage name when the swap succeeds | Check the RAW promotion step, candidate-generation marker, canonical DLT state, and both schemas. The automatic recovery path can finish a matching interrupted DLT rebase when the retained schema exists. If rollback failed or the state is ambiguous, stop and inspect before retrying. |
+| Snowflake serving fails after RAW succeeds | The successful RAW promotion remains active; the prior `TORONTO.ANALYTICS` remains active until serving promotion | Retry only the serving workflow with the successful RAW run ID. Do not reload RAW merely to retry dbt. If RAW promotion succeeded but the serving-dispatch step failed, verify canonical RAW and use the deliberate manual serving dispatch without a RAW run ID, as described in the Snowflake guide. |
+| One backend succeeds and the other fails | DuckDB and Snowflake promote independently | Recover only the failed backend; there is no distributed transaction and no automatic cross-backend rollback. |
+
+A rejected DuckDB quarantine-audit Release is evidence for investigation, not a
+recovery checkpoint. Restore only the verified immutable DuckDB recovery checkpoint;
+never substitute the quarantine-audit database or a rejected candidate.
 
 New row-level quarantine is retained in a dedicated queryable table. NULL/blank
 keys and all rows from conflicting duplicate-key groups are excluded from clean
