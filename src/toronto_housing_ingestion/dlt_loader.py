@@ -627,10 +627,13 @@ def _persist_snowflake_quarantine(
             role="TORONTO_INGEST_ROLE",
             warehouse="TORONTO_XS_WH",
             database="TORONTO",
-            schema=schema,
         )
         cursor = connection.cursor()
         try:
+            # Quarantine is persisted before the first dlt load creates its
+            # run-scoped destination schema, so initialize that schema here.
+            cursor.execute(f'CREATE SCHEMA IF NOT EXISTS TORONTO."{schema}"')
+            cursor.execute(f'USE SCHEMA TORONTO."{schema}"')
             cursor.execute(
                 f"""CREATE TABLE IF NOT EXISTS {target} (
                     QUARANTINE_ID VARCHAR NOT NULL,
