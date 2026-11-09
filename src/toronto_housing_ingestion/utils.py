@@ -157,9 +157,9 @@ def key_quality_warnings(
 ) -> list[dict[str, Any]]:
     """Check configured natural keys and return warnings without failing extraction.
 
-    A bad natural key is a data-quality problem, not a reason to discard the raw
-    source snapshot. Callers can use the returned warnings to block an unsafe
-    warehouse merge while keeping the Parquet file.
+    A bad row-level natural key is quarantined by the SCD2 loader, not a reason to
+    discard the raw source snapshot. Missing key columns are structural defects and
+    remain warehouse blockers while the Parquet file is preserved.
     """
     if not key_columns:
         return []
@@ -184,7 +184,10 @@ def key_quality_warnings(
         missing_values = int(
             connection.execute(
                 "SELECT COUNT(*) FROM read_parquet(?) WHERE "
-                + " OR ".join(f"{_quote_identifier(c)} IS NULL" for c in actual_keys),
+                + " OR ".join(
+                    f"{_quote_identifier(c)} IS NULL OR TRIM(CAST({_quote_identifier(c)} AS VARCHAR)) = ''"
+                    for c in actual_keys
+                ),
                 [str(parquet_path)],
             ).fetchone()[0]
         )

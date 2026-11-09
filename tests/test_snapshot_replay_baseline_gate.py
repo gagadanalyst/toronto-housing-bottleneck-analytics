@@ -255,10 +255,10 @@ def test_workflows_require_enabled_flag_and_baseline_contract():
 
     assert "inputs.confirm_canonical_raw == true" in snowflake
     assert "github.event_name == 'workflow_dispatch' &&" in snowflake
-    assert "steps.duckdb_snapshot_replay.outcome == 'success'" in cd
-    assert "always() && steps.duckdb_snapshot_replay.outcome != 'skipped'" not in cd
+    assert "steps.promote_duckdb_candidate.outcome == 'success'" in cd
+    assert "always() && steps.promote_duckdb_candidate.outcome != 'skipped'" not in cd
     assert "actions: write" in snowflake
-    assert "if: success() && vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake
+    assert "steps.promote_raw_candidate.outcome == 'success'" in snowflake
     assert snowflake.index("Replay approved archived snapshots") < snowflake.index(
         "Dispatch Snowflake serving build"
     )

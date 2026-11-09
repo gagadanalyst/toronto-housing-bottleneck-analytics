@@ -50,3 +50,28 @@ def test_duplicate_keys_are_warnings(tmp_path: Path) -> None:
 
     assert warnings[0]["type"] == "duplicate_key"
     assert warnings[0]["rows"] == 1
+
+
+def test_blank_and_null_business_keys_are_reported_as_row_level_warnings(
+    tmp_path: Path,
+) -> None:
+    pytest = __import__("pytest")
+    pytest.importorskip("duckdb")
+    pytest.importorskip("pyarrow")
+
+    path = tmp_path / "invalid-keys.parquet"
+    frame = pd.DataFrame(
+        {
+            "permit_num": [None, "   ", "26 123456 BLD"],
+            "revision_num": ["00", "00", "00"],
+        }
+    )
+    frame.to_parquet(path, index=False)
+
+    warnings = utils.key_quality_warnings(
+        path, ("permit_num", "revision_num"), "active_permits"
+    )
+
+    missing = next(item for item in warnings if item["type"] == "missing_key")
+    assert missing["rows"] == 2
+    assert not any(item["type"] == "missing_key_columns" for item in warnings)

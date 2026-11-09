@@ -42,6 +42,22 @@ MAX_METADATA_AGE_SECONDS = 36 * 60 * 60
 SNAPSHOT_LEDGER_TABLE = "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
 
 
+def _validated_dataset_schema(value: str) -> str:
+    """Accept only the run-scoped RAW staging schema, never production RAW."""
+    normalized = str(value).upper()
+    if not re.fullmatch(r"RAW_STAGE_[0-9]+_[0-9]+", normalized):
+        raise ValueError(
+            "Snowflake archive loading is restricted to a run-scoped "
+            "TORONTO.RAW_STAGE_<run_id>_<attempt> candidate schema."
+        )
+    return normalized
+
+
+def _snapshot_ledger_table(dataset: str) -> str:
+    schema = _validated_dataset_schema(dataset)
+    return f"TORONTO.{schema}.TORONTO_SNAPSHOT_LEDGER"
+
+
 def _read_json(value: bytes, label: str) -> dict:
     parsed = json.loads(value)
     if not isinstance(parsed, dict):
@@ -269,17 +285,20 @@ def _snowflake_connection_options(credentials: str, key_path: Path) -> dict[str,
     }
 
 
-def _watermark(cursor, pipeline_name: str):
+def _watermark(cursor, pipeline_name: str, dataset: str) -> datetime | None:
+    schema = _validated_dataset_schema(dataset)
     cursor.execute(
-        "SELECT MAX(inserted_at) "
-        "FROM TORONTO.RAW._DLT_LOADS "
+        f'SELECT MAX(inserted_at) FROM TORONTO."{schema}"._DLT_LOADS '
         "WHERE schema_name = %s AND status = 0",
         (pipeline_name,),
     )
     return cursor.fetchone()[0]
 
 
-def _connect_and_preflight(connection_options: dict) -> dict[str, datetime]:
+def _connect_and_preflight(
+    connection_options: dict, dataset: str
+) -> dict[str, datetime]:
+    schema_name = _validated_dataset_schema(dataset)
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
@@ -287,21 +306,28 @@ def _connect_and_preflight(connection_options: dict) -> dict[str, datetime]:
         role, database, schema = cursor.fetchone()
         if str(role).upper() != "TORONTO_INGEST_ROLE":
             raise ValueError(f"Unexpected Snowflake role: {role!r}")
-        if str(database).upper() != "TORONTO" or str(schema).upper() != "RAW":
+        if str(database).upper() != "TORONTO" or str(schema).upper() != schema_name:
             raise ValueError(
-                f"Unexpected Snowflake session context: database={database!r}, schema={schema!r}"
+                f"Unexpected Snowflake session context: database={database!r}, "
+                f"schema={schema!r}; expected TORONTO.{schema_name}."
             )
 
         cursor.execute(
             "SELECT TABLE_NAME FROM TORONTO.INFORMATION_SCHEMA.TABLES "
-            "WHERE TABLE_SCHEMA = 'RAW'"
+            "WHERE TABLE_SCHEMA = %s",
+            (schema_name,),
         )
         available = {str(row[0]).upper() for row in cursor.fetchall()}
-        required = {*EXPECTED_TABLES.values(), "_DLT_LOADS"}
+        required = {
+            *EXPECTED_TABLES.values(),
+            "_DLT_LOADS",
+            "TORONTO_SNAPSHOT_LEDGER",
+            "_DLT_PIPELINE_STATE",
+        }
         missing = required - available
         if missing:
             raise ValueError(
-                f"TORONTO.RAW is missing required existing tables: {sorted(missing)}"
+                f"TORONTO.{schema_name} is missing required cloned tables: {sorted(missing)}"
             )
 
         watermarks: dict[str, datetime] = {}
@@ -309,7 +335,8 @@ def _connect_and_preflight(connection_options: dict) -> dict[str, datetime]:
             table = EXPECTED_TABLES[name]
             cursor.execute(
                 f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), "
-                f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) FROM TORONTO.RAW.{table}"
+                f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) "
+                f'FROM TORONTO."{schema_name}".{table}'
             )
             total, current, expired = cursor.fetchone()
             if (
@@ -318,17 +345,17 @@ def _connect_and_preflight(connection_options: dict) -> dict[str, datetime]:
                 or int(total) != int(current) + int(expired or 0)
             ):
                 raise ValueError(
-                    f"TORONTO.RAW.{table} preflight counts do not reconcile: "
+                    f"TORONTO.{schema_name}.{table} preflight counts do not reconcile: "
                     f"total={total}, current={current}, expired={expired}"
                 )
-            watermark = _watermark(cursor, PIPELINE_NAMES[name])
+            watermark = _watermark(cursor, PIPELINE_NAMES[name], schema_name)
             if watermark is None:
                 raise ValueError(
                     f"No successful prior dlt load metadata found for {PIPELINE_NAMES[name]}"
                 )
             watermarks[name] = watermark
             print(
-                f"Preflight TORONTO.RAW.{table}: total={int(total):,}, "
+                f"Preflight TORONTO.{schema_name}.{table}: total={int(total):,}, "
                 f"current={int(current):,}, expired={int(expired or 0):,}; "
                 f"last successful load={watermark}"
             )
@@ -342,7 +369,9 @@ def _verify_refresh(
     connection_options: dict,
     old_watermarks: dict[str, datetime],
     expected_sources: tuple[str, ...] = SOURCE_NAMES,
+    dataset: str = "RAW_STAGE_0_0",
 ) -> None:
+    schema_name = _validated_dataset_schema(dataset)
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
@@ -350,7 +379,8 @@ def _verify_refresh(
             table = EXPECTED_TABLES[name]
             cursor.execute(
                 f"SELECT COUNT(*), COUNT_IF(_DLT_VALID_TO IS NULL), "
-                f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) FROM TORONTO.RAW.{table}"
+                f"COUNT_IF(_DLT_VALID_TO IS NOT NULL) "
+                f'FROM TORONTO."{schema_name}".{table}'
             )
             total, current, expired = cursor.fetchone()
             if (
@@ -359,13 +389,14 @@ def _verify_refresh(
                 or int(total) != int(current) + int(expired or 0)
             ):
                 raise ValueError(
-                    f"TORONTO.RAW.{table} post-load SCD2 counts do not reconcile: "
-                    f"total={total}, current={current}, expired={expired}"
+                    f"TORONTO.{schema_name}.{table} post-load SCD2 counts do not "
+                    f"reconcile: total={total}, current={current}, expired={expired}"
                 )
             cursor.execute(
-                "SELECT MAX(inserted_at), "
-                "DATEDIFF('second', MAX(inserted_at), CURRENT_TIMESTAMP()) "
-                "FROM TORONTO.RAW._DLT_LOADS WHERE schema_name = %s AND status = 0",
+                f'''SELECT MAX(inserted_at),
+                           DATEDIFF('second', MAX(inserted_at), CURRENT_TIMESTAMP())
+                    FROM TORONTO."{schema_name}"._DLT_LOADS
+                    WHERE schema_name = %s AND status = 0''',
                 (PIPELINE_NAMES[name],),
             )
             latest_load, age_seconds = cursor.fetchone()
@@ -382,7 +413,7 @@ def _verify_refresh(
                     f"Invalid/stale load metadata for {PIPELINE_NAMES[name]}: {age_seconds}"
                 )
             print(
-                f"Verified TORONTO.RAW.{table}: total={int(total):,}, "
+                f"Verified TORONTO.{schema_name}.{table}: total={int(total):,}, "
                 f"current={int(current):,}, expired={int(expired or 0):,}; "
                 f"new load metadata age={int(age_seconds)} seconds"
             )
@@ -454,6 +485,18 @@ def _prepare_snapshot_ledger(
                     CREATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
                     UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
                 )"""
+            )
+            cursor.execute(
+                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_ROW_COUNT NUMBER(38,0) DEFAULT 0"
+            )
+            cursor.execute(
+                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_BAD_ROW_COUNT NUMBER(38,0) DEFAULT 0"
+            )
+            cursor.execute(
+                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_BUSINESS_KEY_COUNT NUMBER(38,0) DEFAULT 0"
+            )
+            cursor.execute(
+                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINE_SHA256 VARCHAR"
             )
         except Exception as exc:
             raise RuntimeError(
@@ -618,14 +661,17 @@ def _prepare_snapshot_ledger(
         connection.close()
 
 
-def _completed_snapshot_ids(connection_options: dict) -> set[str]:
+def _completed_snapshot_ids(
+    connection_options: dict, ledger_table: str = SNAPSHOT_LEDGER_TABLE
+) -> set[str]:
     """Return only snapshots with both source loads durably marked succeeded."""
+    ledger_table = _validated_snapshot_ledger_table(ledger_table)
     connection = snowflake.connector.connect(**connection_options)
     cursor = connection.cursor()
     try:
         try:
             cursor.execute(
-                f"""CREATE TABLE IF NOT EXISTS {SNAPSHOT_LEDGER_TABLE} (
+                f"""CREATE TABLE IF NOT EXISTS {ledger_table} (
                 SNAPSHOT_ID VARCHAR NOT NULL,
                 SOURCE_RUN_ID VARCHAR NOT NULL,
                 SOURCE_RUN_ATTEMPT NUMBER(10,0) NOT NULL,
@@ -642,13 +688,11 @@ def _completed_snapshot_ids(connection_options: dict) -> set[str]:
             )
         except Exception as exc:
             raise RuntimeError(
-                f"Cannot create or access {SNAPSHOT_LEDGER_TABLE}. "
+                f"Cannot create or access {ledger_table}. "
                 "TORONTO_INGEST_ROLE needs USAGE on database TORONTO and "
                 "schema RAW, plus CREATE TABLE on schema TORONTO.RAW."
             ) from exc
-        cursor.execute(
-            f"SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS FROM {SNAPSHOT_LEDGER_TABLE}"
-        )
+        cursor.execute(f"SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS FROM {ledger_table}")
         grouped: dict[str, dict[str, str]] = {}
         for snapshot_id, source_name, status in cursor.fetchall():
             grouped.setdefault(str(snapshot_id), {})[str(source_name)] = str(
@@ -673,6 +717,10 @@ def _set_snapshot_source_status(
     status: str,
     error: str | None = None,
     ledger_table: str = SNAPSHOT_LEDGER_TABLE,
+    quarantined_row_count: int = 0,
+    quarantined_bad_row_count: int = 0,
+    quarantined_business_key_count: int = 0,
+    quarantine_sha256: str | None = None,
 ) -> None:
     """Update and verify one per-source ledger status."""
     allowed = {"pending", "loading", "succeeded", "failed"}
@@ -684,9 +732,22 @@ def _set_snapshot_source_status(
     try:
         cursor.execute(
             f"""UPDATE {ledger_table}
-                SET STATUS = %s, ERROR = %s, UPDATED_AT = CURRENT_TIMESTAMP()
+                SET STATUS = %s, ERROR = %s, UPDATED_AT = CURRENT_TIMESTAMP(),
+                    QUARANTINED_ROW_COUNT = %s,
+                    QUARANTINED_BAD_ROW_COUNT = %s,
+                    QUARANTINED_BUSINESS_KEY_COUNT = %s,
+                    QUARANTINE_SHA256 = %s
                 WHERE SNAPSHOT_ID = %s AND SOURCE_NAME = %s""",
-            (status, error, snapshot_id, source_name),
+            (
+                status,
+                error,
+                quarantined_row_count,
+                quarantined_bad_row_count,
+                quarantined_business_key_count,
+                quarantine_sha256,
+                snapshot_id,
+                source_name,
+            ),
         )
         cursor.execute(
             f"SELECT STATUS FROM {ledger_table} "
@@ -812,13 +873,13 @@ def _assert_canonical_replay_baseline(connection_options: dict) -> None:
 
 def main() -> None:
     credentials = os.environ.get("TORONTO_WAREHOUSE_CREDENTIALS", "")
-    dataset = os.environ.get("TORONTO_WAREHOUSE_DATASET", "RAW").upper()
+    dataset = _validated_dataset_schema(os.environ.get("TORONTO_WAREHOUSE_DATASET", ""))
     if not credentials:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION is missing.")
     if os.environ.get("TORONTO_WAREHOUSE_KIND", "").lower() != "snowflake":
         raise ValueError("TORONTO_WAREHOUSE_KIND must be 'snowflake'.")
-    if dataset != "RAW":
-        raise ValueError("Refusing to load outside canonical dataset TORONTO.RAW.")
+    # Direct writes to TORONTO.RAW are forbidden. The candidate schema must be
+    # the unique run-scoped clone prepared by prepare_snowflake_raw_candidate.py.
 
     run_id = os.environ.get("SNAPSHOT_SOURCE_RUN_ID", "")
     attempt = os.environ.get("SNAPSHOT_SOURCE_RUN_ATTEMPT", "1")
@@ -878,7 +939,9 @@ def main() -> None:
         key_path = root / "snowflake_key.p8"
         connection_options = _snowflake_connection_options(credentials, key_path)
         _assert_canonical_replay_baseline(connection_options)
-        old_watermarks = _connect_and_preflight(connection_options)
+        connection_options["schema"] = dataset
+        old_watermarks = _connect_and_preflight(connection_options, dataset)
+        ledger_table = _snapshot_ledger_table(dataset)
         statuses = _prepare_snapshot_ledger(
             connection_options,
             bundle=bundle,
@@ -887,6 +950,7 @@ def main() -> None:
             commit=commit,
             release_tag=release_tag,
             asset_name=asset_name,
+            ledger_table=ledger_table,
         )
         snapshot_id = f"{run_id}:{attempt}"
         failures: list[str] = []
@@ -903,6 +967,7 @@ def main() -> None:
                 snapshot_id=snapshot_id,
                 source_name=name,
                 status="loading",
+                ledger_table=ledger_table,
             )
             try:
                 manifest_path = extracted / name / "manifest.json"
@@ -915,20 +980,35 @@ def main() -> None:
                     credentials=credentials,
                     snapshot_path=extracted / name / "data.parquet",
                     source=sources[name],
-                    dataset_name="RAW",
+                    dataset_name=dataset,
                     destination_kind="snowflake",
                     pipeline_name=PIPELINE_NAMES[name],
                     boundary_timestamp=boundary_timestamp,
+                    snapshot_context={
+                        "snapshot_id": snapshot_id,
+                        "source_run_id": run_id,
+                        "source_run_attempt": int(attempt),
+                        "extracted_at_utc": manifest["extracted_at_utc"],
+                        "source_commit": commit,
+                        "release_tag": release_tag,
+                        "asset_name": asset_name,
+                        "parquet_sha256": _sha256(extracted / name / "data.parquet"),
+                    },
                 )
-                _verify_refresh(connection_options, old_watermarks, (name,))
+                _verify_refresh(connection_options, old_watermarks, (name,), dataset)
                 _set_snapshot_source_status(
                     connection_options,
                     snapshot_id=snapshot_id,
                     source_name=name,
                     status="succeeded",
+                    ledger_table=ledger_table,
+                    quarantined_row_count=result.quarantined_row_count,
+                    quarantined_bad_row_count=result.quarantined_bad_row_count,
+                    quarantined_business_key_count=result.quarantined_business_key_count,
+                    quarantine_sha256=result.quarantine_sha256,
                 )
                 print(
-                    f"Loaded {name} into TORONTO.RAW.{result.table_name} "
+                    f"Loaded {name} into TORONTO.{dataset}.{result.table_name} "
                     f"with boundary_timestamp={boundary_timestamp}."
                 )
             except Exception as exc:
@@ -940,6 +1020,7 @@ def main() -> None:
                         source_name=name,
                         status="failed",
                         error=message,
+                        ledger_table=ledger_table,
                     )
                 except Exception as ledger_exc:
                     message += f"; ledger update also failed: {type(ledger_exc).__name__}: {ledger_exc}"
@@ -953,7 +1034,7 @@ def main() -> None:
 
     print(
         f"SNOWFLAKE CANONICAL RAW REFRESH PASSED: run {run_id}, attempt {attempt}; "
-        "both source ledger entries are succeeded."
+        f"both source ledger entries are succeeded in TORONTO.{dataset}."
     )
 
 

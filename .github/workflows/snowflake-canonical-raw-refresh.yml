@@ -34,7 +34,7 @@ permissions:
 
 # Queue up to 100 pending refreshes instead of replacing the prior pending run.
 concurrency:
-  group: toronto-snowflake-canonical-raw-refresh
+  group: toronto-snowflake-production-promotion
   cancel-in-progress: false
   queue: max
 
@@ -60,7 +60,7 @@ jobs:
     env:
       TORONTO_WAREHOUSE_KIND: snowflake
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      TORONTO_WAREHOUSE_DATASET: RAW
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
       TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID }}
       TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT }}
@@ -98,7 +98,11 @@ jobs:
           python -m pip install --upgrade "pip>=26.2.1,<27"
           python -m pip install -e ".[snowflake]"
 
-      - name: Replay approved archived snapshots in extraction order
+      - name: Prepare isolated Snowflake RAW candidate
+        run: python scripts/prepare_snowflake_raw_candidate.py --github-env "$GITHUB_ENV"
+
+      - name: Replay approved archived snapshots in candidate schema
+        id: replay_candidate_archives
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -112,10 +116,25 @@ jobs:
             python scripts/replay_snowflake_snapshot_backlog.py
           fi
 
+      - name: Validate and promote Snowflake RAW candidate
+        id: promote_raw_candidate
+        if: steps.replay_candidate_archives.outputs.has_pending_archives == 'true'
+        env:
+          SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+        run: python scripts/promote_snowflake_raw_candidate.py
+
+      - name: Remove unused Snowflake RAW candidate after no-op replay
+        if: >-
+          steps.replay_candidate_archives.outcome == 'success' &&
+          steps.replay_candidate_archives.outputs.has_pending_archives != 'true'
+        run: python scripts/prepare_snowflake_raw_candidate.py --drop-candidate
+
       # GITHUB_TOKEN-triggered runs do not start downstream workflow_run runs.
       # workflow_dispatch is an explicit exception, so hand off through that event.
       - name: Dispatch Snowflake serving build after successful RAW refresh
-        if: success() && vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
+        if: >-
+          steps.promote_raw_candidate.outcome == 'success' &&
+          vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RAW_REFRESH_RUN_ID: ${{ github.run_id }}

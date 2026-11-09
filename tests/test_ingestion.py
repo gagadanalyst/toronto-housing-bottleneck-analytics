@@ -263,3 +263,18 @@ def test_warehouse_failure_is_recorded_and_retried(monkeypatch, tmp_path) -> Non
 def test_stale_flag_is_not_a_cli_option() -> None:
     args = ingestion.build_parser().parse_args([])
     assert not hasattr(args, "fail_on_stale")
+
+
+def test_row_level_bad_keys_are_not_bundle_blockers() -> None:
+    warnings = [
+        {"type": "missing_key", "rows": 4},
+        {"type": "duplicate_key", "rows": 2},
+    ]
+    assert ingestion._warehouse_key_quality_blockers(warnings) == []
+
+
+def test_missing_key_columns_remain_structural_blockers() -> None:
+    warnings = [{"type": "missing_key_columns", "columns": ["permit_num"]}]
+    assert ingestion._warehouse_key_quality_blockers(warnings) == [
+        "missing_business_key_columns"
+    ]

@@ -194,6 +194,15 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     utils.atomic_write_json(path, manifest)
 
 
+def _warehouse_key_quality_blockers(
+    warnings: list[dict[str, Any]],
+) -> list[str]:
+    """Keep structural missing-key-column defects as blockers, not bad rows."""
+    if any(warning.get("type") == "missing_key_columns" for warning in warnings):
+        return ["missing_business_key_columns"]
+    return []
+
+
 def _run_fallbacks(
     client: TorontoCKANClient,
     package: dict[str, Any],
@@ -447,13 +456,10 @@ def ingest_source(
                 change_percent=row_count_change_percent,
             )
 
-    # Conflicting duplicates are handled by the loader's SCD2 quarantine.
-    # Null or missing business-key values are not safe to merge.
-    if any(
-        warning.get("type") in {"missing_key", "missing_key_columns"}
-        for warning in warnings
-    ):
-        quality_blockers.append("invalid_business_keys")
+    # Row-level null/blank keys are retained in the source Parquet and
+    # quarantined by the SCD2 loader. Missing key columns remain structural
+    # blockers because the loader cannot identify a business key without them.
+    quality_blockers.extend(_warehouse_key_quality_blockers(warnings))
 
     warehouse_eligible = not quality_blockers
 
