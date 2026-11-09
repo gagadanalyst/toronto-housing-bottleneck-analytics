@@ -245,6 +245,9 @@ def test_workflows_require_enabled_flag_and_baseline_contract():
     snowflake = Path(".github/workflows/snowflake-canonical-raw-refresh.yml").read_text(
         encoding="utf-8"
     )
+    serving = Path(".github/workflows/snowflake-serving-schema.yml").read_text(
+        encoding="utf-8"
+    )
     for content in (cd, snowflake):
         assert "TORONTO_CANONICAL_REPLAY_ENABLED" in content
         assert "TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID" in content
@@ -254,3 +257,15 @@ def test_workflows_require_enabled_flag_and_baseline_contract():
     assert "github.event_name == 'workflow_dispatch' &&" in snowflake
     assert "steps.duckdb_snapshot_replay.outcome == 'success'" in cd
     assert "always() && steps.duckdb_snapshot_replay.outcome != 'skipped'" not in cd
+    assert "actions: write" in snowflake
+    assert "if: success() && vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake
+    assert snowflake.index("Replay approved archived snapshots") < snowflake.index(
+        "Dispatch Snowflake serving build"
+    )
+    assert "gh workflow run snowflake-serving-schema.yml" in snowflake
+    assert 'raw_refresh_run_id="$RAW_REFRESH_RUN_ID"' in snowflake
+    assert "workflow_run:" not in serving
+    assert "raw_refresh_run_id:" in serving
+    assert "inputs.raw_refresh_run_id != ''" in serving
+    assert "RAW_REFRESH_RUN_ID: ${{ inputs.raw_refresh_run_id }}" in serving
+    assert "actions: read" in serving

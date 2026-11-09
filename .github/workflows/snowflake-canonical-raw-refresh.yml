@@ -30,7 +30,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 # Queue up to 100 pending refreshes instead of replacing the prior pending run.
 concurrency:
@@ -111,3 +111,19 @@ jobs:
           else
             python scripts/replay_snowflake_snapshot_backlog.py
           fi
+
+      # GITHUB_TOKEN-triggered runs do not start downstream workflow_run runs.
+      # workflow_dispatch is an explicit exception, so hand off through that event.
+      - name: Dispatch Snowflake serving build after successful RAW refresh
+        if: success() && vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_REFRESH_RUN_ID: ${{ github.run_id }}
+        run: |
+          gh workflow run snowflake-serving-schema.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f confirm_serving_schema=true \
+            -f raw_refresh_run_id="$RAW_REFRESH_RUN_ID"
+          echo "Dispatched serving build for successful RAW refresh run ${RAW_REFRESH_RUN_ID}."
+

@@ -66,8 +66,10 @@ Routine CI/CD does not require Snowflake credentials. The CI/CD path builds and 
 
 After an eligible successful CD run on `main`, setting the GitHub repository variable `SNOWFLAKE_OPERATIONS_ENABLED` to the exact string `true` enables the following chain:
 
-1. `snowflake-canonical-raw-refresh.yml` is triggered by the completed CD workflow and uses the snapshot bundle from that exact CD run. It refreshes and verifies canonical `TORONTO.RAW`.
-2. After a successful RAW workflow, `snowflake-serving-schema.yml` runs source freshness checks, builds and tests dbt models, and checks the dashboard-facing relations in `TORONTO.ANALYTICS`.
+1. `cd.yml` sends a `repository_dispatch` containing the exact CD run ID, attempt, source commit, monthly Release tag, and immutable raw-bundle asset name. The RAW workflow replays the approved Release backlog in extraction order; the daily schedule reconciles any missed CD handoff.
+2. `snowflake-canonical-raw-refresh.yml` validates the immutable archive and the promoted replay baseline, checks the canonical Snowflake role/schema/tables and SCD2 counts, then processes Active and Cleared in extraction order. Both source-ledger entries must be `succeeded` for the refresh job to complete.
+3. After that job succeeds, its final step explicitly runs `gh workflow run snowflake-serving-schema.yml --ref main` with `confirm_serving_schema=true` and its own `raw_refresh_run_id`. This uses the supported `workflow_dispatch` event and the workflow's `actions: write` permission; it does not depend on a `workflow_run` trigger from a workflow created with `GITHUB_TOKEN`.
+4. The serving workflow verifies the supplied RAW run ID through GitHub and requires the `Snowflake Canonical RAW Refresh` workflow and `Refresh and verify canonical Snowflake RAW` job to have completed successfully. It then checks RAW freshness, builds and tests dbt, reapplies dashboard read-only grants, verifies the four dashboard relations, and records refresh metadata.
 
 The variable is an **operational gate, not a secret and not the dashboard backend setting**. Six workflows apply it:
 
@@ -80,7 +82,32 @@ The variable is an **operational gate, not a secret and not the dashboard backen
 
 When the variable is `false` or unset, the guarded jobs skip before their steps connect to Snowflake or run loads/transforms. GitHub may still show a workflow-run record with a `skipped` job; that is expected. The gate does not cancel jobs that are already running, so inspect in-progress runs separately when disabling the feature. Normal CI, CD, DuckDB dbt builds, the rolling release, and GitHub Pages deployment are not disabled by this variable.
 
-Manual Snowflake runs remain available for deliberate validation and maintenance. A manual canonical RAW refresh requires a successful CD run ID and the `confirm_canonical_raw` input. A manual serving build requires `confirm_serving_schema`. The baseline/replay and dbt-baseline workflows require their relevant run inputs. All remain behind the shared variable gate. When the gate is `true`, a parity workflow triggered by a relevant pull request may consume Snowflake compute; ordinary pull-request CI itself does not require Snowflake.
+Manual Snowflake runs remain available for deliberate validation and maintenance. A manual canonical RAW refresh requires a successful CD run ID and the `confirm_canonical_raw` input. A manual serving build requires `confirm_serving_schema`; the automated serving dispatch also supplies `raw_refresh_run_id`, which is verified against the upstream RAW workflow run. The baseline/replay and dbt-baseline workflows require their relevant run inputs. All remain behind the shared variable gate. When the gate is `true`, a parity workflow triggered by a relevant pull request may consume Snowflake compute; ordinary pull-request CI itself does not require Snowflake.
+
+### Retry behavior and production write guarantees
+
+The same immutable RAW archive can be retried. The canonical Snowflake application ledger records each source independently using the snapshot identity `run_id:attempt` and verifies the archive's commit, extraction timestamp, Release tag, and asset name. A source already marked `succeeded` is skipped on retry; a failed or incomplete source is retried with the original manifest `extracted_at_utc` as its SCD2 boundary. The replay backlog is chronological and the RAW workflow is serialized with a non-cancelling queue, so a later snapshot is blocked when an earlier snapshot is incomplete or a newer write may already have started.
+
+For a failed RAW run, rerun its failed job rather than dispatching a new load from a different archive:
+
+```bash
+gh run rerun RAW_REFRESH_RUN_ID --failed
+```
+
+This replays the same workflow event and immutable archive. Already-succeeded sources remain skipped. It also retries the explicit serving dispatch if the RAW data loads completed but the dispatch step itself failed. If RAW is already successful and only the serving build failed, rerun serving with the verified upstream RAW run ID:
+
+```bash
+gh workflow run snowflake-serving-schema.yml \
+  --ref main \
+  -f confirm_serving_schema=true \
+  -f raw_refresh_run_id=RAW_REFRESH_RUN_ID
+```
+
+The serving workflow verifies the upstream run before it connects to Snowflake. This retry does not reload or replay `TORONTO.RAW`.
+
+**Important production boundary:** the workflow validates both archived source files, manifests, checksums, required columns, approval flags, and quality blockers before starting either source load. It then merges Active and Cleared separately into the production `TORONTO.RAW` tables; this is not a single cross-table transaction or an atomic two-table promotion. If one table commits and the other fails, RAW can temporarily be at different snapshot levels. The RAW job fails and does not dispatch serving, so `TORONTO.ANALYTICS` is not intentionally rebuilt from that partial refresh; rerunning the same archive resumes only the unfinished source. This provides resumable per-source recovery, not a guarantee that no semantically bad source values can ever be written or that both RAW tables always change together.
+
+The serving build is also not a schema-wide atomic transaction: dbt builds its models individually. If it fails partway through, some `ANALYTICS` objects may have been rebuilt while others remain from the previous run. The dashboard refresh metadata is recorded only after the serving relations and grants pass validation. An all-or-nothing production guarantee would require loading and validating both source tables in an isolated Snowflake schema and promoting them atomically, plus a corresponding serving-schema promotion strategy; that stronger design is not implemented by this workflow.
 
 ### Disable Snowflake or switch back at trial end
 
