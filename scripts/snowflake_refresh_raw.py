@@ -20,6 +20,9 @@ from pyarrow import parquet as pq
 
 from toronto_housing_ingestion.config import SourceConfig, load_config
 from toronto_housing_ingestion.dlt_loader import load_scd2
+from toronto_housing_ingestion.snowflake_ledger import (
+    ensure_snapshot_ledger_quarantine_columns,
+)
 
 SOURCE_NAMES = ("active_permits", "cleared_permits")
 EXPECTED_MEMBERS = {
@@ -486,23 +489,12 @@ def _prepare_snapshot_ledger(
                     UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
                 )"""
             )
-            cursor.execute(
-                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_ROW_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_BAD_ROW_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINED_BUSINESS_KEY_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f"ALTER TABLE {ledger_table} ADD COLUMN IF NOT EXISTS QUARANTINE_SHA256 VARCHAR"
+            ensure_snapshot_ledger_quarantine_columns(
+                cursor, ledger_table.split(".")[1]
             )
         except Exception as exc:
             raise RuntimeError(
-                f"Cannot create or access {ledger_table}. "
-                "The TORONTO_INGEST_ROLE needs USAGE on database TORONTO and "
-                "schema RAW, plus CREATE TABLE on schema TORONTO.RAW."
+                f"Cannot create or initialize {ledger_table}: {exc}"
             ) from exc
 
         cursor.execute(

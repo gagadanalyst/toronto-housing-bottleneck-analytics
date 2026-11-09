@@ -18,6 +18,10 @@ TABLES = {
     "raw_active_permits": ("permit_num", "revision_num", "permit_type"),
     "raw_cleared_permits": ("permit_num", "revision_num", "permit_type"),
 }
+SOURCE_TABLES = {
+    "active_permits": "raw_active_permits",
+    "cleared_permits": "raw_cleared_permits",
+}
 
 
 def _validate_quarantine_reconciliation(
@@ -137,7 +141,7 @@ def _validate_quarantine_reconciliation(
                     "Quarantine digest does not reconcile for "
                     f"{snapshot_id}/{source_name}."
                 )
-        table = TABLES.get(str(source_name))
+        table = SOURCE_TABLES.get(str(source_name))
         if table is None:
             raise RuntimeError(f"Unexpected quarantine source name: {source_name!r}.")
         for quarantine_row in rows:

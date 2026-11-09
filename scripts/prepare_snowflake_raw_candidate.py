@@ -13,6 +13,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import snowflake.connector
 
+from toronto_housing_ingestion.snowflake_ledger import (
+    ensure_snapshot_ledger_quarantine_columns,
+)
+
 try:
     from snowflake_candidate_utils import decode_state, rebase_pipeline_state
 except ImportError:
@@ -188,24 +192,7 @@ def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str
                     (GENERATION_ID, PROMOTION_STATE) VALUES (%s, 'READY')''',
                 (f"{run_id}:{attempt}",),
             )
-            cursor.execute(
-                f'ALTER TABLE TORONTO."{stage}".TORONTO_SNAPSHOT_LEDGER '
-                "ADD COLUMN IF NOT EXISTS QUARANTINED_ROW_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f'ALTER TABLE TORONTO."{stage}".TORONTO_SNAPSHOT_LEDGER '
-                "ADD COLUMN IF NOT EXISTS "
-                "QUARANTINED_BAD_ROW_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f'ALTER TABLE TORONTO."{stage}".TORONTO_SNAPSHOT_LEDGER '
-                "ADD COLUMN IF NOT EXISTS "
-                "QUARANTINED_BUSINESS_KEY_COUNT NUMBER(38,0) DEFAULT 0"
-            )
-            cursor.execute(
-                f'ALTER TABLE TORONTO."{stage}".TORONTO_SNAPSHOT_LEDGER '
-                "ADD COLUMN IF NOT EXISTS QUARANTINE_SHA256 VARCHAR"
-            )
+            ensure_snapshot_ledger_quarantine_columns(cursor, stage)
             cursor.execute(
                 "SELECT SCHEMA_OWNER FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
                 "WHERE SCHEMA_NAME = %s",
