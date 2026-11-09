@@ -1,0 +1,391 @@
+name: Promote Validated SCD2 Rebuild
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production_promotion:
+        description: Confirm promotion of the already-validated 28-snapshot rebuild
+        required: true
+        default: false
+        type: boolean
+      replay_run_id:
+        description: Successful historical replay workflow run ID
+        required: true
+        default: "42547265259"
+        type: string
+      replay_run_attempt:
+        description: Successful historical replay workflow attempt
+        required: true
+        default: "1"
+        type: string
+      snowflake_replay_schema:
+        description: Isolated Snowflake schema produced by the replay run
+        required: true
+        default: SNOWFLAKE_SCD2_REBUILD_20261107_42547265259
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: toronto-production-scd2-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main' && inputs.confirm_production_promotion == true
+    name: Validate and promote both recovered SCD2 warehouses
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      REPLAY_RUN_ID: ${{ inputs.replay_run_id }}
+      REPLAY_RUN_ATTEMPT: ${{ inputs.replay_run_attempt }}
+      SNOWFLAKE_REPLAY_SCHEMA: ${{ inputs.snowflake_replay_schema }}
+      RUNTIME__DLTHUB_TELEMETRY: "false"
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
+      DBT_DUCKDB_PATH: ${{ github.workspace }}/data/warehouse/toronto.duckdb
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install ingestion and Snowflake dependencies
+        run: |
+          python -m pip install --upgrade "pip>=26.2.1,<27"
+          python -m pip install -e ".[snowflake]"
+
+      - name: Validate promotion inputs
+        run: |
+          python - <<'PY'
+          import os
+          import re
+
+          for name in ("REPLAY_RUN_ID", "REPLAY_RUN_ATTEMPT"):
+              if not re.fullmatch(r"[0-9]+", os.environ[name]):
+                  raise SystemExit(f"{name} must contain digits only")
+          if not re.fullmatch(
+              r"SNOWFLAKE_SCD2_REBUILD_20261107_[0-9]+",
+              os.environ["SNOWFLAKE_REPLAY_SCHEMA"],
+          ):
+              raise SystemExit("Unexpected isolated Snowflake replay schema")
+          if not os.environ.get("SNOWFLAKE_DLT_CONNECTION"):
+              raise SystemExit("SNOWFLAKE_DLT_CONNECTION repository secret is missing")
+          print("Promotion inputs validated; no source extraction will run in this workflow.")
+          PY
+
+      - name: Download the exact validated historical replay artifacts
+        run: |
+          root="data/recovery/scd2-rebuild"
+          mkdir -p "$root/duckdb-replay" "$root/snowflake-replay-evidence" "$root/final-outcome"
+          gh run download "$REPLAY_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "duckdb-scd2-replay-${REPLAY_RUN_ID}-${REPLAY_RUN_ATTEMPT}" \
+            --dir "$root/duckdb-replay"
+          gh run download "$REPLAY_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "snowflake-scd2-replay-evidence-${REPLAY_RUN_ID}-${REPLAY_RUN_ATTEMPT}" \
+            --dir "$root/snowflake-replay-evidence"
+          gh run download "$REPLAY_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "historical-scd2-final-outcome-${REPLAY_RUN_ID}-${REPLAY_RUN_ATTEMPT}" \
+            --dir "$root/final-outcome"
+          test -s "$root/duckdb-replay/toronto-rebuilt.duckdb"
+          test -s "$root/duckdb-replay/replay-summary.json"
+          test -s "$root/snowflake-replay-evidence/replay-summary.json"
+          test -s "$root/snowflake-replay-evidence/raw_active_permits_history.csv.gz"
+          test -s "$root/snowflake-replay-evidence/raw_cleared_permits_history.csv.gz"
+          test -s "$root/final-outcome/replay-outcome.json"
+
+      - name: Require the original 28-snapshot replay to have passed
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          outcome = json.loads(
+              Path("data/recovery/scd2-rebuild/final-outcome/replay-outcome.json").read_text()
+          )
+          if outcome.get("status") != "passed":
+              raise SystemExit(f"Historical replay did not pass: {outcome}")
+          if outcome.get("jobs") != {
+              "duckdb_replay": "success",
+              "snowflake_replay": "success",
+              "compare_histories": "success",
+          }:
+              raise SystemExit(f"Historical replay jobs were not all successful: {outcome}")
+          print("Original historical replay outcome is PASS.")
+          PY
+
+      - name: Revalidate DuckDB history and exact parity before production writes
+        run: |
+          python scripts/validate_duckdb_scd2_historical_replay.py \
+            --database data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb \
+            --manifest-root data/recovery/scd2-rebuild/duckdb-replay/manifests \
+            --dataset raw \
+            --output data/recovery/scd2-rebuild/duckdb-replay/prepromotion-validation.json
+          python scripts/compare_scd2_replay_histories.py \
+            --database data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb \
+            --dataset raw \
+            --evidence-dir data/recovery/scd2-rebuild/snowflake-replay-evidence
+          python scripts/validate_scd2_replay_recovery.py \
+            --database data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb \
+            --dataset raw \
+            --snowflake-schema "$SNOWFLAKE_REPLAY_SCHEMA" \
+            --duckdb-summary data/recovery/scd2-rebuild/duckdb-replay/replay-summary.json \
+            --snowflake-summary data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json \
+            --output data/recovery/scd2-rebuild/prepromotion-recovery-validation.json
+
+      - name: Prepare recovered DuckDB database for dbt
+        run: |
+          mkdir -p data/warehouse
+          cp data/recovery/scd2-rebuild/duckdb-replay/toronto-rebuilt.duckdb \
+            data/warehouse/toronto.duckdb
+          test -s data/warehouse/toronto.duckdb
+          echo "TORONTO_DBT_AS_OF_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - name: Create isolated dbt environment
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+
+      - name: Build and test DuckDB dbt models
+        working-directory: dbt
+        run: |
+          cp profiles.yml.example profiles.yml
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" deps --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" build \
+            --profiles-dir . \
+            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
+
+      - name: Record DuckDB refresh metadata and validate dashboard relations
+        run: |
+          python - <<'PY'
+          import os
+          import duckdb
+
+          path = "data/warehouse/toronto.duckdb"
+          with duckdb.connect(path) as connection:
+              connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
+              connection.execute(
+                  """CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
+                      refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
+                      last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
+                      source_commit VARCHAR NOT NULL,
+                      workflow_run_id VARCHAR NOT NULL
+                  )"""
+              )
+              connection.execute(
+                  "DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
+              )
+              connection.execute(
+                  "INSERT INTO metadata.dashboard_refresh_metadata "
+                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id) "
+                  "VALUES (1, now(), ?, ?)",
+                  (os.environ["GITHUB_SHA"], os.environ["GITHUB_RUN_ID"]),
+              )
+              required = {
+                  "FCT_ACTIVE_PERMIT_REVISION",
+                  "FCT_CLEARED_PERMIT_REVISION",
+                  "MART_ACTIVE_PERMIT_AGE",
+                  "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+              }
+              available = {
+                  str(row[0]).upper()
+                  for row in connection.execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE upper(table_schema) = 'ANALYTICS'"
+                  ).fetchall()
+              }
+              missing = required - available
+              if missing:
+                  raise SystemExit(f"DuckDB dbt dashboard relations are missing: {sorted(missing)}")
+              for table in sorted(required):
+                  count = int(connection.execute(
+                      f'SELECT COUNT(*) FROM analytics."{table}"'
+                  ).fetchone()[0])
+                  if count < 1:
+                      raise SystemExit(f"DuckDB dashboard relation is empty: {table}")
+                  print(f"analytics.{table}: {count:,} rows")
+          PY
+
+      - name: Generate and package dbt documentation
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" docs generate --profiles-dir . --output-dir docs-site
+          test -s docs-site/index.html
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          index = Path("docs-site/index.html")
+          measurement_id = "G-7F7JW7LG51"
+          script_url = f"https://www.googletagmanager.com/gtag/js?id={measurement_id}"
+          html = index.read_text(encoding="utf-8")
+          if script_url not in html:
+              if html.count("</head>") != 1:
+                  raise SystemExit("Expected exactly one </head> in dbt documentation")
+              tag = (
+                  "    <!-- Google tag (gtag.js) -->\n"
+                  f'    <script async src="{script_url}"></script>\n'
+                  "    <script>\n"
+                  "      window.dataLayer = window.dataLayer || [];\n"
+                  "      function gtag() { window.dataLayer.push(arguments); }\n"
+                  "      gtag(\"js\", new Date());\n"
+                  f'      gtag("config", "{measurement_id}");\n'
+                  "    </script>\n"
+              )
+              index.write_text(html.replace("</head>", tag + "</head>", 1), encoding="utf-8")
+          root = Path("../data-assets/dbt-docs")
+          root.mkdir(parents=True, exist_ok=True)
+          for source in Path("docs-site").rglob("*"):
+              if source.is_file():
+                  target = root / source.relative_to("docs-site")
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(source.read_bytes())
+          (root / "README.txt").write_text(
+              "Toronto Housing Analytics dbt documentation. Extract this archive and "
+              "run: python3 -m http.server 8000\n",
+              encoding="utf-8",
+          )
+          archive = Path("../data-assets/toronto-dbt-docs.zip")
+          archive.parent.mkdir(parents=True, exist_ok=True)
+          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      zipped.write(path, path.relative_to(root).as_posix())
+          with ZipFile(archive) as zipped:
+              if "index.html" not in zipped.namelist() or zipped.testzip() is not None:
+                  raise SystemExit("Generated dbt documentation archive failed validation")
+          print(f"Packaged {archive}")
+          PY
+
+      - name: Restore the last approved full-source Parquet baseline
+        run: |
+          mkdir -p data-assets/archive data-assets
+          gh release download toronto-raw-snapshot-archive-2026-11 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern toronto-raw-snapshot-bundle-42022028625-1.zip \
+            --dir data-assets/archive
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          archive_path = Path("data-assets/archive/toronto-raw-snapshot-bundle-42022028625-1.zip")
+          with ZipFile(archive_path) as archive:
+              bundle = json.loads(archive.read("bundle.json"))
+              if (
+                  str(bundle.get("source_run_id")) != "42022028625"
+                  or str(bundle.get("source_run_attempt")) != "1"
+                  or bundle.get("complete") is not True
+                  or bundle.get("approved_for_warehouse") is not True
+              ):
+                  raise SystemExit("The selected archive is not the approved final baseline snapshot")
+              for source, filename in (
+                  ("active_permits", "toronto-active-permits.parquet"),
+                  ("cleared_permits", "toronto-cleared-permits.parquet"),
+              ):
+                  member = f"{source}/data.parquet"
+                  payload = archive.read(member)
+                  expected = bundle["sources"][source]
+                  digest = hashlib.sha256(payload).hexdigest()
+                  if digest != expected.get("sha256"):
+                      raise SystemExit(f"{source}: archived Parquet SHA-256 mismatch")
+                  target = Path("data-assets") / filename
+                  target.write_bytes(payload)
+                  if target.stat().st_size == 0:
+                      raise SystemExit(f"{source}: extracted Parquet file is empty")
+                  print(f"Verified {filename}: sha256={digest}")
+          PY
+
+      - name: Promote recovered Snowflake schema to canonical RAW
+        run: |
+          python scripts/promote_snowflake_scd2_rebuild.py \
+            --source-schema "$SNOWFLAKE_REPLAY_SCHEMA"
+
+      - name: Validate the promoted production RAW against DuckDB and replay evidence
+        run: |
+          python scripts/validate_scd2_replay_recovery.py \
+            --database data/warehouse/toronto.duckdb \
+            --dataset raw \
+            --snowflake-schema RAW \
+            --duckdb-summary data/recovery/scd2-rebuild/duckdb-replay/replay-summary.json \
+            --snowflake-summary data/recovery/scd2-rebuild/snowflake-replay-evidence/replay-summary.json \
+            --output data/recovery/scd2-rebuild/postpromotion-recovery-validation.json
+          python scripts/compare_scd2_replay_histories.py \
+            --database data/warehouse/toronto.duckdb \
+            --dataset raw \
+            --evidence-dir data/recovery/scd2-rebuild/snowflake-replay-evidence
+          python scripts/validate_duckdb_scd2_historical_replay.py \
+            --database data/warehouse/toronto.duckdb \
+            --manifest-root data/recovery/scd2-rebuild/duckdb-replay/manifests \
+            --dataset raw \
+            --output data/recovery/scd2-rebuild/postpromotion-duckdb-validation.json
+
+      - name: Publish a verified immutable DuckDB recovery checkpoint
+        run: python scripts/publish_duckdb_recovery.py
+
+      - name: Replace warehouse-latest assets with the validated production set
+        run: |
+          gh release upload warehouse-latest \
+            data-assets/toronto-active-permits.parquet \
+            data-assets/toronto-cleared-permits.parquet \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload warehouse-latest \
+            data-assets/toronto-dbt-docs.zip \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          # Publish DuckDB last: it is the asset the public dashboard consumes.
+          gh release upload warehouse-latest \
+            data/warehouse/toronto.duckdb \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Download and verify all four production assets
+        run: |
+          verify_dir="$(mktemp -d)"
+          for asset in \
+            toronto-active-permits.parquet \
+            toronto-cleared-permits.parquet \
+            toronto-dbt-docs.zip \
+            toronto.duckdb; do
+            gh release download warehouse-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir "$verify_dir"
+            case "$asset" in
+              toronto-active-permits.parquet|toronto-cleared-permits.parquet|toronto-dbt-docs.zip)
+                local_path="data-assets/$asset"
+                ;;
+              toronto.duckdb)
+                local_path="data/warehouse/toronto.duckdb"
+                ;;
+            esac
+            cmp -s "$local_path" "$verify_dir/$asset"
+            echo "Verified warehouse-latest/$asset"
+          done
+
+      - name: Publish production-promotion outcome
+        if: always()
+        run: |
+          {
+            echo "## Production SCD2 promotion"
+            echo "- Historical replay source: \\`${REPLAY_RUN_ID}:${REPLAY_RUN_ATTEMPT}\\`"
+            echo "- Snowflake target: \\`TORONTO.RAW\\`"
+            echo "- DuckDB target: \\`warehouse-latest/toronto.duckdb\\`"
+            echo "- Previous Snowflake RAW is retained under \\`TORONTO.${SNOWFLAKE_REPLAY_SCHEMA}\\`."
+            echo "- CD was not invoked by this promotion workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
