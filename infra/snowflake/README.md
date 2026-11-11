@@ -82,7 +82,7 @@ After an eligible successful CD run on `main`, setting the GitHub repository var
 1. `cd.yml` sends a `repository_dispatch` containing the exact CD run ID, attempt, source commit, monthly Release tag, and immutable raw-bundle asset name. The RAW workflow replays the approved Release backlog in extraction order; the daily schedule reconciles any missed CD handoff.
 2. `snowflake-canonical-raw-refresh.yml` validates the immutable archive backlog and the promoted replay baseline, then clones `TORONTO.RAW` into `TORONTO.RAW_STAGE_<run_id>_<attempt>`. The ingestion role rebases the cloned DLT state, replays pending archives in extraction order, and validates both source ledgers, SCD2 integrity and quarantine reconciliation in the candidate. It swaps the candidate into `RAW` only after all checks pass; the previous RAW remains under the candidate schema name.
 3. After RAW promotion succeeds, the workflow explicitly runs `gh workflow run snowflake-serving-schema.yml --ref main` with `confirm_serving_schema=true` and its own `raw_refresh_run_id`. This uses `workflow_dispatch` and the workflow's `actions: write` permission; it does not depend on a `workflow_run` event from a workflow created with `GITHUB_TOKEN`.
-4. The serving workflow verifies the supplied RAW run ID through GitHub, creates a fresh `ANALYTICS_STAGE_<run_id>_<attempt>` schema, and points dbt at that candidate. It builds and tests the full project, verifies the four dashboard relations and refresh metadata, grants the dashboard role access only to those relations, and swaps the candidate into `TORONTO.ANALYTICS`. The previous serving schema remains under the candidate name.
+4. The serving workflow verifies the supplied RAW run ID through GitHub, creates a fresh `ANALYTICS_STAGE_<run_id>_<attempt>` schema, and points dbt at that candidate. It builds and tests the full project, verifies all six dashboard relations and refresh metadata, grants the dashboard role access only to those relations, and swaps the candidate into `TORONTO.ANALYTICS`. The previous serving schema remains under the candidate name.
 
 The variable is an **operational gate, not a secret and not the dashboard backend setting**. Six workflows apply it:
 
@@ -252,7 +252,7 @@ The Snowflake serving workflow checks source freshness before building the marts
 
 ### 1. Grant read-only access
 
-Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the four dashboard-facing dbt relations and `DASHBOARD_REFRESH_METADATA` exist in `TORONTO.ANALYTICS`.
+Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsight as `ACCOUNTADMIN`. Run it only after the six dashboard-facing dbt relations and `DASHBOARD_REFRESH_METADATA` exist in `TORONTO.ANALYTICS`.
 
 `TORONTO_DASHBOARD_ROLE` should have:
 
@@ -260,7 +260,9 @@ Review `40_dashboard_read_only_role.sql` and execute it deliberately in Snowsigh
 - `SELECT` only on these dashboard-facing relations:
   - `TORONTO.ANALYTICS.MART_ACTIVE_PERMIT_AGE`
   - `TORONTO.ANALYTICS.FCT_ACTIVE_PERMIT_REVISION`
+  - `TORONTO.ANALYTICS.MART_ACTIVE_BACKLOG_BY_YEAR_TYPE`
   - `TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE`
+  - `TORONTO.ANALYTICS.MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE`
   - `TORONTO.ANALYTICS.FCT_CLEARED_PERMIT_REVISION`
   - `TORONTO.ANALYTICS.DASHBOARD_REFRESH_METADATA` (refresh timestamp only)
 - No access to `TORONTO.RAW` and no privileges to create, update, or delete analytical data.
@@ -299,7 +301,7 @@ schema = "ANALYTICS"
 
 ### 4. Verify dashboard access
 
-After changing credentials, roles, or serving relations, verify access to all four dashboard-facing relations and `DASHBOARD_REFRESH_METADATA` in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
+After changing credentials, roles, or serving relations, verify access to all six dashboard-facing relations and `DASHBOARD_REFRESH_METADATA` in Snowsight or with an authorized administrator. A deliberate `SELECT COUNT(*)` against each relation is one simple check; it may resume the warehouse and incur compute. Confirm `CURRENT_ROLE()` is `TORONTO_DASHBOARD_ROLE` during the test.
 
 The reader checks that required relations exist, reads dashboard-facing data, and closes the connection after the read. Missing relations, denied permissions, or connection errors are shown to the user; no silent fallback to DuckDB takes place.
 

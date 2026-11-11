@@ -75,6 +75,45 @@ class FakeCursor:
                 ("MEASURE",),
             ]
             self.rows = [(2025, "Residential", "Application to issue")]
+        elif "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE" in query:
+            self.description = [
+                ("APPLICATION_YEAR",),
+                ("PERMIT_TYPE",),
+                ("CURRENT_ACTIVE_REVISION_COUNT",),
+                ("AGE_ELIGIBLE_COUNT",),
+                ("AGE_INELIGIBLE_COUNT",),
+                ("OVER_365_DAYS_COUNT",),
+                ("OVER_730_DAYS_COUNT",),
+                ("OVER_1095_DAYS_COUNT",),
+                ("MEDIAN_AGE_DAYS",),
+                ("P90_AGE_DAYS",),
+                ("ELIGIBLE_BACKLOG_SHARE_PCT",),
+            ]
+            self.rows = [
+                (2025, "Residential", 100, 98, 2, 80, 50, 20, 490.0, 900.0, 0.1)
+            ]
+        elif "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE" in query:
+            self.description = [
+                ("APPLICATION_YEAR",),
+                ("PERMIT_TYPE",),
+                ("MEASURE",),
+                ("MATCHED_COHORT_COUNT",),
+                ("MEDIAN_DAYS",),
+                ("P90_DAYS",),
+            ]
+            self.rows = [(2025, "Residential", "Application to issue", 25, 28.0, 129.0)]
+        elif "matched_closed_cohort" in query.lower():
+            self.description = [
+                ("MEASURE",),
+                ("MATCHED_COHORT_COUNT",),
+                ("MEDIAN_DAYS",),
+                ("P90_DAYS",),
+            ]
+            self.rows = [
+                ("Application to issue", 25, 28.0, 129.0),
+                ("Issue to completion", 25, 292.0, 1054.0),
+                ("Application to completion", 25, 345.0, 1163.0),
+            ]
         elif "FCT_ACTIVE_PERMIT_REVISION" in query:
             self.description = [
                 (field.upper(),) for field in backend.ACTIVE_AGGREGATE_FIELDS
@@ -218,13 +257,24 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     connection = FakeConnection(cursor)
     connection_args = install_snowflake_stubs(monkeypatch, connection)
 
-    active, summary, cleared_count, flags, actual_refresh_timestamp = (
-        backend.load_snowflake_dashboard_data(CONFIG)
-    )
+    (
+        active,
+        summary,
+        active_backlog,
+        matched_lifecycle,
+        pooled_lifecycle,
+        cleared_count,
+        flags,
+        actual_refresh_timestamp,
+    ) = backend.load_snowflake_dashboard_data(CONFIG)
 
     assert active.loc[0, "permit_num"] == "00123"
     assert bool(active.loc[0, "is_age_eligible"])
     assert summary.loc[0, "permit_type"] == "Residential"
+    assert active_backlog.loc[0, "over_365_days_count"] == 80
+    assert matched_lifecycle.loc[0, "matched_cohort_count"] == 25
+    assert pooled_lifecycle.loc[0, "median_days"] == 28.0
+    assert len(backend.REQUIRED_RELATIONS) == 6
     assert cleared_count == 3
     assert actual_refresh_timestamp == refresh_timestamp
     assert flags["builder_name_conflict"] == 1
@@ -271,6 +321,6 @@ def test_refresh_timestamp_is_optional_before_first_refresh(
 
     result = backend.load_snowflake_dashboard_data(CONFIG)
 
-    assert result[4] is None
+    assert result[7] is None
     assert cursor.closed
     assert connection.closed
