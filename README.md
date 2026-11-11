@@ -2,7 +2,7 @@
 
 An end-to-end Analytics Engineering project using City of Toronto building-permit data, with **Snowflake and DuckDB as supported warehouse backends**. A single Python + dlt ingestion pipeline validates source snapshots, and one shared dbt project builds analytical models for both; the Streamlit dashboard selects its data source through an explicit backend setting.
 
-**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
+**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[dbt project guide](dbt/README.md)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
 ## What the project demonstrates
 

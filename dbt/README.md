@@ -10,6 +10,28 @@ The project uses dbt v2, SQL, and the `dbt-labs/dbt_utils` package. The same dbt
 
 The setup below uses the local DuckDB `dev` target. The tracked `profiles.yml.example` also includes a `snowflake` output; see the [Snowflake operations guide](../infra/snowflake/README.md) for credentials and automated refresh details.
 
+## Dashboard integration
+
+The [live Streamlit Dashboard](https://toronto-housing-bottleneck.streamlit.app/) is the presentation layer for the analytical outputs built by this dbt project. It is registered as the `toronto_housing_bottleneck_dashboard` exposure in [`models/exposures.yml`](models/exposures.yml).
+
+The Dashboard requires four dbt relations in its configured analytics schema:
+
+| dbt relation | Dashboard use |
+|---|---|
+| `mart_active_permit_age` | Active permit ages and age-eligibility reporting. |
+| `fct_active_permit_revision` | Active revision-level data-quality checks and counts. |
+| `mart_cleared_lifecycle_by_year_type` | Cleared permit lifecycle summaries and timelines. |
+| `fct_cleared_permit_revision` | Cleared revision-level data-quality checks and date coverage. |
+
+Both Dashboard backends consume these same relations from the shared dbt project; there are no separate Dashboard-specific model trees.
+
+- **DuckDB:** the Dashboard downloads the published `toronto.duckdb` database from the rolling [`warehouse-latest` release](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest) and queries the `analytics` relations read-only.
+- **Snowflake:** the Dashboard queries the corresponding relations in the configured database and schema using its dedicated read-only dashboard role.
+
+`DASHBOARD_BACKEND` selects the backend (`duckdb` or `snowflake`); DuckDB is the default. A failure in the selected backend is reported rather than silently switching to the other source.
+
+See the [Snowflake operations guide](../infra/snowflake/README.md) for backend configuration and access details.
+
 ## Architecture
 
 The models follow three layers:
