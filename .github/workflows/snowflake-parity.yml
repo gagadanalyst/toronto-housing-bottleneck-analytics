@@ -15,6 +15,7 @@ on:
       - "scripts/compare_duckdb_snowflake_parity.py"
       - "scripts/snowflake_snapshot_baseline.py"
       - "dbt/**"
+      - "!dbt/README.md"
       - "pyproject.toml"
       - "open_data_config.yml"
       - "src/toronto_housing_ingestion/**"
@@ -43,7 +44,7 @@ jobs:
       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       # Use one validated source snapshot to build fresh DuckDB and Snowflake
       # raw baselines with the same PR code. Manual runs may select another CD run.
-      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id || '40470002594' }}
+      SNAPSHOT_SOURCE_RUN_ID: ${{ inputs.snapshot_run_id || '' }}
       TORONTO_WAREHOUSE_KIND: duckdb
       TORONTO_WAREHOUSE_CREDENTIALS: ${{ github.workspace }}/data/warehouse/parity/toronto.duckdb
       TORONTO_WAREHOUSE_DATASET: raw
@@ -69,29 +70,96 @@ jobs:
           import re
           import subprocess
 
-          run_id = os.environ["SNAPSHOT_SOURCE_RUN_ID"]
-          if not re.fullmatch(r"[0-9]+", run_id):
-              raise ValueError("Snapshot source run ID must contain digits only.")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          requested_run_id = os.environ.get("SNAPSHOT_SOURCE_RUN_ID", "").strip()
+
           if not os.environ.get("SNOWFLAKE_DLT_CONNECTION"):
               raise ValueError("Repository secret SNOWFLAKE_DLT_CONNECTION is missing.")
-          result = subprocess.run(
-              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
-               "--json", "name,status,conclusion,headBranch,headSha,event"],
-              check=True, capture_output=True, text=True,
-          )
-          run = json.loads(result.stdout)
-          expected = {
-              "name": "CD", "status": "completed", "conclusion": "success",
-              "headBranch": "main", "event": "workflow_run",
-          }
-          mismatches = {key: (value, run.get(key)) for key, value in expected.items() if run.get(key) != value}
-          if mismatches:
-              raise ValueError(f"Selected run is not a successful main-branch CD run: {mismatches}")
-          if not re.fullmatch(r"[0-9a-f]{40}", str(run.get("headSha", ""))):
-              raise ValueError("Selected CD run has an invalid source commit SHA.")
+
+          def gh_json(args):
+              result = subprocess.run(
+                  args, check=True, capture_output=True, text=True
+              )
+              return json.loads(result.stdout)
+
+          if requested_run_id:
+              if not re.fullmatch(r"[0-9]+", requested_run_id):
+                  raise ValueError("Snapshot source run ID must contain digits only.")
+              candidates = [
+                  gh_json([
+                      "gh", "run", "view", requested_run_id,
+                      "--repo", repo,
+                      "--json",
+                      "name,status,conclusion,headBranch,headSha,event,databaseId",
+                  ])
+              ]
+          else:
+              candidates = gh_json([
+                  "gh", "run", "list",
+                  "--repo", repo,
+                  "--workflow", "CD",
+                  "--branch", "main",
+                  "--event", "workflow_run",
+                  "--status", "success",
+                  "--limit", "50",
+                  "--json",
+                  "databaseId,name,status,conclusion,headBranch,headSha,event",
+              ])
+
+          selected = None
+
+          for run in candidates:
+              run_id = str(run.get("databaseId", ""))
+              if not re.fullmatch(r"[0-9]+", run_id):
+                  continue
+
+              expected = {
+                  "name": "CD",
+                  "status": "completed",
+                  "conclusion": "success",
+                  "headBranch": "main",
+                  "event": "workflow_run",
+              }
+              if any(run.get(key) != value for key, value in expected.items()):
+                  continue
+
+              head_sha = str(run.get("headSha", ""))
+              if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                  continue
+
+              artifact_data = gh_json([
+                  "gh", "api",
+                  f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
+              ])
+              expected_name = f"toronto-snapshot-bundle-{run_id}"
+
+              available = any(
+                  artifact.get("name") == expected_name
+                  and artifact.get("expired") is False
+                  for artifact in artifact_data.get("artifacts", [])
+              )
+
+              if available:
+                  selected = (run_id, head_sha)
+                  break
+
+          if selected is None:
+              if requested_run_id:
+                  raise ValueError(
+                      f"CD run {requested_run_id} has no available, unexpired "
+                      "snapshot bundle."
+                  )
+              raise RuntimeError(
+                  "No successful main-branch CD run among the latest 50 candidates "
+                  "has an available, unexpired snapshot bundle."
+              )
+
+          run_id, head_sha = selected
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-              env.write(f"SNAPSHOT_SOURCE_COMMIT={run['headSha']}\n")
-          print(f"Verified CD run {run_id} at {run['headSha']}.")
+              env.write(f"SNAPSHOT_SOURCE_RUN_ID={run_id}\n")
+              env.write(f"SNAPSHOT_SOURCE_COMMIT={head_sha}\n")
+
+          print(f"Selected successful CD run {run_id} at {head_sha}.")
           PY
 
       - name: Download the exact validated snapshot bundle
@@ -180,7 +248,7 @@ jobs:
               if not re.fullmatch(r"[0-9]+", value):
                   raise ValueError(f"{label} must contain digits only.")
 
-          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
+          source_schema = f"SNOWFLAKE_BASELINE_{workflow_run_id}_{attempt}"
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
               env.write(f"TORONTO_DBT_SOURCE_SCHEMA={source_schema}\n")
@@ -192,7 +260,7 @@ jobs:
         env:
           TORONTO_WAREHOUSE_KIND: snowflake
           TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-          TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ inputs.snapshot_run_id || '40470002594' }}_${{ github.run_id }}_${{ github.run_attempt }}
+          TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ github.run_id }}_${{ github.run_attempt }}
           SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
           RUNTIME__DLTHUB_TELEMETRY: "false"
         run: python scripts/snowflake_snapshot_baseline.py
@@ -215,7 +283,7 @@ jobs:
           if not re.fullmatch(r"[0-9]+", attempt):
               raise ValueError("GitHub workflow attempt must contain digits only.")
 
-          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
+          source_schema = f"SNOWFLAKE_BASELINE_{workflow_run_id}_{attempt}"
           target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
           if os.environ.get("TORONTO_DBT_SOURCE_SCHEMA") != source_schema:
               raise ValueError("Registered Snowflake source schema does not match run IDs.")
@@ -317,7 +385,7 @@ jobs:
               raise ValueError("Unexpected Snowflake parity target schema.")
 
           if source_schema and not re.fullmatch(
-              r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+_[0-9]+", source_schema
+              r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+", source_schema
           ):
               raise ValueError("Unexpected Snowflake parity source schema.")
 
