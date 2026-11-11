@@ -19,6 +19,7 @@ from refresh_metadata import format_refresh_timestamp
 from snowflake_backend import (
     ACTIVE_FLAG_FIELDS,
     FLAG_FIELDS,
+    MATCHED_LIFECYCLE_POOLED_SQL,
     load_snowflake_dashboard_data,
 )
 from streamlit.errors import StreamlitSecretNotFoundError
@@ -444,7 +445,16 @@ def snowflake_dashboard_settings() -> dict[str, Any]:
 @st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=1, show_spinner=False)
 def load_dashboard_data(
     backend: str = "duckdb", config_fingerprint: str = ""
-) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int], Any | None]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    int,
+    dict[str, int],
+    Any | None,
+]:
     """Load dashboard data from the explicitly selected backend.
 
     config_fingerprint participates in Streamlit's cache key so a change to
@@ -470,7 +480,9 @@ def load_dashboard_data(
             required = {
                 (DBT_SCHEMA, "mart_active_permit_age"),
                 (DBT_SCHEMA, "fct_active_permit_revision"),
+                (DBT_SCHEMA, "mart_active_backlog_by_year_type"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_by_year_type"),
+                (DBT_SCHEMA, "mart_cleared_lifecycle_matched_by_year_type"),
                 (DBT_SCHEMA, "fct_cleared_permit_revision"),
             }
             missing = sorted(required - available)
@@ -488,6 +500,17 @@ def load_dashboard_data(
             ).fetchdf()
             summary = connection.execute(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type"
+            ).fetchdf()
+            active_backlog = connection.execute(
+                f"SELECT * FROM {DBT_SCHEMA}.mart_active_backlog_by_year_type"
+            ).fetchdf()
+            matched_lifecycle = connection.execute(
+                f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_matched_by_year_type"
+            ).fetchdf()
+            pooled_lifecycle = connection.execute(
+                MATCHED_LIFECYCLE_POOLED_SQL.format(
+                    fact_relation=f"{DBT_SCHEMA}.fct_cleared_permit_revision"
+                )
             ).fetchdf()
 
             # The data-quality page needs aggregates, not the full Cleared fact.
@@ -617,9 +640,20 @@ def load_dashboard_data(
         raise RuntimeError(
             f"{DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type returned no records."
         )
+    if active_backlog.empty:
+        raise RuntimeError(
+            f"{DBT_SCHEMA}.mart_active_backlog_by_year_type returned no records."
+        )
+    if matched_lifecycle.empty or pooled_lifecycle.empty:
+        raise RuntimeError(
+            "The matched Closed-permit lifecycle relations returned no records."
+        )
     return (
         active,
         summary,
+        active_backlog,
+        matched_lifecycle,
+        pooled_lifecycle,
         cleared_revision_count,
         quality_counts,
         last_successful_refresh_utc,
@@ -775,18 +809,77 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
     return page, loading_slot, last_successful_refresh_slot
 
 
-def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
+def overview(
+    active: pd.DataFrame,
+    active_backlog: pd.DataFrame,
+    matched_lifecycle: pd.DataFrame,
+    pooled_lifecycle: pd.DataFrame,
+    backend: str,
+) -> None:
     hero(
         "TORONTO OPEN DATA · BUILDING PERMITS",
-        "What can permit records tell us about time?",
-        "Explore how long current Active records have been open, compare historical timelines for permits marked Closed, and see where the source data needs a closer look.",
+        "Toronto's Building Permit Backlog",
+        "Where current Active permit records are concentrated, how long they have remained open, and how elapsed time is distributed across matched Closed-permit lifecycles.",
     )
 
     active["is_age_eligible"] = normalize_bool(active["is_age_eligible"])
-    eligible = active[active["is_age_eligible"]].copy()
-    eligible_ages = number(eligible["age_since_application_days"]).dropna()
-    total_active = len(active)
-    eligible_count = len(eligible)
+    active["age_since_application_days"] = number(active["age_since_application_days"])
+    eligible_active = active.loc[active["is_age_eligible"]].copy()
+    eligible_ages = eligible_active["age_since_application_days"].dropna()
+
+    count_columns = [
+        "current_active_revision_count",
+        "age_eligible_count",
+        "age_ineligible_count",
+        "over_365_days_count",
+        "over_730_days_count",
+        "over_1095_days_count",
+    ]
+    required_columns = {"application_year", "permit_type", *count_columns}
+    missing_columns = required_columns - set(active_backlog.columns)
+    if missing_columns:
+        raise RuntimeError(
+            "The Active backlog mart is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+    active_backlog["application_year"] = number(active_backlog["application_year"])
+    for column in count_columns:
+        active_backlog[column] = number(active_backlog[column]).fillna(0)
+
+    cohort = (
+        active_backlog.groupby("application_year", dropna=False)[count_columns]
+        .sum()
+        .reset_index()
+    )
+    eligible_active["application_year"] = pd.to_datetime(
+        eligible_active["application_date"], errors="coerce"
+    ).dt.year
+    cohort_age = (
+        eligible_active.dropna(subset=["application_year"])
+        .groupby("application_year", as_index=False)
+        .agg(
+            median_age_days=("age_since_application_days", "median"),
+            p90_age_days=(
+                "age_since_application_days",
+                lambda values: values.quantile(0.90),
+            ),
+        )
+    )
+    cohort = cohort.merge(cohort_age, on="application_year", how="left")
+    cohort["application_year_label"] = cohort["application_year"].map(
+        lambda value: str(int(value)) if pd.notna(value) else "Unknown year"
+    )
+    cohort = cohort.sort_values("application_year", na_position="last")
+
+    total_active = int(cohort["current_active_revision_count"].sum())
+    eligible_count = int(cohort["age_eligible_count"].sum())
+    ineligible_count = int(cohort["age_ineligible_count"].sum())
+    over_365 = int(cohort["over_365_days_count"].sum())
+    over_730 = int(cohort["over_730_days_count"].sum())
+    over_1095 = int(cohort["over_1095_days_count"].sum())
+    median_active_age = eligible_ages.median() if not eligible_ages.empty else None
+    p90_active_age = eligible_ages.quantile(0.90) if not eligible_ages.empty else None
+
     asof_values = (
         pd.to_datetime(active["as_of_date"], errors="coerce").dropna()
         if "as_of_date" in active
@@ -797,19 +890,10 @@ def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
         if not asof_values.empty
         else "Not available"
     )
-
-    summary["eligible_date_pairs"] = number(summary["eligible_date_pairs"])
-    summary["median_days"] = number(summary["median_days"])
-    summary["p90_days"] = number(summary["p90_days"])
-    years = number(summary["application_year"]).dropna()
-    year_range = (
-        f"{int(years.min())}–{int(years.max())}" if not years.empty else "Not available"
-    )
     backend_label = (
         "Snowflake warehouse" if backend == "snowflake" else "Published DuckDB snapshot"
     )
 
-    # Compact provenance row: only show metadata supported by the loaded data/config.
     with st.container(key="story_data_context"):
         meta = st.columns([1, 1.25, 1.25], gap="medium")
         with meta[0]:
@@ -826,13 +910,11 @@ def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
     cols = st.columns(4, gap="medium")
     with cols[0]:
         metric_card(
-            "Active permit records",
-            fmt_int(total_active),
-            "Currently marked Active",
+            "Current Active records", fmt_int(total_active), "Currently marked Active"
         )
     with cols[1]:
         metric_card(
-            "Eligible for age analysis",
+            "Age-eligible records",
             fmt_int(eligible_count),
             f"{eligible_count / total_active:.1%} of Active records"
             if total_active
@@ -840,93 +922,284 @@ def overview(active: pd.DataFrame, summary: pd.DataFrame, backend: str) -> None:
         )
     with cols[2]:
         metric_card(
-            "Median active age",
-            fmt_days(eligible_ages.median()),
-            "Elapsed time so far for eligible records",
+            "Open more than one year",
+            fmt_int(over_365),
+            f"{over_365 / eligible_count:.1%} of age-eligible records"
+            if eligible_count
+            else "No eligible records",
         )
     with cols[3]:
         metric_card(
-            "90th-percentile active age",
-            fmt_days(eligible_ages.quantile(0.9)),
-            "9 in 10 eligible records are at or below this age",
+            "Median Active age",
+            fmt_days(median_active_age),
+            f"P90: {fmt_days(p90_active_age)} · elapsed time so far",
         )
 
-    st.write("")
-    left, right = st.columns([1, 1], gap="large")
-    with left:
-        st.subheader("What's still open?")
-        st.markdown(
-            '<div class="section-note">The age profile of records currently marked Active. '
-            "These are ongoing timelines, not estimates of how long permits will take to finish.</div>",
-            unsafe_allow_html=True,
-        )
-        if not eligible_ages.empty:
-            hist = pd.DataFrame({"Age (days)": eligible_ages})
-            fig = px.histogram(
-                hist,
-                x="Age (days)",
-                nbins=30,
-                color_discrete_sequence=[TEAL],
-                title="Age of eligible Active permit records",
-            )
-            fig.update_traces(
-                hovertemplate="Age: %{x:.0f} days<br>Records: %{y:,}<extra></extra>"
-            )
-            fig.update_xaxes(title="Days since application")
-            fig.update_yaxes(title="Permit records")
-            st.plotly_chart(chart_layout(fig, 410), width="stretch")
-        else:
-            st.info("No eligible Active records have a usable age value.")
-
-    with right:
-        st.subheader("What do closed records show?")
-        st.markdown(
-            f'<div class="section-note">Historical intervals for application years {year_range}. '
-            "The bars compare typical and higher-end values within year/type groups.</div>",
-            unsafe_allow_html=True,
-        )
-        if not summary.empty:
-            measures = summary.groupby("measure", as_index=False).agg(
-                typical_time=("median_days", "median"),
-                higher_end_time=("p90_days", "median"),
-            )
-            fig = go.Figure()
-            fig.add_trace(
-                go.Bar(
-                    name="Median of group medians",
-                    x=measures["measure"],
-                    y=measures["typical_time"],
-                    marker_color=TEAL,
-                )
-            )
-            fig.add_trace(
-                go.Bar(
-                    name="Median of group 90th percentiles",
-                    x=measures["measure"],
-                    y=measures["higher_end_time"],
-                    marker_color=RED,
-                )
-            )
-            fig.update_layout(
-                barmode="group",
-                title="Typical and higher-end times",
-            )
-            fig.update_xaxes(title="Date interval")
-            fig.update_yaxes(title="Days")
-            st.plotly_chart(chart_layout(fig, 410), width="stretch")
-        else:
-            st.info("No closed-permit lifecycle summaries are available.")
-
+    st.divider()
+    st.subheader("1. Where is today's Active backlog concentrated?")
     st.markdown(
-        '<div class="callout"><b>How to read this:</b> Active ages are elapsed time so far. '
-        "Closed-permit summaries describe historical records and compare year/type groups; "
-        "they are not pooled permit-level averages and do not identify causes of delay.</div>",
+        '<div class="section-note">Current Active records are grouped by the year of application. '
+        "Age-ineligible records remain in the total count but are excluded from age statistics.</div>",
         unsafe_allow_html=True,
     )
+    cohort_fig = go.Figure()
+    cohort_fig.add_trace(
+        go.Bar(
+            name="Age-eligible",
+            x=cohort["application_year_label"],
+            y=cohort["age_eligible_count"],
+            marker_color=TEAL,
+        )
+    )
+    cohort_fig.add_trace(
+        go.Bar(
+            name="Age-ineligible",
+            x=cohort["application_year_label"],
+            y=cohort["age_ineligible_count"],
+            marker_color=MUTED,
+        )
+    )
+    cohort_fig.update_layout(
+        barmode="stack", title="Current Active records by application-year cohort"
+    )
+    cohort_fig.update_xaxes(title="Application year")
+    cohort_fig.update_yaxes(title="Current Active records")
+    st.plotly_chart(chart_layout(cohort_fig, 360), width="stretch")
 
+    eligible_total = max(eligible_count, 1)
+    cohort["eligible_backlog_share_pct"] = (
+        100.0 * cohort["age_eligible_count"] / eligible_total
+    )
+    cohort_table = cohort[
+        [
+            "application_year_label",
+            "current_active_revision_count",
+            "age_eligible_count",
+            "age_ineligible_count",
+            "eligible_backlog_share_pct",
+            "over_365_days_count",
+            "over_730_days_count",
+            "over_1095_days_count",
+            "median_age_days",
+            "p90_age_days",
+        ]
+    ].rename(
+        columns={
+            "application_year_label": "Application year",
+            "current_active_revision_count": "Current Active",
+            "age_eligible_count": "Age eligible",
+            "age_ineligible_count": "Age ineligible",
+            "eligible_backlog_share_pct": "Share of eligible backlog (%)",
+            "over_365_days_count": ">365 days",
+            "over_730_days_count": ">730 days",
+            "over_1095_days_count": ">1,095 days",
+            "median_age_days": "Median age (days)",
+            "p90_age_days": "P90 age (days)",
+        }
+    )
+    st.dataframe(cohort_table, hide_index=True, width="stretch")
+    recent_cohorts = cohort.loc[
+        cohort["application_year"] >= 2024, "age_eligible_count"
+    ].sum()
+    recent_share = recent_cohorts / eligible_total if eligible_count else 0.0
+    latest_year = (
+        int(cohort["application_year"].dropna().max())
+        if cohort["application_year"].notna().any()
+        else None
+    )
+    st.markdown(
+        f"**{recent_share:.1%}** of the age-eligible backlog belongs to 2024 and later application cohorts. "
+        + (f"The {latest_year} cohort is partial." if latest_year else "")
+    )
     st.caption(
-        "The latest application year may be incomplete. Records with missing or conflicting "
-        "information are handled by the documented eligibility and data-quality rules."
+        f"Age-ineligible Active records: {ineligible_count:,}. Threshold counts use age-eligible records only: "
+        f"{over_365:,} over 365 days, {over_730:,} over 730 days, and {over_1095:,} over 1,095 days."
+    )
+
+    st.divider()
+    st.subheader("2. Which permit types account for the older backlog?")
+    st.markdown(
+        '<div class="section-note">Ranked by the number of age-eligible Active records open for more than 365 days. '
+        "Median and P90 ages are calculated from individual Active records, not averages of permit-type summaries.</div>",
+        unsafe_allow_html=True,
+    )
+    by_type = (
+        active_backlog.groupby("permit_type", dropna=False)[count_columns]
+        .sum()
+        .reset_index()
+    )
+    type_age = eligible_active.groupby("permit_type", as_index=False).agg(
+        median_age_days=("age_since_application_days", "median"),
+        p90_age_days=(
+            "age_since_application_days",
+            lambda values: values.quantile(0.90),
+        ),
+    )
+    by_type = by_type.merge(type_age, on="permit_type", how="left")
+    by_type = by_type.sort_values(
+        ["over_365_days_count", "current_active_revision_count"],
+        ascending=[False, False],
+    )
+    top_types = by_type.head(10).sort_values("over_365_days_count", ascending=True)
+    type_fig = px.bar(
+        top_types,
+        x="over_365_days_count",
+        y="permit_type",
+        orientation="h",
+        color_discrete_sequence=[TEAL],
+        title="Top permit types by Active records open over one year",
+    )
+    type_fig.update_xaxes(title="Age-eligible Active records open >365 days")
+    type_fig.update_yaxes(title="Permit type")
+    st.plotly_chart(chart_layout(type_fig, 420), width="stretch")
+
+    top_five_share = (
+        by_type.head(5)["over_365_days_count"].sum() / over_365 if over_365 else 0.0
+    )
+    st.markdown(
+        f"The five permit types with the largest over-one-year counts account for **{top_five_share:.1%}** "
+        "of all age-eligible Active records open more than 365 days."
+    )
+    type_table = by_type.head(12)[
+        [
+            "permit_type",
+            "current_active_revision_count",
+            "age_eligible_count",
+            "over_365_days_count",
+            "over_730_days_count",
+            "over_1095_days_count",
+            "median_age_days",
+            "p90_age_days",
+        ]
+    ].rename(
+        columns={
+            "permit_type": "Permit type",
+            "current_active_revision_count": "Current Active",
+            "age_eligible_count": "Age eligible",
+            "over_365_days_count": ">365 days",
+            "over_730_days_count": ">730 days",
+            "over_1095_days_count": ">1,095 days",
+            "median_age_days": "Median age (days)",
+            "p90_age_days": "P90 age (days)",
+        }
+    )
+    st.dataframe(type_table, hide_index=True, width="stretch")
+
+    st.divider()
+    st.subheader("3. How long do Closed permits spend at each lifecycle stage?")
+    st.markdown(
+        '<div class="section-note">These three intervals use the same matched cohort of records marked Closed '
+        "with application, issue, and completion dates all present and chronologically ordered.</div>",
+        unsafe_allow_html=True,
+    )
+    measure_order = [
+        "Application to issue",
+        "Issue to completion",
+        "Application to completion",
+    ]
+    pooled = pooled_lifecycle.copy()
+    for column in ("matched_cohort_count", "median_days", "p90_days"):
+        pooled[column] = number(pooled[column])
+    pooled = pooled.set_index("measure").reindex(measure_order).reset_index()
+    if pooled[["matched_cohort_count", "median_days", "p90_days"]].isna().any().any():
+        raise RuntimeError(
+            "The pooled matched lifecycle summary is missing one or more intervals."
+        )
+    matched_count = int(pooled["matched_cohort_count"].min())
+    lifecycle_cols = st.columns(3, gap="medium")
+    for column, row in zip(lifecycle_cols, pooled.to_dict("records"), strict=True):
+        with column:
+            metric_card(
+                row["measure"],
+                fmt_days(row["median_days"]),
+                f"P90: {fmt_days(row['p90_days'])} · n={int(row['matched_cohort_count']):,}",
+            )
+
+    lifecycle_fig = go.Figure()
+    lifecycle_fig.add_trace(
+        go.Bar(
+            name="Median",
+            x=pooled["measure"],
+            y=pooled["median_days"],
+            marker_color=TEAL,
+        )
+    )
+    lifecycle_fig.add_trace(
+        go.Bar(
+            name="90th percentile",
+            x=pooled["measure"],
+            y=pooled["p90_days"],
+            marker_color=GOLD,
+        )
+    )
+    lifecycle_fig.update_layout(
+        barmode="group", title="Elapsed calendar days in the matched Closed cohort"
+    )
+    lifecycle_fig.update_xaxes(title="Lifecycle interval")
+    lifecycle_fig.update_yaxes(title="Calendar days")
+    st.plotly_chart(chart_layout(lifecycle_fig, 360), width="stretch")
+    st.caption(
+        f"Matched cohort: {matched_count:,} Closed permit records. Each interval uses the same records; "
+        "these are pooled permit-level medians and P90s, not medians of year/type group summaries."
+    )
+
+    with st.expander(
+        "Explore matched lifecycle cohorts by permit type and application year"
+    ):
+        matched_lifecycle["application_year"] = number(
+            matched_lifecycle["application_year"]
+        )
+        matched_lifecycle["matched_cohort_count"] = number(
+            matched_lifecycle["matched_cohort_count"]
+        ).fillna(0)
+        matched_lifecycle["median_days"] = number(matched_lifecycle["median_days"])
+        matched_lifecycle["p90_days"] = number(matched_lifecycle["p90_days"])
+        permit_types = sorted(
+            matched_lifecycle["permit_type"].dropna().astype(str).unique()
+        )
+        if permit_types:
+            choose_type, choose_measure = st.columns(2, gap="medium")
+            selected_type = choose_type.selectbox(
+                "Permit type",
+                permit_types,
+                key="story_matched_permit_type",
+            )
+            selected_measure = choose_measure.selectbox(
+                "Lifecycle interval",
+                measure_order,
+                key="story_matched_lifecycle_measure",
+            )
+            selected_cohorts = matched_lifecycle.loc[
+                (matched_lifecycle["permit_type"].astype(str) == selected_type)
+                & (matched_lifecycle["measure"] == selected_measure)
+            ].sort_values("application_year")
+            selected_cohorts = selected_cohorts[
+                ["application_year", "matched_cohort_count", "median_days", "p90_days"]
+            ].rename(
+                columns={
+                    "application_year": "Application year",
+                    "matched_cohort_count": "Matched records",
+                    "median_days": "Median days",
+                    "p90_days": "P90 days",
+                }
+            )
+            st.dataframe(selected_cohorts, hide_index=True, width="stretch")
+            st.caption(
+                "Each row is one application-year × permit-type matched cohort. "
+                "These group-level values should not be averaged to produce an overall permit-level median."
+            )
+        else:
+            st.info(
+                "No matched Closed lifecycle cohorts are available for permit-type exploration."
+            )
+
+    st.markdown(
+        '<div class="callout"><b>Scope and interpretation:</b> Active ages are elapsed time so far for records still marked Active; '
+        "they are ongoing timelines, not forecasts of completion. The Closed cohort includes only records with all three dates "
+        "available and in chronological order. Recent Closed cohorts are selected from permits already marked Closed, so they "
+        "must not be interpreted as proof that processing times are improving. The source covers building-permit records only; "
+        "it does not measure housing units, affordability, causes of delay, or the wider development-application pipeline.</div>",
+        unsafe_allow_html=True,
     )
 
 
@@ -1766,6 +2039,9 @@ def main() -> None:
                     (
                         active,
                         summary,
+                        active_backlog,
+                        matched_lifecycle,
+                        pooled_lifecycle,
                         cleared_count,
                         quality_counts,
                         last_successful_refresh_utc,
@@ -1788,6 +2064,9 @@ def main() -> None:
             (
                 active,
                 summary,
+                active_backlog,
+                matched_lifecycle,
+                pooled_lifecycle,
                 cleared_count,
                 quality_counts,
                 last_successful_refresh_utc,
@@ -1807,7 +2086,7 @@ def main() -> None:
         else:
             st.markdown(
                 "Check the Snowflake connection settings, the dashboard role's "
-                "read-only grants, and whether all four required dbt relations "
+                "read-only grants, and whether all six required dbt relations "
                 "exist in the configured analytics schema. The app will not silently "
                 "switch to DuckDB when Snowflake fails."
             )
@@ -1847,7 +2126,13 @@ def main() -> None:
         )
 
     if page == "The story":
-        overview(active.copy(), summary.copy(), backend)
+        overview(
+            active.copy(),
+            active_backlog.copy(),
+            matched_lifecycle.copy(),
+            pooled_lifecycle.copy(),
+            backend,
+        )
     elif page == "Active permits":
         active_page(active.copy())
     elif page == "Closed-permit timelines":

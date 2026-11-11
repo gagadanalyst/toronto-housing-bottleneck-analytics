@@ -336,7 +336,9 @@ jobs:
               tables = (
                   "MART_ACTIVE_PERMIT_AGE",
                   "FCT_ACTIVE_PERMIT_REVISION",
+                  "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
                   "FCT_CLEARED_PERMIT_REVISION",
                   "DASHBOARD_REFRESH_METADATA",
               )
@@ -376,7 +378,9 @@ jobs:
               required = (
                   "MART_ACTIVE_PERMIT_AGE",
                   "FCT_ACTIVE_PERMIT_REVISION",
+                  "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
                   "FCT_CLEARED_PERMIT_REVISION",
               )
               cursor.execute(

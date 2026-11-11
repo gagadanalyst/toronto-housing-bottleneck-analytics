@@ -8,11 +8,14 @@ exposures:
       Public Streamlit dashboard for the Toronto Housing Bottleneck Analytics
       project. It reads the DuckDB or Snowflake backend selected by
       DASHBOARD_BACKEND and queries the shared dbt serving models for Active
-      permit age, Cleared lifecycle summaries, and data-quality reporting.
+      permit age, Active backlog cohorts, matched Closed lifecycle summaries,
+      and data-quality reporting.
     depends_on:
       - ref('mart_active_permit_age')
       - ref('fct_active_permit_revision')
+      - ref('mart_active_backlog_by_year_type')
       - ref('mart_cleared_lifecycle_by_year_type')
+      - ref('mart_cleared_lifecycle_matched_by_year_type')
       - ref('fct_cleared_permit_revision')
     owner:
       name: gagadanalyst

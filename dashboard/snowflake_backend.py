@@ -1,4 +1,4 @@
-"""Read the four dashboard-facing dbt relations using a dedicated read-only role."""
+"""Read the six dashboard-facing dbt relations using a dedicated read-only role."""
 
 from __future__ import annotations
 
@@ -64,9 +64,59 @@ CLEARED_AGGREGATE_FIELDS = (
 REQUIRED_RELATIONS = (
     "MART_ACTIVE_PERMIT_AGE",
     "FCT_ACTIVE_PERMIT_REVISION",
+    "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
     "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+    "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
     "FCT_CLEARED_PERMIT_REVISION",
 )
+
+MATCHED_LIFECYCLE_POOLED_SQL = """
+WITH matched_closed_cohort AS (
+    SELECT
+        application_to_issue_days_raw,
+        application_to_completion_days_raw,
+        issue_to_completion_days_raw
+    FROM {fact_relation}
+    WHERE status = 'Closed'
+      AND application_date IS NOT NULL
+      AND issued_date IS NOT NULL
+      AND completed_date IS NOT NULL
+      AND application_date <= issued_date
+      AND issued_date <= completed_date
+),
+duration_rows AS (
+    SELECT
+        'Application to issue' AS measure,
+        application_to_issue_days_raw AS duration_days
+    FROM matched_closed_cohort
+    UNION ALL
+    SELECT
+        'Issue to completion' AS measure,
+        issue_to_completion_days_raw AS duration_days
+    FROM matched_closed_cohort
+    UNION ALL
+    SELECT
+        'Application to completion' AS measure,
+        application_to_completion_days_raw AS duration_days
+    FROM matched_closed_cohort
+)
+SELECT
+    measure,
+    CAST(COUNT(*) AS BIGINT) AS matched_cohort_count,
+    CAST(MEDIAN(duration_days) AS DOUBLE) AS median_days,
+    CAST(
+        PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY duration_days)
+        AS DOUBLE
+    ) AS p90_days
+FROM duration_rows
+GROUP BY measure
+ORDER BY CASE measure
+    WHEN 'Application to issue' THEN 1
+    WHEN 'Issue to completion' THEN 2
+    WHEN 'Application to completion' THEN 3
+    ELSE 4
+END
+"""
 
 
 def _identifier(value: str, label: str) -> str:
@@ -86,8 +136,17 @@ def _fetch_dataframe(cursor: Any, query: str) -> pd.DataFrame:
 
 def load_snowflake_dashboard_data(
     config: Mapping[str, Any],
-) -> tuple[pd.DataFrame, pd.DataFrame, int, dict[str, int], Any | None]:
-    """Read the four dashboard relations using a dedicated read-only role.
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    int,
+    dict[str, int],
+    Any | None,
+]:
+    """Read the six dashboard relations using a dedicated read-only role.
 
     Expected configuration keys:
       account, user, private_key
@@ -197,6 +256,20 @@ def load_snowflake_dashboard_data(
             cursor,
             f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
         )
+        active_backlog = _fetch_dataframe(
+            cursor,
+            f"SELECT * FROM {qualified_schema}.MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
+        )
+        matched_lifecycle = _fetch_dataframe(
+            cursor,
+            f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
+        )
+        pooled_lifecycle = _fetch_dataframe(
+            cursor,
+            MATCHED_LIFECYCLE_POOLED_SQL.format(
+                fact_relation=f"{qualified_schema}.FCT_CLEARED_PERMIT_REVISION"
+            ),
+        )
 
         active_flag_expressions = [
             f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) "
@@ -304,6 +377,14 @@ def load_snowflake_dashboard_data(
                 f"{qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE "
                 "returned no records."
             )
+        if active_backlog.empty:
+            raise RuntimeError(
+                f"{qualified_schema}.MART_ACTIVE_BACKLOG_BY_YEAR_TYPE returned no records."
+            )
+        if matched_lifecycle.empty or pooled_lifecycle.empty:
+            raise RuntimeError(
+                "The matched Closed-permit lifecycle relations returned no records."
+            )
 
         totals = totals_frame.iloc[0].to_dict()
         cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
@@ -320,6 +401,9 @@ def load_snowflake_dashboard_data(
         return (
             active,
             summary,
+            active_backlog,
+            matched_lifecycle,
+            pooled_lifecycle,
             cleared_revision_count,
             quality_counts,
             last_successful_refresh_utc,
