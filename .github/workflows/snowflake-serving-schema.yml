@@ -217,7 +217,9 @@ jobs:
                   "DIM_DATE",
                   "DIM_PERMIT_TYPE",
                   "MART_ACTIVE_PERMIT_AGE",
+                  "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
                   "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+                  "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
                   "DASHBOARD_REFRESH_METADATA",
               }
               cursor.execute(

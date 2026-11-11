@@ -29,7 +29,9 @@ The models follow three layers:
 | `dim_date` | Provides a continuous date dimension covering the lifecycle dates used by the project. |
 | `dim_permit_type` | Provides permit-type values for analytical joins. |
 | `mart_active_permit_age` | Calculates eligible active-permit age as of a configured date. |
+| `mart_active_backlog_by_year_type` | Aggregates current Active backlog counts, ageing thresholds, and age statistics by application year and permit type. |
 | `mart_cleared_lifecycle_by_year_type` | Summarizes lifecycle durations, eligible date pairs, and negative-duration exceptions by application year and permit type. |
+| `mart_cleared_lifecycle_matched_by_year_type` | Compares all three Closed-permit lifecycle intervals using one matched cohort with complete, chronological dates. |
 
 Staging models are materialized as views. Marts are materialized as tables. Model materializations and static-analysis settings are defined in `dbt_project.yml`.
 
@@ -47,6 +49,8 @@ The project includes singular SQL tests for:
 - Source-row aggregation and conflict-publication rules.
 - Lifecycle-duration eligibility and treatment of negative intervals.
 - Active-permit age eligibility and uniqueness.
+- Active-backlog cohort aggregation, threshold ordering, and reconciliation to the age mart.
+- Matched Cleared lifecycle cohort coverage, duration statistics, and reconciliation to the revision fact.
 - Date continuity and lifecycle-date coverage.
 
 Tests are organized alongside the models and grouped by the contract they verify. Existing tests should be extended where needed rather than duplicated.
@@ -77,7 +81,8 @@ The DuckDB filename is intentionally kept as `toronto.duckdb`. Renaming the file
 ### Analytical limitations
 
 - **Cleared Permits:** lifecycle duration measures describe observed cleared/closed outcomes, not the full population of permits at application time. Closure selection bias affects comparisons, and 2026 is a partial year.
-- **Active Permits:** age is right censored because these permits have not necessarily completed their lifecycle. The as-of-date must be stated when publishing results.
+- **Active Permits:** age is right censored because these permits have not necessarily completed their lifecycle. The as-of-date must be stated when publishing results. The backlog mart groups current revisions by application year and permit type; records without a usable application date are retained in a null-year group rather than silently omitted.
+- **Matched Cleared lifecycle:** the matched mart includes only Closed revisions with all three dates present and chronologically ordered (application, issue, completion). This makes the three interval measures comparable within each year/type cohort, but it does not remove closure-selection bias or the partial-year effect.
 - **Negative durations:** intervals with negative durations are retained as data-quality evidence but excluded from publishable duration statistics.
 - **Conflicting attributes:** where critical values disagree across physical source rows, the models preserve conflict evidence and withhold affected analytical values according to the model contracts.
 - **Causality:** observed differences describe the data; they do not establish the causes of permit delays.
