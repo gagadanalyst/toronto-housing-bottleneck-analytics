@@ -1115,6 +1115,8 @@ def overview(
                 f"P90: {fmt_days(row['p90_days'])} · n={int(row['matched_cohort_count']):,}",
             )
 
+    st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
+
     lifecycle_fig = go.Figure()
     lifecycle_fig.add_trace(
         go.Bar(
@@ -1635,6 +1637,8 @@ def quality_page(
         y="Check",
         text="Records",
         orientation="h",
+        color="Records",
+        color_continuous_scale=[SCALE_LOW, TEAL],
         title="Active revisions by check",
     )
     fig.update_traces(
@@ -1707,6 +1711,8 @@ def quality_page(
             y="Reason",
             text="Records",
             orientation="h",
+            color="Reason",
+            color_discrete_sequence=[TEAL, GOLD, BLUE, RED],
             title="Excluded Active revisions by first applicable reason",
         )
         fig.update_traces(
@@ -1829,6 +1835,8 @@ def quality_page(
         y="Check",
         text="Records",
         orientation="h",
+        color="Records",
+        color_continuous_scale=[SCALE_LOW, TEAL],
         title="Cleared revisions by check",
     )
     fig.update_traces(
