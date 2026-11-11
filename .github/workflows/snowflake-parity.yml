@@ -248,7 +248,7 @@ jobs:
               if not re.fullmatch(r"[0-9]+", value):
                   raise ValueError(f"{label} must contain digits only.")
 
-          source_schema = f"SNOWFLAKE_BASELINE_{workflow_run_id}_{attempt}"
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
               env.write(f"TORONTO_DBT_SOURCE_SCHEMA={source_schema}\n")
@@ -260,10 +260,11 @@ jobs:
         env:
           TORONTO_WAREHOUSE_KIND: snowflake
           TORONTO_WAREHOUSE_CREDENTIALS: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-          TORONTO_WAREHOUSE_DATASET: SNOWFLAKE_BASELINE_${{ github.run_id }}_${{ github.run_attempt }}
           SNAPSHOT_BUNDLE_PATH: data/snapshot-download/toronto-snapshot-bundle.zip
           RUNTIME__DLTHUB_TELEMETRY: "false"
-        run: python scripts/snowflake_snapshot_baseline.py
+        run: |
+          export TORONTO_WAREHOUSE_DATASET="SNOWFLAKE_BASELINE_${SNAPSHOT_SOURCE_RUN_ID}_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          python scripts/snowflake_snapshot_baseline.py
 
       - name: Prepare isolated Snowflake parity target and grant dbt access
         run: |
@@ -283,7 +284,7 @@ jobs:
           if not re.fullmatch(r"[0-9]+", attempt):
               raise ValueError("GitHub workflow attempt must contain digits only.")
 
-          source_schema = f"SNOWFLAKE_BASELINE_{workflow_run_id}_{attempt}"
+          source_schema = f"SNOWFLAKE_BASELINE_{run_id}_{workflow_run_id}_{attempt}"
           target_schema = f"ANALYTICS_PARITY_{workflow_run_id}_{attempt}"
           if os.environ.get("TORONTO_DBT_SOURCE_SCHEMA") != source_schema:
               raise ValueError("Registered Snowflake source schema does not match run IDs.")
@@ -385,7 +386,7 @@ jobs:
               raise ValueError("Unexpected Snowflake parity target schema.")
 
           if source_schema and not re.fullmatch(
-              r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+", source_schema
+              r"SNOWFLAKE_BASELINE_[0-9]+_[0-9]+_[0-9]+", source_schema
           ):
               raise ValueError("Unexpected Snowflake parity source schema.")
 
