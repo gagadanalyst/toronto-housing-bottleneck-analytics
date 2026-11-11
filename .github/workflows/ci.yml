@@ -9,6 +9,11 @@ on:
       - 'dashboard/**'
       - 'tests/**'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/cd.yml'
+      - '.github/workflows/snowflake-serving-schema.yml'
+      - 'dbt/models/exposures.yml'
+      - 'infra/**'
+      - 'scripts/promote_snowflake_serving_candidate.py'
       - '.gitignore'
       - 'LICENSE'
   pull_request:
