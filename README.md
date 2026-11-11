@@ -4,6 +4,24 @@ An end-to-end Analytics Engineering project using City of Toronto building-permi
 
 **[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
+## Analytical questions this project answers
+
+Using current logical Active permit revisions and records marked `Closed`, the dashboard investigates:
+
+1. **How is the current Active permit backlog distributed across application years and permit types?** Compare eligible and ineligible revisions and see how the backlog varies by cohort.
+
+2. **How old are eligible Active permits?** Examine age distributions, median and 90th-percentile age, and counts of records older than 365, 730, and 1,095 calendar days.
+
+3. **Where is the older Active backlog concentrated?** Identify application-year cohorts and permit types contributing the largest counts of permits aged more than 365 days.
+
+4. **For matched permits recorded as `Closed`, how much calendar time elapses between application, issuance, and completion?** Compare counts, median, and 90th-percentile durations for application-to-issue, issue-to-completion, and application-to-completion intervals using the same matched cohort.
+
+5. **How do Closed-permit lifecycle intervals vary by application year and permit type?** Compare lifecycle measures across the corresponding year/type cohorts.
+
+6. **What data-quality conditions affect these measures?** Examine missing and conflicting fields, unusable or out-of-order dates, and exclusions from the Active-age and matched Closed cohorts.
+
+**Interpretation guardrails.** Each observation is a building-permit revision, not a home or dwelling unit. Active age is elapsed calendar days from application date to the analysis `as_of_date`; these are ongoing, right-censored ages, not final processing times. The pooled matched Closed lifecycle analysis uses records with all three dates present and chronological order (`application_date <= issued_date <= completed_date`). The broader Closed-permit timelines page evaluates each date pair independently and excludes negative intervals from published duration statistics. Both describe selected records, not all applications. These are descriptive comparisons, not causal explanations of processing time, housing supply, affordability, or the wider development pipeline.
+
 ## What the project demonstrates
 
 | Area | What is implemented |
@@ -165,16 +183,16 @@ If a real credential is detected, treat it as exposed and rotate/revoke it; dele
 
 ## Live dashboard
 
-**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. The dashboard supports both DuckDB and Snowflake; `DASHBOARD_BACKEND` selects the source (`duckdb` or `snowflake`). If neither the environment variable nor the Streamlit secret is set, the app defaults to DuckDB. Both paths query the same dbt analytical relations rather than calling Toronto CKAN directly. Connection or query errors are shown rather than silently switching backends. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successful DuckDB publication or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections:
+**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. The dashboard supports both DuckDB and Snowflake; `DASHBOARD_BACKEND` selects the source (`duckdb` or `snowflake`). If neither the environment variable nor the Streamlit secret is set, the app defaults to DuckDB. Both paths query the same dbt analytical relations rather than calling Toronto CKAN directly. Connection or query errors are shown rather than silently switching backends. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successful DuckDB publication or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections, each with a distinct analytical purpose:
 
-- **The story** — current Active backlog by application-year cohort and permit type, plus pooled matched Closed-lifecycle intervals and interpretation caveats.
-- **Active permits** — age distributions and comparisons by permit type, including record-level detail.
-- **Closed-permit timelines** — lifecycle date-pair comparisons by application year and permit type for records marked `Closed`.
-- **Data quality & definitions** — logical-revision findings, overlapping check counts, Active age eligibility and exclusions, Cleared date completeness, metric definitions, and caveats.
+- **The story** — decision-oriented overview of the current Active backlog by application-year cohort and permit type. It compares eligible and ineligible records, highlights older backlog thresholds, and reports age statistics. It also presents pooled lifecycle durations for matched Closed permits and an application-year/permit-type cohort explorer using that same matched cohort.
+- **Active permits** — interactive exploration of ongoing Active-permit ages by permit type, including distributions, median and 90th-percentile age, and individual permit-revision details. Filters allow the viewer to narrow the analysis by permit type and age.
+- **Closed-permit timelines** — lifecycle comparisons for records marked `Closed`, by application year, permit type and date interval. This page uses the broader lifecycle mart and reports date-pair counts, usable non-negative duration counts, and group-level duration summaries.
+- **Data quality & definitions** — logical-revision findings, overlapping check counts, Active age eligibility and exclusions, Cleared date completeness, metric definitions and interpretation caveats.
 
-The “revisions with findings” KPIs count each logical revision once; per-check counts can overlap and should not be added. Active age exclusions are reported separately from data-quality findings. Cleared checks cover all current statuses, and date completeness separates conflicting values from missing or unusable values. A populated completion date is a source value, not confirmation that a permit is marked `Closed`.
+**How to interpret the two lifecycle views.** The Story page calculates pooled median and 90th-percentile durations across individual permit revisions in one matched Closed cohort: all three dates must be present and chronologically ordered. The Closed-permit timelines page uses the broader lifecycle mart, which summarizes records within application-year and permit-type groups. Its displayed median of group medians and median of group 90th percentiles are summaries of group-level statistics, not pooled permit-level median and P90 values. The two views therefore answer related questions but use different cohorts and aggregation levels.
 
-The dashboard distinguishes within-group summary statistics from statistics across individual revisions; a median of group medians is not presented as the median of all permits.
+The "revisions with findings" KPIs count each logical revision once; per-check counts can overlap and should not be added. Active age exclusions are reported separately from data-quality findings. Cleared checks cover all current statuses, and date completeness separates conflicting values from missing or unusable values. A populated completion date is a source value, not confirmation that a permit is marked `Closed`.
 
 ## Review the project locally
 
