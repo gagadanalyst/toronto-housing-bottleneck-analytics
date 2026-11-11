@@ -339,3 +339,128 @@ models:
         data_tests:
           - not_null
           - unique
+
+  - name: mart_active_backlog_by_year_type
+    config:
+      contract:
+        enforced: true
+    description: >-
+      Current logical Active permit revisions grouped by application year and
+      permit type. Counts include both age-eligible and ineligible revisions;
+      revisions without a usable application date remain visible in a null-year
+      group. Age statistics and ageing thresholds use only age-eligible rows.
+      Eligible backlog share is each group’s percentage of all eligible current
+      Active revisions in this mart.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - application_year
+              - permit_type
+    columns:
+      - name: application_year
+        data_type: INTEGER
+        description: Calendar year of application; null when no consolidated application date is available.
+      - name: permit_type
+        data_type: VARCHAR
+        description: City-defined permit type.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_permit_type')
+                field: permit_type
+      - name: current_active_revision_count
+        data_type: BIGINT
+        description: Number of current logical Active revisions in the year and permit-type group.
+        data_tests:
+          - not_null
+      - name: age_eligible_count
+        data_type: BIGINT
+        description: Number of revisions eligible for the Active age analysis.
+        data_tests:
+          - not_null
+      - name: age_ineligible_count
+        data_type: BIGINT
+        description: Number of revisions excluded from the Active age analysis.
+        data_tests:
+          - not_null
+      - name: over_365_days_count
+        data_type: BIGINT
+        description: Eligible current Active revisions with an observed age greater than 365 calendar days.
+        data_tests:
+          - not_null
+      - name: over_730_days_count
+        data_type: BIGINT
+        description: Eligible current Active revisions with an observed age greater than 730 calendar days.
+        data_tests:
+          - not_null
+      - name: over_1095_days_count
+        data_type: BIGINT
+        description: Eligible current Active revisions with an observed age greater than 1,095 calendar days.
+        data_tests:
+          - not_null
+      - name: median_age_days
+        data_type: DOUBLE
+        description: Median elapsed calendar-day age among age-eligible revisions; null when the group has no eligible revisions.
+      - name: p90_age_days
+        data_type: DOUBLE
+        description: 90th percentile of elapsed calendar-day age among age-eligible revisions, rounded to two decimal places; null when none are eligible.
+      - name: eligible_backlog_share_pct
+        data_type: DOUBLE
+        description: Percentage contribution of this group to all age-eligible current Active revisions across the mart.
+
+  - name: mart_cleared_lifecycle_matched_by_year_type
+    config:
+      contract:
+        enforced: true
+    description: >-
+      Lifecycle duration statistics by application year, permit type, and
+      interval for one matched cohort of Closed logical revisions. A revision
+      is included only when all three lifecycle dates are present and satisfy
+      application_date <= issued_date <= completed_date. The matched cohort
+      count is therefore identical across all three interval measures within
+      a year and permit-type group. Recent years remain subject to
+      closure-selection bias and 2026 is partial.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - application_year
+              - permit_type
+              - measure
+    columns:
+      - name: application_year
+        data_type: INTEGER
+        description: Calendar year of application.
+        data_tests:
+          - not_null
+      - name: permit_type
+        data_type: VARCHAR
+        description: City-defined permit type.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_permit_type')
+                field: permit_type
+      - name: measure
+        data_type: VARCHAR
+        description: Lifecycle interval being summarized.
+        data_tests:
+          - not_null
+      - name: matched_cohort_count
+        data_type: BIGINT
+        description: Number of Closed logical revisions in the shared matched cohort for this year, permit type, and measure.
+        data_tests:
+          - not_null
+      - name: median_days
+        data_type: DOUBLE
+        description: Median non-negative elapsed calendar days for the matched cohort.
+        data_tests:
+          - not_null
+      - name: p90_days
+        data_type: DOUBLE
+        description: 90th percentile of non-negative elapsed calendar days for the matched cohort, rounded to two decimal places.
+        data_tests:
+          - not_null

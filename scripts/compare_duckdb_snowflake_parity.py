@@ -21,7 +21,9 @@ MODELS = (
     "fct_active_permit_revision",
     "fct_cleared_permit_revision",
     "mart_active_permit_age",
+    "mart_active_backlog_by_year_type",
     "mart_cleared_lifecycle_by_year_type",
+    "mart_cleared_lifecycle_matched_by_year_type",
 )
 GRAINS = {
     "dim_date": ("date_day",),
@@ -29,7 +31,13 @@ GRAINS = {
     "fct_active_permit_revision": ("permit_num", "revision_num", "permit_type"),
     "fct_cleared_permit_revision": ("permit_num", "revision_num", "permit_type"),
     "mart_active_permit_age": ("permit_num", "revision_num", "permit_type"),
+    "mart_active_backlog_by_year_type": ("application_year", "permit_type"),
     "mart_cleared_lifecycle_by_year_type": (
+        "application_year",
+        "permit_type",
+        "measure",
+    ),
+    "mart_cleared_lifecycle_matched_by_year_type": (
         "application_year",
         "permit_type",
         "measure",
@@ -40,7 +48,14 @@ ROW_COMPARE_MODELS = tuple(
     for model in MODELS
     if model not in {"stg_active_permits", "stg_cleared_permits"}
 )
-FLOAT_TOLERANCE_COLUMNS = {"median_days", "p90_days", "negative_interval_rate_pct"}
+FLOAT_TOLERANCE_COLUMNS = {
+    "median_days",
+    "p90_days",
+    "negative_interval_rate_pct",
+    "median_age_days",
+    "p90_age_days",
+    "eligible_backlog_share_pct",
+}
 NUMERIC_EPSILON = Decimal("0.000000001")
 SUMMARY_TOLERANCE = Decimal("0.01")
 
