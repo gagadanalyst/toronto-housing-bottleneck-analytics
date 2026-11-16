@@ -176,7 +176,6 @@ def validate_release_provenance(provenance: Mapping[str, Any]) -> None:
     ):
         raise ValueError("A full source commit SHA is required for publication.")
 
-
     repository = execution.get("repository")
     workflow = execution.get("workflow")
     run_id = execution.get("run_id")
