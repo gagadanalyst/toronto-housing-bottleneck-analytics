@@ -1,0 +1,100 @@
+name: V2 Snapshot Archive
+
+on:
+  # One-time bootstrap trigger for the extraction feature branch.
+  # It only runs when this workflow file is first added or changed.
+  push:
+    branches:
+      - refactor/separate-extraction
+    paths:
+      - .github/workflows/v2-snapshot-archive.yml
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toronto-v2-snapshot-archive
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  archive:
+    name: Extract and publish V2 source snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: extraction/pyproject.toml
+
+      - name: Install extraction package
+        working-directory: extraction
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run lint, formatting and tests
+        working-directory: extraction
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+          pytest -q
+
+      - name: Extract and validate Active/Cleared snapshot
+        id: extract
+        working-directory: extraction
+        env:
+          SNAPSHOT_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          toronto-extract \
+            --config config/sources.yml \
+            --output data/extraction
+
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+
+          archives = sorted(
+              Path("data/extraction/snapshots").glob("*.zip")
+          )
+
+          if len(archives) != 1:
+              raise SystemExit(
+                  f"Expected one new snapshot archive, found {len(archives)}."
+              )
+
+          archive = archives[0]
+
+          print(f"archive={archive.as_posix()}")
+          print(f"workspace_archive=extraction/{archive.as_posix()}")
+          PY
+
+      - name: Preserve validated snapshot for retry
+        if: always() && steps.extract.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toronto-v2-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.extract.outputs.workspace_archive }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Publish and verify V2 GitHub Release asset
+        working-directory: extraction
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          toronto-publish-snapshot \
+            --archive "${{ steps.extract.outputs.archive }}" \
+            --repository "$GITHUB_REPOSITORY"

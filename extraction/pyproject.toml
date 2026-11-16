@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=83,<85"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toronto-housing-extraction"
+version = "0.1.0"
+description = "Standalone extraction and validation of Toronto Open Data snapshots."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+
+dependencies = [
+    "ijson>=3.3,<4",
+    "pandas>=2.2,<3",
+    "pyarrow==25.0.1",
+    "PyYAML>=6,<7",
+    "requests>=2.32,<3",
+    "urllib3>=2.5,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+    "ruff==0.16",
+]
+
+[project.scripts]
+toronto-extract = "toronto_housing_extraction.cli:main"
+toronto-publish-snapshot = "toronto_housing_extraction.release:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

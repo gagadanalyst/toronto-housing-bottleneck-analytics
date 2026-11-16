@@ -1,0 +1,47 @@
+ckan:
+  base_url: "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action"
+  timeout_seconds: 120
+  retries: 4
+  page_size: 10000
+
+sources:
+  active_permits:
+    title: "Building Permits - Active Permits"
+    dataset_slug: "building-permits-active-permits"
+    portal_url: "https://open.toronto.ca/dataset/building-permits-active-permits/"
+    expected_cadence: daily
+    pagination_sort: "_id asc"
+    required_columns:
+      - PERMIT_NUM
+      - REVISION_NUM
+      - PERMIT_TYPE
+      - APPLICATION_DATE
+      - ISSUED_DATE
+      - STATUS
+      - GEO_ID
+    business_key:
+      - PERMIT_NUM
+      - REVISION_NUM
+      - PERMIT_TYPE
+    min_row_count: 1000
+    max_row_change_percent: 50
+
+  cleared_permits:
+    title: "Building Permits - Cleared Permits"
+    dataset_slug: "building-permits-cleared-permits"
+    portal_url: "https://open.toronto.ca/dataset/building-permits-cleared-permits/"
+    expected_cadence: daily
+    pagination_sort: "_id asc"
+    required_columns:
+      - PERMIT_NUM
+      - REVISION_NUM
+      - PERMIT_TYPE
+      - APPLICATION_DATE
+      - ISSUED_DATE
+      - COMPLETED_DATE
+    business_key:
+      - PERMIT_NUM
+      - REVISION_NUM
+      - PERMIT_TYPE
+    min_row_count: 1000
+    max_row_change_percent: 50
