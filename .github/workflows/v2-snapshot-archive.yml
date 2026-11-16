@@ -1,7 +1,7 @@
 name: V2 Snapshot Archive
 
 on:
-  # One-time bootstrap trigger for the extraction feature branch.
+  # Bootstrap integration run for the extraction feature branch.
   # It only runs when this workflow file is first added or changed.
   push:
     branches:
