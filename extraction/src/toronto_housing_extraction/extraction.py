@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from . import utils
-from .ckan_client import DatastoreUnavailableError, TorontoCKANClient
+from .ckan_client import (
+    DatastoreUnavailableError,
+    TorontoCKANClient,
+    is_reliable_datastore_fingerprint,
+)
 from .config import CKANConfig, ExtractionConfig, SourceConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +35,7 @@ class SourceExtraction:
     quality_warnings: tuple[str, ...]
     columns: tuple[str, ...]
     parquet_path: Path
+    fingerprint_reliable: bool = False
 
 
 def _check_required_columns(
@@ -126,6 +131,7 @@ def extract_source(
 
     is_datastore = resource.get("datastore_active") is True
     probe: dict[str, Any] | None = None
+    resource_details_loaded = False
 
     if is_datastore:
         try:
@@ -135,6 +141,20 @@ def extract_source(
                 source.required_columns,
                 source.name,
             )
+            try:
+                resource_details = client.action("resource_show", id=resource["id"])
+            except Exception as metadata_exc:
+                utils.log_event(
+                    logging.WARNING,
+                    "resource_metadata_probe_failed",
+                    source_name=source.name,
+                    resource_id=resource.get("id"),
+                    error=str(metadata_exc),
+                )
+            else:
+                if isinstance(resource_details, dict):
+                    resource = {**resource, **resource_details}
+                    resource_details_loaded = True
         except DatastoreUnavailableError as exc:
             utils.log_event(
                 logging.WARNING,
@@ -149,12 +169,16 @@ def extract_source(
     checkpoint_dir = run_dir / "staging" / source.name
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    fingerprint_reliable = False
 
     if is_datastore:
         fingerprint = client.source_fingerprint(
             resource,
             probe,
             package.get("metadata_modified"),
+        )
+        fingerprint_reliable = resource_details_loaded and (
+            is_reliable_datastore_fingerprint(fingerprint)
         )
 
         try:
@@ -168,6 +192,20 @@ def extract_source(
                 pagination_sort=source.pagination_sort,
                 required_columns=source.required_columns,
             )
+            if fingerprint_reliable:
+                resource_after = client.action("resource_show", id=resource["id"])
+                cache_marker_changed = resource_after.get(
+                    "datastore_cache_last_update"
+                ) != fingerprint.get("datastore_cache_last_update")
+                modified_marker_changed = resource_after.get(
+                    "last_modified"
+                ) != fingerprint.get("resource_last_modified")
+                if cache_marker_changed or modified_marker_changed:
+                    output_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"{source.name}: source changed during extraction; "
+                        "discarding the snapshot."
+                    )
             fingerprint["datastore_total"] = row_count
             extraction_method = "datastore"
 
@@ -190,6 +228,7 @@ def extract_source(
                 output_path,
                 expected_rows=probe["declared_total"],
             )
+            fingerprint_reliable = False
             extraction_method = "file_fallback"
 
     else:
@@ -201,6 +240,7 @@ def extract_source(
             output_path,
             first_resource=first_fallback,
         )
+        fingerprint_reliable = False
         extraction_method = "file_fallback"
 
     columns = utils.actual_columns(output_path)
@@ -234,6 +274,7 @@ def extract_source(
         columns=tuple(columns),
         parquet_path=output_path,
         quality_warnings=quality_warnings,
+        fingerprint_reliable=fingerprint_reliable,
     )
 
 
