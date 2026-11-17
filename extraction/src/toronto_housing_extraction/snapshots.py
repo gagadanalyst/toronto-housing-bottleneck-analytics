@@ -302,6 +302,7 @@ def build_source_manifest(
         "resource_name": extraction.resource_name,
         "extraction_method": extraction.extraction_method,
         "source_fingerprint": extraction.fingerprint,
+        "fingerprint_reliable": extraction.fingerprint_reliable,
         "extraction_started_at_utc": extracted_at.isoformat(),
         "row_count": row_count,
         "columns": columns,

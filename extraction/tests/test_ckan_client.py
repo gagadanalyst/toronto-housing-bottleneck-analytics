@@ -164,3 +164,25 @@ def test_json_fallback_preserves_identifiers(tmp_path, monkeypatch):
     assert count == 1
     assert table.column("PERMIT_NUM").to_pylist() == ["00123"]
     assert table.column("REVISION_NUM").to_pylist() == ["00"]
+
+
+def test_datastore_fingerprint_includes_cache_marker_and_total_estimation():
+    with TorontoCKANClient("https://example.com") as client:
+        fingerprint = client.source_fingerprint(
+            {
+                "id": "resource-1",
+                "datastore_cache_last_update": "2026-11-16T10:23:21.445419",
+                "last_modified": None,
+            },
+            {
+                "declared_total": 123,
+                "total_was_estimated": False,
+                "schema_sha256": "a" * 64,
+            },
+            "package-metadata-timestamp",
+        )
+
+    assert fingerprint["fingerprint_version"] == 1
+    assert fingerprint["datastore_cache_last_update"] == ("2026-11-16T10:23:21.445419")
+    assert fingerprint["datastore_total"] == 123
+    assert fingerprint["total_was_estimated"] is False

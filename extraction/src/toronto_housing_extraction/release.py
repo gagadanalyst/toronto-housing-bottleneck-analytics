@@ -24,6 +24,7 @@ SNAPSHOT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 V2_RELEASE_PREFIX = "toronto-raw-snapshot-v2-archive-"
 V2_ASSET_PREFIX = "toronto-raw-snapshot-v2-bundle-"
+FINGERPRINT_ASSET_PREFIX = "toronto-raw-snapshot-v2-fingerprint-"
 MAX_RELEASE_ASSETS = 1000
 MAX_ASSET_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -396,6 +397,144 @@ def _ensure_release(snapshot: SnapshotArchive, gh: str) -> dict[str, Any]:
     return release
 
 
+def _fingerprint_index(archive_path: Path, snapshot: SnapshotArchive) -> dict[str, Any]:
+    """Build the sidecar index from the already-validated V2 archive."""
+    with ZipFile(archive_path) as archive:
+        bundle = _read_json(archive, "bundle.json")
+        sources: dict[str, Any] = {}
+        for source_name in SOURCE_NAMES:
+            manifest = _read_json(archive, f"{source_name}/manifest.json")
+            sources[source_name] = {
+                "resource_id": manifest.get("resource_id"),
+                "extraction_method": manifest.get("extraction_method"),
+                "source_fingerprint": manifest.get("source_fingerprint"),
+                # Older bundles lack this field and are intentionally unreliable.
+                "fingerprint_reliable": manifest.get("fingerprint_reliable") is True,
+            }
+
+    return {
+        "index_version": 1,
+        "snapshot_id": snapshot.snapshot_id,
+        "release_tag": snapshot.release_tag,
+        "archive_asset_name": snapshot.asset_name,
+        "archive_sha256": snapshot.sha256,
+        "archive_size_bytes": snapshot.size_bytes,
+        "extraction_completed_at_utc": bundle.get("extraction_completed_at_utc"),
+        "sources": sources,
+    }
+
+
+def _verify_exact_asset(
+    asset: dict[str, Any],
+    *,
+    repository: str,
+    tag: str,
+    name: str,
+    sha256_digest: str,
+    size_bytes: int,
+    gh: str,
+) -> None:
+    """Verify a Release asset by metadata and a fresh download."""
+    if asset.get("state") not in (None, "uploaded") or asset.get("size") != size_bytes:
+        raise RuntimeError(
+            f"Existing Release asset {name!r} has different metadata; "
+            "refusing overwrite."
+        )
+    if _download_hash(repository, tag, name, gh) != sha256_digest:
+        raise RuntimeError(
+            f"Existing Release asset {name!r} has different bytes; refusing overwrite."
+        )
+
+
+def _ensure_fingerprint_asset(
+    snapshot: SnapshotArchive,
+    archive_path: Path,
+    release: dict[str, Any],
+    release_id: int,
+    gh: str,
+) -> None:
+    """Append and verify the fingerprint sidecar after the ZIP is verified."""
+    index = _fingerprint_index(archive_path, snapshot)
+    asset_name = f"{FINGERPRINT_ASSET_PREFIX}{snapshot.snapshot_id}.json"
+    content = (json.dumps(index, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    size_bytes = len(content)
+
+    if size_bytes >= MAX_ASSET_BYTES:
+        raise ValueError("Fingerprint sidecar exceeds GitHub's 2 GiB asset limit.")
+
+    assets = _assets(snapshot.repository, release_id, gh)
+    existing = _find_asset(assets, asset_name)
+    if existing:
+        _verify_exact_asset(
+            existing,
+            repository=snapshot.repository,
+            tag=snapshot.release_tag,
+            name=asset_name,
+            sha256_digest=digest,
+            size_bytes=size_bytes,
+            gh=gh,
+        )
+        return
+
+    if release.get("immutable") is True:
+        raise RuntimeError(
+            "Monthly Release is platform-immutable and cannot accept a "
+            "missing fingerprint sidecar."
+        )
+    if len(assets) >= MAX_RELEASE_ASSETS:
+        raise RuntimeError(
+            "Release reached GitHub's 1,000-asset limit; no assets were removed."
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="toronto-v2-index-") as directory:
+            index_path = Path(directory) / asset_name
+            index_path.write_bytes(content)
+            _run_gh(
+                [
+                    "release",
+                    "upload",
+                    snapshot.release_tag,
+                    str(index_path),
+                    "--repo",
+                    snapshot.repository,
+                ],
+                gh,
+            )
+    except GitHubCLIError:
+        # The upload may have succeeded even if the client lost the response.
+        assets = _assets(snapshot.repository, release_id, gh)
+        uploaded = _find_asset(assets, asset_name)
+        if uploaded is None:
+            raise
+        _verify_exact_asset(
+            uploaded,
+            repository=snapshot.repository,
+            tag=snapshot.release_tag,
+            name=asset_name,
+            sha256_digest=digest,
+            size_bytes=size_bytes,
+            gh=gh,
+        )
+    else:
+        assets = _assets(snapshot.repository, release_id, gh)
+        uploaded = _find_asset(assets, asset_name)
+        if uploaded is None:
+            raise RuntimeError(
+                "Fingerprint sidecar upload completed but the asset is not listed."
+            )
+        _verify_exact_asset(
+            uploaded,
+            repository=snapshot.repository,
+            tag=snapshot.release_tag,
+            name=asset_name,
+            sha256_digest=digest,
+            size_bytes=size_bytes,
+            gh=gh,
+        )
+
+
 def publish_snapshot_archive(
     archive_path: Path,
     *,
@@ -459,6 +598,15 @@ def publish_snapshot_archive(
                 )
             _verify_asset(uploaded, snapshot, gh_executable)
             already_present = False
+
+    # Publish the small index only after the large archive has been verified.
+    _ensure_fingerprint_asset(
+        snapshot,
+        archive_path,
+        release,
+        release_id,
+        gh_executable,
+    )
 
     return PublicationResult(
         release_tag=snapshot.release_tag,

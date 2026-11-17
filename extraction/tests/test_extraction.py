@@ -57,10 +57,24 @@ def test_extracts_source_using_datastore(tmp_path, monkeypatch):
             },
         )
 
+        marker = "2026-11-15T10:00:00.000000"
+        monkeypatch.setattr(
+            client,
+            "action",
+            lambda action_name, **params: {
+                "datastore_cache_last_update": marker,
+                "last_modified": None,
+            },
+        )
         monkeypatch.setattr(
             client,
             "source_fingerprint",
-            lambda *args: {"resource_id": "store-1"},
+            lambda *args: {
+                "fingerprint_version": 1,
+                "resource_id": "store-1",
+                "datastore_cache_last_update": marker,
+                "resource_last_modified": None,
+            },
         )
 
         def fake_fetch(**kwargs):
@@ -77,6 +91,7 @@ def test_extracts_source_using_datastore(tmp_path, monkeypatch):
         )
 
     assert result.extraction_method == "datastore"
+    assert result.fingerprint_reliable is True
     assert result.row_count == 1
     assert result.parquet_path.is_file()
     assert result.quality_warnings == ("below_minimum_row_count",)
@@ -201,3 +216,59 @@ def test_pair_fails_when_one_source_extraction_fails(tmp_path, monkeypatch):
         )
 
     assert attempted == ["active_permits", "cleared_permits"]
+
+
+def test_discards_datastore_snapshot_if_source_marker_changes_during_extract(
+    tmp_path, monkeypatch
+):
+    config = load_config(Path("config/sources.yml"))
+    source = config.sources["active_permits"]
+    package = {
+        "metadata_modified": "2026-11-15T10:00:00",
+        "resources": [{"id": "store-1", "name": "Active", "datastore_active": True}],
+    }
+    markers = iter(["2026-11-15T10:00:00.000000", "2026-11-15T10:05:00.000000"])
+
+    with TorontoCKANClient(config.ckan.base_url) as client:
+        monkeypatch.setattr(client, "package_show", lambda slug: package)
+        monkeypatch.setattr(
+            client,
+            "probe_datastore",
+            lambda resource_id: {
+                "declared_total": 1,
+                "field_names": list(source.required_columns),
+                "total_was_estimated": False,
+            },
+        )
+        monkeypatch.setattr(
+            client,
+            "action",
+            lambda action_name, **params: {
+                "datastore_cache_last_update": next(markers),
+                "last_modified": None,
+            },
+        )
+        monkeypatch.setattr(
+            client,
+            "source_fingerprint",
+            lambda *args: {
+                "fingerprint_version": 1,
+                "resource_id": "store-1",
+                "datastore_cache_last_update": "2026-11-15T10:00:00.000000",
+                "resource_last_modified": None,
+            },
+        )
+
+        def fake_fetch(**kwargs):
+            write_sample_parquet(kwargs["output_path"], source)
+            return 1
+
+        monkeypatch.setattr(client, "fetch_datastore", fake_fetch)
+
+        with pytest.raises(RuntimeError, match="source changed during extraction"):
+            extract_source(
+                client=client,
+                source=source,
+                ckan=config.ckan,
+                run_dir=tmp_path,
+            )

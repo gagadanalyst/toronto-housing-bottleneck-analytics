@@ -1,14 +1,20 @@
 name: V2 Snapshot Archive
 
 on:
-  # Bootstrap integration run for the extraction feature branch.
-  # It only runs when this workflow file is first added or changed.
   push:
     branches:
       - refactor/separate-extraction
     paths:
       - .github/workflows/v2-snapshot-archive.yml
-
+      - extraction/**
+  pull_request:
+    branches:
+      - refactor/separate-extraction
+    paths:
+      - .github/workflows/v2-snapshot-archive.yml
+      - extraction/**
+  schedule:
+    - cron: "17 10 * * *"
   workflow_dispatch:
 
 permissions:
@@ -51,8 +57,19 @@ jobs:
           ruff format --check src tests
           pytest -q
 
+      - name: Check whether source snapshots changed
+        id: change_check
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        working-directory: extraction
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          toronto-check-snapshot --config config/sources.yml --repository "$GITHUB_REPOSITORY"
+
       - name: Extract and validate Active/Cleared snapshot
         id: extract
+        if: github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true'
         working-directory: extraction
         env:
           SNAPSHOT_SOURCE_COMMIT: ${{ github.sha }}
@@ -79,8 +96,12 @@ jobs:
           print(f"workspace_archive=extraction/{archive.as_posix()}")
           PY
 
+      - name: Report unchanged source snapshots
+        if: steps.change_check.outputs.no_change == 'true'
+        run: echo "Active and Cleared are unchanged; extraction and publication skipped."
+
       - name: Preserve validated snapshot for retry
-        if: always() && steps.extract.outcome == 'success'
+        if: always() && github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true' && steps.extract.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -91,6 +112,7 @@ jobs:
           retention-days: 90
 
       - name: Publish and verify V2 GitHub Release asset
+        if: github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true' && steps.extract.outcome == 'success'
         working-directory: extraction
         env:
           GH_TOKEN: ${{ github.token }}

@@ -29,6 +29,16 @@ class DatastoreUnavailableError(RuntimeError):
     """Raised when DataStore extraction fails and fallback should be attempted."""
 
 
+def is_reliable_datastore_fingerprint(fingerprint: dict[str, Any]) -> bool:
+    return any(
+        isinstance(fingerprint.get(field), str) and bool(fingerprint[field].strip())
+        for field in (
+            "datastore_cache_last_update",
+            "resource_last_modified",
+        )
+    )
+
+
 class TorontoCKANClient:
     """Reusable client for Toronto's CKAN Action API.
 
@@ -146,6 +156,11 @@ class TorontoCKANClient:
         ).hexdigest()
         return {
             "declared_total": int(result.get("total", len(records))),
+            "total_was_estimated": (
+                result.get("total_was_estimated")
+                if isinstance(result.get("total_was_estimated"), bool)
+                else None
+            ),
             "field_names": [field.get("id") for field in fields],
             "field_schema": field_schema,
             "schema_sha256": schema_hash,
@@ -160,12 +175,15 @@ class TorontoCKANClient:
     ) -> dict[str, Any]:
         """Build source-change metadata for the full published snapshot."""
         return {
+            "fingerprint_version": 1,
             "resource_id": resource.get("id"),
             "resource_hash": resource.get("hash"),
             "resource_size": resource.get("size"),
+            "datastore_cache_last_update": resource.get("datastore_cache_last_update"),
             "resource_last_modified": resource.get("last_modified"),
             "package_metadata_modified": package_metadata_modified,
             "datastore_total": probe.get("declared_total"),
+            "total_was_estimated": probe.get("total_was_estimated"),
             "schema_sha256": probe.get("schema_sha256"),
         }
 

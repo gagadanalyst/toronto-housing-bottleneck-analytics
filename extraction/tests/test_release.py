@@ -49,7 +49,16 @@ def make_archive(path: Path, *, snapshot_id="snapshot-001", data_suffix=b""):
             "manifest_version": 1,
             "source_name": source_name,
             "resource_id": f"{source_name}-resource",
-            "source_fingerprint": {"resource_id": f"{source_name}-resource"},
+            "source_fingerprint": {
+                "fingerprint_version": 1,
+                "resource_id": f"{source_name}-resource",
+                "datastore_cache_last_update": "2026-11-16T04:59:00.000000",
+                "resource_last_modified": None,
+                "datastore_total": 1,
+                "total_was_estimated": False,
+                "schema_sha256": "b" * 64,
+            },
+            "fingerprint_reliable": True,
             "extraction_method": "datastore",
             "extraction_started_at_utc": "2026-11-16T05:00:00+00:00",
             "extraction_completed_at_utc": "2026-11-16T05:01:00+00:00",
@@ -137,7 +146,13 @@ def fake_github(
             content = path.read_bytes()
             state["asset_bytes"][path.name] = content
             state["assets"].append(
-                {"id": 99, "name": path.name, "size": len(content), "state": "uploaded"}
+                {
+                    "id": 99 + state["upload_count"],
+                    "name": path.name,
+                    "size": len(content),
+                    "state": "uploaded",
+                    "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                }
             )
             if state["upload_error"]:
                 raise release.GitHubCLIError("connection dropped after upload")
@@ -215,9 +230,14 @@ def test_publishes_and_download_verifies_new_asset(tmp_path, monkeypatch):
 
     assert result.already_present is False
     assert result.release_tag == "toronto-raw-snapshot-v2-archive-2026-11"
-    assert state["upload_count"] == 1
+    assert state["upload_count"] == 2
     assert state["assets"][0]["name"] == result.asset_name
     assert state["asset_bytes"][result.asset_name] == archive.read_bytes()
+    index_name = f"{release.FINGERPRINT_ASSET_PREFIX}snapshot-001.json"
+    assert state["assets"][1]["name"] == index_name
+    index = json.loads(state["asset_bytes"][index_name])
+    assert index["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert index["sources"]["active_permits"]["fingerprint_reliable"] is True
 
 
 def test_retry_of_identical_asset_is_idempotent(tmp_path, monkeypatch):
@@ -229,7 +249,7 @@ def test_retry_of_identical_asset_is_idempotent(tmp_path, monkeypatch):
 
     assert first.already_present is False
     assert second.already_present is True
-    assert state["upload_count"] == 1
+    assert state["upload_count"] == 2
 
 
 def test_rejects_different_bytes_for_existing_snapshot_id(tmp_path, monkeypatch):
@@ -244,7 +264,7 @@ def test_rejects_different_bytes_for_existing_snapshot_id(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="different metadata|different bytes"):
         release.publish_snapshot_archive(conflicting, repository=REPOSITORY)
 
-    assert state["upload_count"] == 1
+    assert state["upload_count"] == 2
 
 
 def test_recovers_when_upload_succeeded_but_client_lost_response(tmp_path, monkeypatch):
@@ -254,7 +274,7 @@ def test_recovers_when_upload_succeeded_but_client_lost_response(tmp_path, monke
     result = release.publish_snapshot_archive(archive, repository=REPOSITORY)
 
     assert result.already_present is True
-    assert state["upload_count"] == 1
+    assert state["upload_count"] == 2
 
 
 def test_refuses_platform_immutable_monthly_release(tmp_path, monkeypatch):
@@ -290,4 +310,4 @@ def test_verifies_existing_asset_on_platform_immutable_release(
 
     assert second.already_present is True
     assert second.sha256 == first.sha256
-    assert state["upload_count"] == 1
+    assert state["upload_count"] == 2
