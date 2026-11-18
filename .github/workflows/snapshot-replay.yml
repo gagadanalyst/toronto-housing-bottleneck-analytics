@@ -197,7 +197,7 @@ jobs:
       - name: Discover and load archived snapshots
         id: replay
         run: |
-          command=(python scripts/replay_snapshots.py \
+          command=(python -m scripts.replay_snapshots \
             --mode "$REPLAY_MODE" \
             --backend duckdb \
             --ledger "$REPLAY_LEDGER" \
@@ -579,7 +579,7 @@ jobs:
       - name: Discover and load archived snapshots
         id: replay
         run: |
-          command=(python scripts/replay_snapshots.py \
+          command=(python -m scripts.replay_snapshots \
             --mode "$REPLAY_MODE" \
             --backend snowflake \
             --schema "$REPLAY_SCHEMA" \
