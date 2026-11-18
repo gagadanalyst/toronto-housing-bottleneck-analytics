@@ -27,6 +27,9 @@ concurrency:
 
 jobs:
   archive:
+    if: >-
+      github.event_name != 'schedule' ||
+      vars.TORONTO_EXTRACTION_ENABLED == 'true'
     name: Extract and publish V2 source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
