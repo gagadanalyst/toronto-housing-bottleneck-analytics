@@ -8,11 +8,10 @@ import pytest
 
 from scripts import snapshot_replay_baseline as baseline
 
+
 @pytest.fixture(autouse=True)
 def _enable_snowflake_operations(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "true")
-
-
 
 
 def test_duckdb_baseline_is_sha256_and_detects_file_mutation(tmp_path):
@@ -202,6 +201,7 @@ def test_mode1_workflow_fingerprints_production_before_candidate_copy_and_promot
         "python scripts/loader_promote_snowflake_raw.py", snow_verify
     )
     assert snow_capture < snow_clone < snow_replay < snow_verify < snow_promote
+
 
 def test_snowflake_baseline_capture_rejects_disabled_gate(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "false")

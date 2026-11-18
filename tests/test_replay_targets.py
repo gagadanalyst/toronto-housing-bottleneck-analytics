@@ -9,11 +9,10 @@ import pytest
 from scripts import replay_targets, replay_warehouse_ledger
 from scripts.replay_ledger import ReplayLedger
 
+
 @pytest.fixture(autouse=True)
 def _enable_snowflake_operations(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "true")
-
-
 
 
 def _install_fake_scd2_analysis(monkeypatch, module, *, analysis=None):
@@ -937,6 +936,7 @@ def test_snowflake_replay_schema_must_be_owned_by_ingest_role():
             "TORONTO_SNAPSHOT_REPLAY_123456", None
         )
 
+
 def test_snowflake_replay_target_rejects_disabled_gate(monkeypatch):
     for value in (None, "false", "TRUE"):
         if value is None:
@@ -949,6 +949,7 @@ def test_snowflake_replay_target_rejects_disabled_gate(monkeypatch):
                 "unused",
                 "TORONTO_SNAPSHOT_REPLAY_123",
             )
+
 
 def test_snapshot_loader_duckdb_path_is_independent_of_snowflake_gate():
     workflow = (

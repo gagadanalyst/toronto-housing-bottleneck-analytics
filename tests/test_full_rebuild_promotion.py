@@ -7,11 +7,10 @@ import pytest
 from scripts import promote_snowflake_snapshot_rebuild as snow_promote
 from scripts import validate_full_rebuild_promotion as promotion
 
+
 @pytest.fixture(autouse=True)
 def _enable_snowflake_operations(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "true")
-
-
 
 
 def _report(backend: str):
@@ -36,8 +35,6 @@ def _report(backend: str):
         ],
         "history_validation": {"status": "passed"},
     }
-
-
 
 
 def _complete_duckdb_report():
@@ -92,10 +89,7 @@ def _complete_duckdb_report():
         },
         "history_validation": {
             "status": "passed",
-            "sources": {
-                source: dict(metrics)
-                for source in sources
-            },
+            "sources": {source: dict(metrics) for source in sources},
         },
         "ledger_entries": [
             {
@@ -238,6 +232,7 @@ def test_snowflake_promotion_job_can_dispatch_the_serving_workflow():
     assert "actions: write" in snowflake_job.split("    env:", 1)[0]
     assert "gh workflow run snowflake-serving-schema.yml" in snowflake_job
 
+
 def test_duckdb_only_full_rebuild_validates_both_source_ledgers():
     report = _complete_duckdb_report()
 
@@ -294,6 +289,7 @@ def test_snowflake_snapshot_promotion_requires_enabled_gate(monkeypatch):
             summary_path=None,
         )
 
+
 def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
     workflow = (
         Path(__file__).resolve().parents[1]
@@ -303,10 +299,14 @@ def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
     ).read_text(encoding="utf-8")
 
     verify_job = workflow.split("  verify:", 1)[1].split("  promote-duckdb:", 1)[0]
-    duckdb_job = workflow.split("  promote-duckdb:", 1)[1].split("  promote-snowflake:", 1)[0]
-    snowflake_job = workflow.split("  promote-snowflake:", 1)[1].split("  deploy-dbt-docs:", 1)[0]
+    duckdb_job = workflow.split("  promote-duckdb:", 1)[1].split(
+        "  promote-snowflake:", 1
+    )[0]
+    snowflake_job = workflow.split("  promote-snowflake:", 1)[1].split(
+        "  deploy-dbt-docs:", 1
+    )[0]
 
-    assert 'backend_policy: ${{ steps.policy.outputs.backend_policy }}' in workflow
+    assert "backend_policy: ${{ steps.policy.outputs.backend_policy }}" in workflow
     assert 'echo "backend_policy=duckdb-only"' in verify_job
     assert 'echo "backend_policy=both"' in verify_job
     assert "validate_full_rebuild_promotion.py" in verify_job

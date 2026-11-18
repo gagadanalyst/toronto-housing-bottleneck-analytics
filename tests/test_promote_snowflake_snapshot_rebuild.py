@@ -7,11 +7,10 @@ import pytest
 
 from scripts import promote_snowflake_snapshot_rebuild as promote
 
+
 @pytest.fixture(autouse=True)
 def _enable_snowflake_operations(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "true")
-
-
 
 
 def _summary(tmp_path):
@@ -139,6 +138,7 @@ def test_snowflake_promoter_requires_run_scoped_candidate_and_confirmation(monke
             confirmed=False,
             summary_path=None,
         )
+
 
 def test_snowflake_snapshot_promoter_rejects_disabled_gate(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_OPERATIONS_ENABLED", "false")
