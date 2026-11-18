@@ -143,7 +143,7 @@ jobs:
           fi
           # Capture before candidate copy. If production changes between these
           # operations, the pre-promotion comparison rejects the candidate.
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --output data/staging/duckdb/production-baseline.json
@@ -186,7 +186,7 @@ jobs:
               gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
                 --pattern toronto.duckdb --dir data/warehouse
             fi
-            python scripts/snapshot_replay_baseline.py \
+            python -m scripts.snapshot_replay_baseline \
               --backend duckdb \
               --database data/warehouse/toronto.duckdb \
               --output "$baseline"
@@ -348,7 +348,7 @@ jobs:
       - name: Verify the production baseline has not changed
         if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         run: |
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --expected data/staging/duckdb/production-baseline.json
@@ -545,7 +545,7 @@ jobs:
         run: |
           # Capture the canonical baseline before CLONE. A concurrent external
           # mutation between capture and clone will be caught before promotion.
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --output data/staging/snowflake/production-baseline.json
           python scripts/loader_prepare_snowflake_raw.py --github-env "$GITHUB_ENV"
@@ -569,7 +569,7 @@ jobs:
           mkdir -p data/recovery/snapshot-replay
           baseline=data/recovery/snapshot-replay/snowflake-production-baseline.json
           if [ ! -s "$baseline" ]; then
-            python scripts/snapshot_replay_baseline.py \
+            python -m scripts.snapshot_replay_baseline \
               --backend snowflake \
               --output "$baseline"
           else
@@ -600,7 +600,7 @@ jobs:
       - name: Verify the canonical Snowflake RAW baseline has not changed
         if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         run: |
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --expected data/staging/snowflake/production-baseline.json
 
