@@ -51,8 +51,7 @@ def _require_full_report(report: dict[str, Any], backend: str) -> None:
 
     selection = report.get("selection")
     if not isinstance(selection, dict) or any(
-        selection.get(field) is not None
-        for field in ("from_date", "to_date", "limit")
+        selection.get(field) is not None for field in ("from_date", "to_date", "limit")
     ):
         raise ValueError(
             f"{backend} full rebuild report contains an explicit partial selection."
@@ -126,14 +125,11 @@ def validate_full_rebuild(
             "Saved joint backend evidence differs from backend replay reports."
         )
 
-    expected_snapshots = [
-        _snapshot_identity(item) for item in recomputed["snapshots"]
-    ]
+    expected_snapshots = [_snapshot_identity(item) for item in recomputed["snapshots"]]
     saved_snapshots = saved_joint.get("snapshots")
     if (
         not isinstance(saved_snapshots, list)
-        or [_snapshot_identity(item) for item in saved_snapshots]
-        != expected_snapshots
+        or [_snapshot_identity(item) for item in saved_snapshots] != expected_snapshots
     ):
         raise ValueError(
             "Saved joint archive provenance differs from backend replay reports."
@@ -272,9 +268,7 @@ def verify_current_archives(
     with tempfile.TemporaryDirectory(prefix="toronto-rebuild-archive-check-") as temp:
         found = discover_archives(repository, Path(temp), exclude_snapshot_ids=set())
 
-    expected_ids = {
-        _snapshot_identity(item) for item in expected.get("snapshots", [])
-    }
+    expected_ids = {_snapshot_identity(item) for item in expected.get("snapshots", [])}
     current_ids = {
         (item.snapshot_id, item.archive_sha256, item.release_tag, item.asset_name)
         for item in found
@@ -319,8 +313,7 @@ def main() -> int:
         if args.policy == "both":
             if args.snowflake_summary is None or args.joint_validation is None:
                 raise ValueError(
-                    "Policy 'both' requires --snowflake-summary and "
-                    "--joint-validation."
+                    "Policy 'both' requires --snowflake-summary and --joint-validation."
                 )
             snow = _read(args.snowflake_summary, "Snowflake summary")
             joint = _read(args.joint_validation, "joint validation")

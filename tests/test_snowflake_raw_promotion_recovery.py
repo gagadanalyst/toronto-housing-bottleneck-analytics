@@ -42,7 +42,6 @@ finally:
         sys.modules["snowflake_candidate_utils"] = _existing_helpers
 
 
-
 class _FakeCursor:
     def __init__(self) -> None:
         self.executed: list[str] = []

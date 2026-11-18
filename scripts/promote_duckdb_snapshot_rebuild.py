@@ -146,7 +146,7 @@ def _json_value(value: Any) -> Any:
     if hasattr(value, "isoformat"):
         try:
             return value.isoformat()
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             pass
     return value
 
