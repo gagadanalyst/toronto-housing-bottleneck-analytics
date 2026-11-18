@@ -13,6 +13,16 @@ on:
         required: false
         default: ""
         type: string
+      snapshot_loader_run_id:
+        description: "Successful Mode 1 Snapshot Loader run ID that promoted canonical RAW"
+        required: false
+        default: ""
+        type: string
+      snapshot_rebuild_promotion_run_id:
+        description: "Successful explicitly approved full-history rebuild promotion run ID"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   actions: read
@@ -20,7 +30,7 @@ permissions:
 
 # Queue up to 100 pending serving builds instead of replacing the prior pending run.
 concurrency:
-  group: toronto-snowflake-production-promotion
+  group: toronto-housing-data-publication
   cancel-in-progress: false
   queue: max
 
@@ -105,6 +115,85 @@ jobs:
               )
 
           print(f"Verified successful canonical RAW refresh run {run_id}.")
+          PY
+
+      - name: Ensure only one upstream production promotion is supplied
+        env:
+          RAW_REFRESH_RUN_ID: ${{ inputs.raw_refresh_run_id }}
+          SNAPSHOT_LOADER_RUN_ID: ${{ inputs.snapshot_loader_run_id }}
+          SNAPSHOT_REBUILD_PROMOTION_RUN_ID: ${{ inputs.snapshot_rebuild_promotion_run_id }}
+        run: |
+          python - <<'PY'
+          import os
+          values = [os.environ.get(name, "") for name in (
+              "RAW_REFRESH_RUN_ID", "SNAPSHOT_LOADER_RUN_ID", "SNAPSHOT_REBUILD_PROMOTION_RUN_ID"
+          )]
+          if sum(bool(value) for value in values) > 1:
+              raise SystemExit("Supply at most one upstream RAW promotion run ID.")
+          PY
+
+      - name: Verify successful staged Snapshot Loader Mode 1 promotion
+        if: inputs.snapshot_loader_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.snapshot_loader_run_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          run_id = os.environ["SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Snapshot Loader run ID must contain digits only.")
+          result = subprocess.run(
+              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
+               "--json", "name,status,conclusion,headBranch,jobs"],
+              check=True, capture_output=True, text=True,
+          )
+          run = json.loads(result.stdout)
+          if (run.get("name") != "Snapshot Loader (Incremental and Rebuild)"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("headBranch") != "main"):
+              raise ValueError("Snapshot Loader run was not a successful main-branch run.")
+          job = next((item for item in run.get("jobs", [])
+                      if item.get("name") == "Load Snowflake (incremental)"), None)
+          if not job or job.get("conclusion") != "success":
+              raise ValueError("Staged Snowflake Mode 1 RAW promotion did not succeed.")
+          print(f"Verified successful staged Snapshot Loader run {run_id}.")
+          PY
+
+      - name: Verify successful full-history Snapshot Loader rebuild promotion
+        if: inputs.snapshot_rebuild_promotion_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.snapshot_rebuild_promotion_run_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          run_id = os.environ["SOURCE_RUN_ID"]
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise ValueError("Rebuild promotion run ID must contain digits only.")
+          result = subprocess.run(
+              ["gh", "run", "view", run_id, "--repo", os.environ["GITHUB_REPOSITORY"],
+               "--json", "name,status,conclusion,headBranch,jobs"],
+              check=True, capture_output=True, text=True,
+          )
+          run = json.loads(result.stdout)
+          if (run.get("name") != "Promote validated full-history SCD2 rebuild"
+              or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
+              or run.get("headBranch") != "main"):
+              raise ValueError("Full-history promotion workflow was not successful on main.")
+          job = next((item for item in run.get("jobs", [])
+                      if item.get("name") == "Promote Snowflake full-history candidate"), None)
+          if not job or job.get("conclusion") != "success":
+              raise ValueError("Full-history Snowflake RAW promotion did not succeed.")
+          print(f"Verified successful full-history promotion run {run_id}.")
           PY
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

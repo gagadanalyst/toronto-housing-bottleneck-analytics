@@ -9,6 +9,23 @@ import pytest
 
 # The promotion module imports its DLT state helpers at module import time. Keep
 # this unit test independent of the DLT runtime; the helpers are patched below.
+# Keep these recovery tests independent of the optional Snowflake connector.
+if "snowflake.connector" not in sys.modules:
+    try:
+        import snowflake.connector  # noqa: F401
+    except ModuleNotFoundError:
+        snowflake_package = ModuleType("snowflake")
+        snowflake_package.__path__ = []
+        connector_module = ModuleType("snowflake.connector")
+
+        def _no_live_connection(**kwargs):
+            raise AssertionError("Offline tests must not open Snowflake connections")
+
+        connector_module.connect = _no_live_connection
+        snowflake_package.connector = connector_module
+        sys.modules["snowflake"] = snowflake_package
+        sys.modules["snowflake.connector"] = connector_module
+
 _state_helpers = ModuleType("snowflake_candidate_utils")
 _state_helpers.decode_state = lambda value, pipeline: {  # type: ignore[attr-defined]
     "dataset_name": "RAW_STAGE_123_2"
@@ -23,6 +40,7 @@ finally:
         sys.modules.pop("snowflake_candidate_utils", None)
     else:
         sys.modules["snowflake_candidate_utils"] = _existing_helpers
+
 
 
 class _FakeCursor:
