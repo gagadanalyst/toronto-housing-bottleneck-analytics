@@ -1,0 +1,52 @@
+name: Snapshot Loader (Incremental and Rebuild)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Incremental production update or isolated historical rebuild
+        required: true
+        type: choice
+        options: [rebuild, incremental]
+        default: rebuild
+      backends:
+        description: Backends to run
+        required: true
+        type: choice
+        options: [both, duckdb, snowflake]
+        default: both
+      confirm_production:
+        description: Explicitly authorize a staged incremental production promotion
+        required: false
+        type: boolean
+        default: false
+      from_date:
+        description: Rebuild lower UTC date boundary
+        required: false
+        type: string
+        default: ""
+      to_date:
+        description: Rebuild upper UTC date boundary
+        required: false
+        type: string
+        default: ""
+      limit:
+        description: Optional maximum number of archives
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  registration:
+    name: Inert default-branch registration
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm this is only a registration stub
+        run: |
+          echo "Inert Snapshot Loader registration stub."
+          echo "Dispatch the actual workflow using refactor/separate-extraction."
