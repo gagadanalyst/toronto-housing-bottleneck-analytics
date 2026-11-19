@@ -717,6 +717,52 @@
       "sequence": 51,
       "snapshot_id": "47427ccbe477406397b173bb3ccea5c9",
       "source_commit": "2060c7e91da91cf92acc97d8159e4739a60e267b"
+    },
+    {
+      "archive_sha256": "49c2200328dfbc34dbd8a64d1c6c74b28c4c085ef5181b7be196dd629d0922ee",
+      "archive_size_bytes": 63561703,
+      "asset_name": "toronto-raw-snapshot-bundle-44524052662-1.zip",
+      "extracted_at_utc": "2026-11-19T12:28:12.254342Z",
+      "format_version": 1,
+      "release_tag": "toronto-raw-snapshot-archive-2026-11",
+      "replay_contract": null,
+      "run_attempt": 1,
+      "run_id": "44524052662",
+      "sequence": 52,
+      "snapshot_id": "44524052662:1",
+      "source_commit": "7b290d3041ddce60877926e686bebdff346aa5dd"
+    },
+    {
+      "archive_sha256": "67797eec48d76bddaf170d8ebca933bd3a640af65c2e9559b705dadb116b2bd5",
+      "archive_size_bytes": 63561700,
+      "asset_name": "toronto-raw-snapshot-bundle-44526202453-1.zip",
+      "extracted_at_utc": "2026-11-19T12:41:52.262524Z",
+      "format_version": 1,
+      "release_tag": "toronto-raw-snapshot-archive-2026-11",
+      "replay_contract": null,
+      "run_attempt": 1,
+      "run_id": "44526202453",
+      "sequence": 53,
+      "snapshot_id": "44526202453:1",
+      "source_commit": "83705b6e4204023b6f5cf6aba16e74bdc9d18153"
+    },
+    {
+      "archive_sha256": "dd6e6b21c488664807c9da5da520899119adcf851075fe4092674bbbb3f60d4b",
+      "archive_size_bytes": 63567229,
+      "asset_name": "toronto-raw-snapshot-v2-bundle-759c44d8401f49b590fb1c7394fe5f97.zip",
+      "extracted_at_utc": "2026-11-19T15:43:30.994752Z",
+      "format_version": 2,
+      "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+      "replay_contract": {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "sha256": "86b234f0c22bbb157e0a3c5d6c1bbf3fa21900342838d745504be8a7db39cc26"
+      },
+      "run_attempt": 1,
+      "run_id": "44557927794",
+      "sequence": 54,
+      "snapshot_id": "759c44d8401f49b590fb1c7394fe5f97",
+      "source_commit": "85ca94168166baae74bd8bd5c0b359d934e03e1b"
     }
   ],
   "inventory_version": 1,
