@@ -48,6 +48,8 @@ jobs:
   duckdb:
     if: >-
       vars.TORONTO_MODE1_ENABLED == 'true' &&
+      (github.event_name != 'schedule' ||
+       vars.TORONTO_MODE1_SCHEDULE_ENABLED == 'true') &&
       (github.event_name != 'workflow_dispatch' ||
        github.ref == 'refs/heads/refactor/separate-extraction') &&
       (github.event_name == 'schedule' ||
@@ -143,6 +145,8 @@ jobs:
   snowflake:
     if: >-
       vars.TORONTO_MODE1_ENABLED == 'true' &&
+      (github.event_name != 'schedule' ||
+       vars.TORONTO_MODE1_SCHEDULE_ENABLED == 'true') &&
       (github.event_name != 'workflow_dispatch' ||
        github.ref == 'refs/heads/refactor/separate-extraction') &&
       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&

@@ -43,6 +43,16 @@ on:
         required: false
         type: string
         default: ""
+      compare_run_id:
+        description: Revalidate a completed Mode 2 run from its saved artifacts without replaying archives
+        required: false
+        type: string
+        default: ""
+      compare_run_attempt:
+        description: Attempt number for the saved Mode 2 run
+        required: false
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -64,6 +74,7 @@ jobs:
     if: >-
       (github.event_name == 'schedule' && vars.TORONTO_SNAPSHOT_LOADER_ENABLED == 'true') ||
       (github.event_name == 'workflow_dispatch' &&
+       inputs.compare_run_id == '' &&
        (inputs.backends == 'both' || inputs.backends == 'duckdb'))
     name: Load DuckDB (${{ github.event_name == 'schedule' && 'incremental' || inputs.mode }})
     runs-on: ubuntu-latest
@@ -501,6 +512,7 @@ jobs:
        vars.TORONTO_SNAPSHOT_LOADER_ENABLED == 'true' &&
        vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true') ||
       (github.event_name == 'workflow_dispatch' &&
+       inputs.compare_run_id == '' &&
        vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
        (inputs.backends == 'both' || inputs.backends == 'snowflake'))
     name: Load Snowflake (${{ github.event_name == 'schedule' && 'incremental' || inputs.mode }})
@@ -731,7 +743,8 @@ jobs:
       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'rebuild' &&
-      inputs.backends == 'both'
+      inputs.backends == 'both' &&
+      inputs.compare_run_id == ''
     name: Validate and compare rebuilt SCD2 histories
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -759,12 +772,13 @@ jobs:
               echo "Could not download ${backend} candidate evidence." >&2
               exit 1
             fi
-            if ! test -s "$temp/state.tar.gz"; then
-              echo "${backend} candidate evidence is missing state.tar.gz." >&2
+            mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
+            if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+              echo "${backend} candidate evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
               exit 1
             fi
             mkdir -p data/recovery/snapshot-replay
-            tar -xzf "$temp/state.tar.gz" -C data/recovery/snapshot-replay
+            tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
             rm -rf "$temp"
           done
 
@@ -791,6 +805,117 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+
+  compare-existing:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.compare_run_id != ''
+    name: Revalidate saved Mode 2 evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.compare_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.compare_run_attempt }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install comparison dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Verify source run and successful backend jobs
+        run: |
+          case "$SOURCE_RUN_ID" in
+            ''|*[!0-9]*|0) echo "compare_run_id must be a positive numeric workflow run ID." >&2; exit 1 ;;
+          esac
+          case "$SOURCE_RUN_ATTEMPT" in
+            ''|*[!0-9]*|0) echo "compare_run_attempt must be a positive integer." >&2; exit 1 ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            > "$RUNNER_TEMP/source-run.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs?per_page=100" \
+            > "$RUNNER_TEMP/source-jobs.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          run = json.loads(Path(os.environ["RUNNER_TEMP"], "source-run.json").read_text())
+          jobs = json.loads(Path(os.environ["RUNNER_TEMP"], "source-jobs.json").read_text())
+          if run.get("path") != ".github/workflows/snapshot-replay.yml":
+              raise SystemExit("The selected run is not from snapshot-replay.yml.")
+          if run.get("event") != "workflow_dispatch" or run.get("status") != "completed":
+              raise SystemExit("The selected source run must be a completed manual dispatch.")
+          required = {"Load DuckDB (rebuild)", "Load Snowflake (rebuild)"}
+          observed = {
+              job.get("name"): job.get("conclusion")
+              for job in jobs.get("jobs", [])
+          }
+          failures = {name: observed.get(name) for name in required if observed.get(name) != "success"}
+          if failures:
+              raise SystemExit(f"Source run backend jobs did not both succeed: {failures}")
+          print("Source Mode 2 run and both successful backend jobs verified.")
+          PY
+
+      - name: Restore saved DuckDB and Snowflake candidates
+        run: |
+          mkdir -p data/recovery/snapshot-replay
+          for backend in duckdb snowflake; do
+            temp="$(mktemp -d)"
+            gh run download "$SOURCE_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "snapshot-loader-${backend}-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
+              --dir "$temp"
+            mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
+            if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+              echo "${backend} evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+              exit 1
+            fi
+            tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
+            rm -rf "$temp"
+          done
+          test -s data/recovery/snapshot-replay/duckdb-summary.json
+          test -s data/recovery/snapshot-replay/snowflake-summary.json
+          test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
+          test -s data/recovery/snapshot-replay/snowflake/exports/raw_active_permits_history.csv.gz
+          test -s data/recovery/snapshot-replay/snowflake/exports/raw_cleared_permits_history.csv.gz
+
+      - name: Validate archive provenance, ledger completeness and SCD2 integrity
+        run: |
+          python scripts/validate_snapshot_replay.py \
+            --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
+            --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
+            --output data/recovery/snapshot-replay/joint-validation.json
+
+      - name: Compare exact SCD2 history multisets
+        run: |
+          python scripts/compare_scd2_replay_histories.py \
+            --database "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
+            --dataset raw \
+            --evidence-dir data/recovery/snapshot-replay/snowflake/exports
+
+      - name: Summarize existing-run validation
+        if: always()
+        run: |
+          echo "## Existing Mode 2 evidence validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source run: ${SOURCE_RUN_ID}, attempt ${SOURCE_RUN_ATTEMPT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Both backend jobs were checked before candidate evidence was restored." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload joint validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snapshot-loader-joint-validation-existing-${{ inputs.compare_run_id }}-${{ inputs.compare_run_attempt }}
+          path: data/recovery/snapshot-replay/joint-validation.json
+          if-no-files-found: warn
+          retention-days: 30
 
   deploy-dbt-docs:
     name: Deploy dbt documentation to GitHub Pages
