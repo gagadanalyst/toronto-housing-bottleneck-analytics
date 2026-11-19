@@ -35,7 +35,7 @@ jobs:
   archive:
     if: >-
       github.event_name != 'schedule' ||
-      vars.TORONTO_EXTRACTION_ENABLED == 'true'
+      vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'
     name: Extract and publish V2 source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -101,7 +101,7 @@ jobs:
         if: >-
           (
             (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true') ||
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
              vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
@@ -139,7 +139,7 @@ jobs:
         if: >-
           (
             (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true') ||
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
              vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
@@ -154,7 +154,7 @@ jobs:
           always() &&
           (
             (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true') ||
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
              vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
@@ -176,7 +176,7 @@ jobs:
         if: >-
           (
             (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true') ||
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
              vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
@@ -197,7 +197,7 @@ jobs:
         if: >-
           (
             (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true') ||
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
              vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&

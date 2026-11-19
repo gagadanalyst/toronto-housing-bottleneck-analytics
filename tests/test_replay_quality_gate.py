@@ -151,6 +151,16 @@ def test_v2_manual_publication_requires_explicit_authorization():
     assert "github.ref == 'refs/heads/refactor/separate-extraction'" in workflow
 
 
+def test_v2_manual_and_scheduled_extraction_have_separate_gates():
+    workflow = (ROOT / ".github/workflows/v2-snapshot-archive.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'") == 6
+    assert workflow.count("vars.TORONTO_EXTRACTION_ENABLED == 'true'") == 5
+    assert "EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}" in workflow
+
+
 def test_v2_push_and_pull_request_are_ci_only():
     workflow = (ROOT / ".github/workflows/v2-snapshot-archive.yml").read_text(
         encoding="utf-8"
