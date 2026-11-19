@@ -1,0 +1,18 @@
+name: Mode 1 Incremental Loader (Validated Staging)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  registration:
+    name: Inert default-branch registration
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm this is only a registration stub
+        run: |
+          echo "Inert Mode 1 workflow registration stub."
+          echo "The actual implementation remains on refactor/separate-extraction."
