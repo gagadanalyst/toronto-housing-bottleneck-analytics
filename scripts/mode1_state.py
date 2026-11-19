@@ -114,14 +114,17 @@ def _mode2_generation(
 
         rows = connection.execute(
             """SELECT source_name, snapshot_id, order_timestamp, run_id,
-                      run_attempt, status
+                      run_attempt, status, format_version, source_commit, archive_sha256,
+                      release_tag, asset_name
                FROM replay_loads WHERE backend = ?
                ORDER BY order_timestamp, run_id, run_attempt, snapshot_id,
                         source_name""",
             (backend,),
         ).fetchall()
 
-    snapshots: dict[str, tuple[float, int, int, str, set[str]]] = {}
+    snapshots: dict[
+        str, tuple[float, int, int, str, tuple[int, str, str, str, str], set[str]]
+    ] = {}
     for row in rows:
         snapshot_id = str(row["snapshot_id"])
         source_name = str(row["source_name"])
@@ -137,15 +140,32 @@ def _mode2_generation(
             int(row["run_attempt"]),
             snapshot_id,
         )
+        source_identity = (
+            int(row["format_version"]),
+            str(row["source_commit"]),
+            str(row["archive_sha256"]),
+            str(row["release_tag"]),
+            str(row["asset_name"]),
+        )
         current = snapshots.get(snapshot_id)
         if current is None:
-            snapshots[snapshot_id] = (*order, {source_name})
+            snapshots[snapshot_id] = (*order, source_identity, {source_name})
         else:
-            if current[:4] != order or source_name in current[4]:
+            # Active and Cleared are extracted independently, so their
+            # observation timestamps may legitimately differ within one
+            # immutable archive. The archive identity must match; retain the
+            # later source timestamp for chronological baseline selection.
+            if (
+                current[1:4] != order[1:]
+                or current[4] != source_identity
+                or source_name in current[5]
+            ):
                 raise RuntimeError(
                     f"Mode 2 source identity is duplicated or inconsistent: {snapshot_id}."
                 )
-            current[4].add(source_name)
+            current[5].add(source_name)
+            if order[0] > current[0]:
+                snapshots[snapshot_id] = (order[0], *current[1:])
 
     if len(snapshots) != selected_count:
         raise RuntimeError(
@@ -153,7 +173,7 @@ def _mode2_generation(
             f"{len(snapshots)}."
         )
     for snapshot_id, item in snapshots.items():
-        if item[4] != {"active_permits", "cleared_permits"}:
+        if item[5] != {"active_permits", "cleared_permits"}:
             raise RuntimeError(
                 f"Mode 2 snapshot {snapshot_id} lacks one of its two source records."
             )

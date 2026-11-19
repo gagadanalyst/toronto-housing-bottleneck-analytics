@@ -93,6 +93,42 @@ def test_mode2_metadata_requires_successful_full_history_and_two_sources(tmp_pat
     assert result["selected_snapshot_count"] == 2
 
 
+@pytest.mark.parametrize("backend", ("duckdb", "snowflake"))
+def test_mode2_metadata_accepts_source_specific_observation_timestamps(
+    tmp_path, backend
+):
+    ledger_path, _, _ = _mode2_fixture(tmp_path, backend=backend)
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            """UPDATE replay_loads
+               SET order_timestamp = order_timestamp + 0.5
+               WHERE backend = ? AND source_name = 'cleared_permits'""",
+            (backend,),
+        )
+
+    result = mode1_state._mode2_generation(ledger_path, backend, "12345:1")
+
+    assert result["baseline_snapshot_id"] == "snapshot-2"
+    assert result["baseline_snapshot_count"] == 2
+    assert result["selected_snapshot_count"] == 2
+
+
+@pytest.mark.parametrize("backend", ("duckdb", "snowflake"))
+def test_mode2_metadata_rejects_mismatched_source_archive_identity(tmp_path, backend):
+    ledger_path, _, _ = _mode2_fixture(tmp_path, backend=backend)
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            """UPDATE replay_loads
+               SET archive_sha256 = ?
+               WHERE backend = ? AND snapshot_id = 'snapshot-2'
+                 AND source_name = 'cleared_permits'""",
+            ("c" * 64, backend),
+        )
+
+    with pytest.raises(RuntimeError, match="duplicated or inconsistent"):
+        mode1_state._mode2_generation(ledger_path, backend, "12345:1")
+
+
 @pytest.mark.parametrize(
     ("history_scope", "terminal_status", "message"),
     [
@@ -666,3 +702,19 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
     assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 2
     assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 3
     assert "steps.replay.outputs.has_pending_archives != 'true'" not in workflow
+
+
+@pytest.mark.parametrize("backend", ("duckdb", "snowflake"))
+def test_mode2_metadata_rejects_mismatched_source_format_version(tmp_path, backend):
+    ledger_path, _, _ = _mode2_fixture(tmp_path, backend=backend)
+
+    with sqlite3.connect(ledger_path) as connection:
+        connection.execute(
+            """UPDATE replay_loads
+               SET format_version = ?
+               WHERE backend = ? AND snapshot_id = ? AND source_name = ?""",
+            (1, backend, "snapshot-2", "cleared_permits"),
+        )
+
+    with pytest.raises(RuntimeError, match="duplicated or inconsistent"):
+        mode1_state._mode2_generation(ledger_path, backend, "12345:1")
