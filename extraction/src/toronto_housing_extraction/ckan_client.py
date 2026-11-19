@@ -228,6 +228,7 @@ class TorontoCKANClient:
         output_path: Path,
         pagination_sort: str,
         required_columns: tuple[str, ...],
+        total_was_estimated: bool = False,
     ) -> int:
         """Extract a full DataStore snapshot with restartable pagination."""
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -329,9 +330,12 @@ class TorontoCKANClient:
 
             records = result.get("records", [])
             page_total = int(result.get("total", len(records)))
+            estimated_total = total_was_estimated or (
+                result.get("total_was_estimated") is True
+            )
             if declared_total is None:
                 declared_total = page_total
-            elif page_total != declared_total:
+            elif page_total != declared_total and not estimated_total:
                 if snapshot_restarts >= max_snapshot_restarts:
                     output_path.unlink(missing_ok=True)
                     shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -366,7 +370,7 @@ class TorontoCKANClient:
                 time.sleep(retry_delay_seconds)
                 continue
 
-            if not records and offset < page_total:
+            if not records and not estimated_total and offset < page_total:
                 raise RuntimeError(
                     f"{source_name}: DataStore returned an empty page "
                     "before completion."
@@ -383,7 +387,11 @@ class TorontoCKANClient:
 
             offset += len(records)
             page_number += 1
-            complete = offset >= page_total
+            # An estimated (or unknown) total is diagnostic only. Continue
+            # until CKAN returns an empty page, then record the observed count.
+            complete = not records if estimated_total else offset >= page_total
+            if estimated_total and complete:
+                declared_total = offset
             utils.atomic_write_json(
                 checkpoint_path,
                 {
@@ -391,7 +399,7 @@ class TorontoCKANClient:
                     "fingerprint": fingerprint,
                     "next_offset": offset,
                     "next_page": page_number,
-                    "declared_total": page_total,
+                    "declared_total": declared_total,
                     "complete": complete,
                 },
             )
@@ -404,7 +412,7 @@ class TorontoCKANClient:
                 page=page_number,
                 rows=len(records),
                 offset=offset,
-                total=page_total,
+                total=declared_total if estimated_total and complete else page_total,
             )
             if complete:
                 break

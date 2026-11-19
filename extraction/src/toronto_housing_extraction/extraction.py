@@ -191,6 +191,7 @@ def extract_source(
                 output_path=output_path,
                 pagination_sort=source.pagination_sort,
                 required_columns=source.required_columns,
+                total_was_estimated=probe.get("total_was_estimated") is not False,
             )
             if fingerprint_reliable:
                 resource_after = client.action("resource_show", id=resource["id"])
@@ -226,7 +227,11 @@ def extract_source(
                 package,
                 source,
                 output_path,
-                expected_rows=probe["declared_total"],
+                expected_rows=(
+                    probe["declared_total"]
+                    if probe.get("total_was_estimated") is False
+                    else None
+                ),
             )
             fingerprint_reliable = False
             extraction_method = "file_fallback"
@@ -276,6 +281,39 @@ def extract_source(
         quality_warnings=quality_warnings,
         fingerprint_reliable=fingerprint_reliable,
     )
+
+
+def _validate_pair_source_markers(
+    client: TorontoCKANClient,
+    extractions: tuple[SourceExtraction, ...],
+) -> None:
+    """Ensure reliable DataStore sources stayed unchanged through the full pair."""
+    for extraction in extractions:
+        if (
+            extraction.extraction_method != "datastore"
+            or not extraction.fingerprint_reliable
+        ):
+            continue
+        if not extraction.resource_id:
+            raise RuntimeError(
+                f"{extraction.source_name}: reliable source fingerprint has no resource ID."
+            )
+
+        try:
+            current = client.action("resource_show", id=extraction.resource_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{extraction.source_name}: could not recheck source after paired extraction."
+            ) from exc
+
+        expected = extraction.fingerprint
+        if current.get("datastore_cache_last_update") != expected.get(
+            "datastore_cache_last_update"
+        ) or current.get("last_modified") != expected.get("resource_last_modified"):
+            raise RuntimeError(
+                f"{extraction.source_name}: source changed during paired extraction; "
+                "discarding the snapshot."
+            )
 
 
 def extract_sources(
@@ -336,4 +374,6 @@ def extract_sources(
     if failures:
         raise RuntimeError("Snapshot extraction incomplete: " + "; ".join(failures))
 
-    return tuple(results)
+    completed_pair = tuple(results)
+    _validate_pair_source_markers(client, completed_pair)
+    return completed_pair
