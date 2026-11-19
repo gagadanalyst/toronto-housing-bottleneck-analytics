@@ -22,9 +22,126 @@ from pyarrow import parquet as pq
 from . import utils
 from .config import ExtractionConfig, SourceConfig
 from .extraction import SourceExtraction
+from .schema import (
+    NORMALIZATION_CONTRACT_VERSION,
+    SOURCE_DATE_FIELDS,
+    SOURCE_FIELD_TYPES,
+)
 
 PACKAGE_NAME = "toronto-housing-extraction"
 FULL_COMMIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z", re.IGNORECASE)
+REPLAY_CONTRACT_ID = "toronto-housing-snapshot-replay"
+REPLAY_CONTRACT_VERSION = 1
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_replay_contract(
+    config: ExtractionConfig, provenance: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Capture the data and code contracts needed to interpret a snapshot."""
+    producer = provenance.get("producer", {})
+    execution = provenance.get("execution", {})
+    if not isinstance(producer, Mapping) or not isinstance(execution, Mapping):
+        raise ValueError("Replay contract requires producer and execution provenance.")
+
+    source_commit = producer.get("source_commit")
+    repository = execution.get("repository")
+    sources = {
+        name: {
+            "title": source.title,
+            "dataset_slug": source.dataset_slug,
+            "portal_url": source.portal_url,
+            "expected_cadence": source.expected_cadence,
+            "pagination_sort": source.pagination_sort,
+            "required_columns": list(source.required_columns),
+            "business_key": list(source.business_key),
+            "min_row_count": source.min_row_count,
+            "max_row_change_percent": source.max_row_change_percent,
+        }
+        for name, source in config.sources.items()
+    }
+
+    return {
+        "contract_id": REPLAY_CONTRACT_ID,
+        "contract_version": REPLAY_CONTRACT_VERSION,
+        "snapshot_format_version": 2,
+        "source_configuration": {
+            "ckan": {
+                "base_url": config.ckan.base_url,
+                "timeout_seconds": config.ckan.timeout_seconds,
+                "retries": config.ckan.retries,
+                "page_size": config.ckan.page_size,
+            },
+            "sources": sources,
+        },
+        "normalization": {
+            "version": NORMALIZATION_CONTRACT_VERSION,
+            "module": "toronto_housing_extraction.schema.normalize_source_schema",
+            "field_types": dict(SOURCE_FIELD_TYPES),
+            "date_fields": list(SOURCE_DATE_FIELDS),
+            "unknown_columns": "retained",
+            "implementation_commit": source_commit,
+        },
+        "scd2_replay": {
+            "loader": "toronto_housing_ingestion.dlt_loader.load_scd2",
+            "archive_order": [
+                "bundle.extraction_started_at_utc",
+                "run_id",
+                "run_attempt",
+                "snapshot_id",
+            ],
+            "observation_boundary": "manifest.extraction_started_at_utc",
+            "observation_boundary_timezone": "UTC",
+            "observation_boundary_resolver": ("scripts.replay_targets.source_boundary"),
+            "business_key_reference": (
+                "source_configuration.sources.<source>.business_key"
+            ),
+            "change_detection": "row_hash",
+            "validity_columns": {
+                "from": "_dlt_valid_from",
+                "to": "_dlt_valid_to",
+            },
+            "current_row_predicate": "_dlt_valid_to IS NULL",
+            "historical_interpretation": (
+                "successive_observed_source_revisions_not_real_world_transition_times"
+            ),
+        },
+        "replay_implementation": {
+            "repository": repository,
+            "source_commit": source_commit,
+            "mode2_entrypoint": "scripts/replay_snapshots.py",
+            "backend_engine": "scripts/replay_targets.py",
+            "validation": [
+                "scripts/validate_snapshot_replay.py",
+                "scripts/compare_scd2_replay_histories.py",
+            ],
+        },
+    }
+
+
+def validate_replay_contract(contract: Mapping[str, Any], expected_sha256: str) -> None:
+    """Validate the replay-contract version and its canonical SHA-256."""
+    if not isinstance(contract, Mapping):
+        raise ValueError("Snapshot replay contract must be a JSON object.")
+    if contract.get("contract_id") != REPLAY_CONTRACT_ID:
+        raise ValueError("Snapshot replay contract ID is missing or unsupported.")
+    if (
+        type(contract.get("contract_version")) is not int
+        or contract.get("contract_version") != REPLAY_CONTRACT_VERSION
+    ):
+        raise ValueError("Snapshot replay contract version is unsupported.")
+    if (
+        not isinstance(expected_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or _canonical_sha256(contract) != expected_sha256
+    ):
+        raise ValueError("Snapshot replay contract SHA-256 mismatch.")
 
 
 def build_provenance(
@@ -394,6 +511,8 @@ def create_snapshot_bundle(
         }
 
     provenance = build_provenance()
+    replay_contract = build_replay_contract(config, provenance)
+    replay_contract_sha256 = _canonical_sha256(replay_contract)
     bundle = {
         "format_version": 2,
         "snapshot_id": snapshot_id,
@@ -402,6 +521,8 @@ def create_snapshot_bundle(
         "complete": True,
         "validation_status": "passed",
         "provenance": provenance,
+        "replay_contract": replay_contract,
+        "replay_contract_sha256": replay_contract_sha256,
         "sources": sources,
     }
 
@@ -463,6 +584,11 @@ def create_snapshot_bundle(
 
             if archived_bundle != bundle:
                 raise ValueError("Archived bundle metadata does not match.")
+
+            validate_replay_contract(
+                archived_bundle.get("replay_contract", {}),
+                archived_bundle.get("replay_contract_sha256", ""),
+            )
 
             for source_name, manifest in manifests.items():
                 data_name = f"{source_name}/data.parquet"

@@ -6,6 +6,9 @@ from typing import Any
 
 import pandas as pd
 
+# Increment when normalization or field interpretation changes.
+NORMALIZATION_CONTRACT_VERSION = 1
+
 # These types are our extraction contract, not types inferred from CKAN.
 # Dates intentionally remain strings to preserve their original representation.
 SOURCE_FIELD_TYPES: dict[str, str] = {

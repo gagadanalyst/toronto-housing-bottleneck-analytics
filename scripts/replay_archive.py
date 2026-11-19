@@ -30,6 +30,8 @@ V2_ASSET = re.compile(
 )
 SHA1 = re.compile(r"[0-9a-f]{40}\Z", re.IGNORECASE)
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+REPLAY_CONTRACT_ID = "toronto-housing-snapshot-replay"
+REPLAY_CONTRACT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -302,6 +304,127 @@ def _validate_v1(
     )
 
 
+def _validate_replay_contract(
+    bundle: dict[str, Any], source_commit: str, repository: str
+) -> None:
+    """Verify a V2 replay contract while retaining legacy V2 compatibility."""
+    # Only archives predating the explicit contract may omit both fields.
+    if "replay_contract" not in bundle and "replay_contract_sha256" not in bundle:
+        return
+
+    contract = bundle.get("replay_contract")
+    expected_digest = bundle.get("replay_contract_sha256")
+    if not isinstance(contract, dict) or not isinstance(expected_digest, str):
+        raise ValueError("V2 replay contract or its SHA-256 is missing.")
+    if contract.get("contract_id") != REPLAY_CONTRACT_ID:
+        raise ValueError("V2 replay contract ID is missing or unsupported.")
+    if (
+        type(contract.get("contract_version")) is not int
+        or contract.get("contract_version") != REPLAY_CONTRACT_VERSION
+    ):
+        raise ValueError("V2 replay contract version is unsupported.")
+    if contract.get("snapshot_format_version") != 2:
+        raise ValueError("V2 replay contract snapshot format is invalid.")
+
+    encoded = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    actual_digest = hashlib.sha256(encoded).hexdigest()
+    if not SHA256.fullmatch(expected_digest) or actual_digest != expected_digest:
+        raise ValueError("V2 replay contract SHA-256 mismatch.")
+
+    source_configuration = contract.get("source_configuration")
+    normalization = contract.get("normalization")
+    implementation = contract.get("replay_implementation")
+    if not isinstance(source_configuration, dict):
+        raise ValueError("V2 replay contract source configuration is invalid.")
+    ckan = source_configuration.get("ckan")
+    sources = source_configuration.get("sources")
+    if not isinstance(ckan, dict) or not isinstance(sources, dict):
+        raise ValueError("V2 replay contract source configuration is incomplete.")
+    if set(sources) != set(SOURCE_NAMES):
+        raise ValueError("V2 replay contract source set is incomplete.")
+    if not isinstance(normalization, dict):
+        raise ValueError("V2 replay contract normalization is missing.")
+    normalization_version = normalization.get("version")
+    field_types = normalization.get("field_types")
+    if (
+        type(normalization_version) is not int
+        or normalization_version < 1
+        or not isinstance(field_types, dict)
+        or not field_types
+    ):
+        raise ValueError("V2 replay contract normalization definition is invalid.")
+
+    for source_name, source_definition in sources.items():
+        business_key = (
+            source_definition.get("business_key")
+            if isinstance(source_definition, dict)
+            else None
+        )
+        if (
+            not isinstance(business_key, list)
+            or not business_key
+            or not all(
+                isinstance(column, str) and column.strip() for column in business_key
+            )
+        ):
+            raise ValueError(
+                f"V2 replay contract business key is invalid for {source_name}."
+            )
+
+    expected_scd2_replay = {
+        "loader": "toronto_housing_ingestion.dlt_loader.load_scd2",
+        "archive_order": [
+            "bundle.extraction_started_at_utc",
+            "run_id",
+            "run_attempt",
+            "snapshot_id",
+        ],
+        "observation_boundary": "manifest.extraction_started_at_utc",
+        "observation_boundary_timezone": "UTC",
+        "observation_boundary_resolver": ("scripts.replay_targets.source_boundary"),
+        "business_key_reference": (
+            "source_configuration.sources.<source>.business_key"
+        ),
+        "change_detection": "row_hash",
+        "validity_columns": {
+            "from": "_dlt_valid_from",
+            "to": "_dlt_valid_to",
+        },
+        "current_row_predicate": "_dlt_valid_to IS NULL",
+        "historical_interpretation": (
+            "successive_observed_source_revisions_not_real_world_transition_times"
+        ),
+    }
+    if contract.get("scd2_replay") != expected_scd2_replay:
+        raise ValueError(
+            "V2 replay contract SCD2 replay definition is incomplete or unsupported."
+        )
+
+    if not isinstance(implementation, dict):
+        raise ValueError("V2 replay implementation reference is missing.")
+    contract_repository = implementation.get("repository")
+    contract_commit = implementation.get("source_commit")
+    if (
+        not isinstance(contract_repository, str)
+        or contract_repository.lower() != repository.lower()
+        or contract_commit != source_commit
+    ):
+        raise ValueError("V2 replay contract implementation does not match provenance.")
+    for field in ("mode2_entrypoint", "backend_engine"):
+        value = implementation.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"V2 replay contract {field} is missing.")
+    validation = implementation.get("validation")
+    if (
+        not isinstance(validation, list)
+        or not validation
+        or not all(isinstance(item, str) and item.strip() for item in validation)
+    ):
+        raise ValueError("V2 replay contract validation references are invalid.")
+
+
 def _validate_v2(
     path: Path,
     release_tag: str,
@@ -335,6 +458,8 @@ def _validate_v2(
     if release_tag != f"toronto-raw-snapshot-v2-archive-{started:%Y-%m}":
         raise ValueError("V2 Release month does not match extraction timestamp.")
     commit, run_id, attempt = _validate_provenance(bundle, repository)
+    execution = bundle["provenance"]["execution"]
+    _validate_replay_contract(bundle, commit, execution["repository"])
     summaries = bundle.get("sources")
     if not isinstance(summaries, dict) or set(summaries) - set(SOURCE_NAMES):
         raise ValueError("V2 bundle has invalid source summaries.")

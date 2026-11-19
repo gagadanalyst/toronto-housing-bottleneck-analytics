@@ -135,6 +135,183 @@ def test_inspect_normalizes_both_archive_generations(tmp_path, version):
     assert result.order[0].year == 2026
 
 
+def _contract():
+    return {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "snapshot_format_version": 2,
+        "source_configuration": {
+            "ckan": {"page_size": 10000},
+            "sources": {
+                name: {"business_key": ["PERMIT_NUM"]} for name in SOURCE_NAMES
+            },
+        },
+        "normalization": {
+            "version": 1,
+            "field_types": {"PERMIT_NUM": "text"},
+        },
+        "scd2_replay": {
+            "loader": "toronto_housing_ingestion.dlt_loader.load_scd2",
+            "archive_order": [
+                "bundle.extraction_started_at_utc",
+                "run_id",
+                "run_attempt",
+                "snapshot_id",
+            ],
+            "observation_boundary": "manifest.extraction_started_at_utc",
+            "observation_boundary_timezone": "UTC",
+            "observation_boundary_resolver": ("scripts.replay_targets.source_boundary"),
+            "business_key_reference": (
+                "source_configuration.sources.<source>.business_key"
+            ),
+            "change_detection": "row_hash",
+            "validity_columns": {
+                "from": "_dlt_valid_from",
+                "to": "_dlt_valid_to",
+            },
+            "current_row_predicate": "_dlt_valid_to IS NULL",
+            "historical_interpretation": (
+                "successive_observed_source_revisions_not_real_world_transition_times"
+            ),
+        },
+        "replay_implementation": {
+            "repository": "gagadanalyst/toronto-housing-bottleneck-analytics",
+            "source_commit": "b" * 40,
+            "mode2_entrypoint": "scripts/replay_snapshots.py",
+            "backend_engine": "scripts/replay_targets.py",
+            "validation": [
+                "scripts/validate_snapshot_replay.py",
+                "scripts/compare_scd2_replay_histories.py",
+            ],
+        },
+    }
+
+
+def _add_replay_contract(path, *, tamper=False, wrong_commit=False, omit_scd2=False):
+    with ZipFile(path) as source:
+        entries = {name: source.read(name) for name in source.namelist()}
+    bundle = json.loads(entries["bundle.json"])
+    contract = _contract()
+    if wrong_commit:
+        contract["replay_implementation"]["source_commit"] = "c" * 40
+    if omit_scd2:
+        contract.pop("scd2_replay")
+
+    canonical = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+
+    if tamper:
+        # Modify the contract after calculating its original digest.
+        contract["normalization"]["version"] = 99
+
+    bundle["replay_contract"] = contract
+    bundle["replay_contract_sha256"] = digest
+    entries["bundle.json"] = json.dumps(bundle).encode()
+    with ZipFile(path, "w", ZIP_DEFLATED) as target:
+        for name, payload in entries.items():
+            target.writestr(name, payload)
+
+
+def test_v2_replay_contract_is_verified_when_archive_is_read(tmp_path):
+    path = tmp_path / "contract-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+    _add_replay_contract(path)
+
+    result = inspect_archive(
+        path,
+        tag,
+        asset,
+        repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+    )
+
+    assert result.bundle["replay_contract"]["contract_version"] == 1
+
+
+def test_v2_replay_contract_checksum_is_enforced(tmp_path):
+    path = tmp_path / "tampered-contract-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+    _add_replay_contract(path, tamper=True)
+
+    with pytest.raises(ValueError, match="replay contract SHA-256 mismatch"):
+        inspect_archive(
+            path,
+            tag,
+            asset,
+            repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+        )
+
+
+def test_v2_replay_contract_must_match_snapshot_provenance(tmp_path):
+    path = tmp_path / "wrong-commit-contract-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+    _add_replay_contract(path, wrong_commit=True)
+
+    with pytest.raises(ValueError, match="does not match provenance"):
+        inspect_archive(
+            path,
+            tag,
+            asset,
+            repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+        )
+
+
+def test_v2_replay_contract_requires_scd2_interpretation(tmp_path):
+    path = tmp_path / "missing-scd2-contract-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+    _add_replay_contract(path, omit_scd2=True)
+
+    with pytest.raises(
+        ValueError, match="SCD2 replay definition is incomplete or unsupported"
+    ):
+        inspect_archive(
+            path,
+            tag,
+            asset,
+            repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+        )
+
+
+def test_v2_archive_with_explicit_null_contract_is_rejected(tmp_path):
+    path = tmp_path / "null-contract-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+
+    with ZipFile(path) as source:
+        entries = {name: source.read(name) for name in source.namelist()}
+
+    bundle = json.loads(entries["bundle.json"])
+    bundle["replay_contract"] = None
+    bundle["replay_contract_sha256"] = None
+    entries["bundle.json"] = json.dumps(bundle).encode()
+
+    with ZipFile(path, "w", ZIP_DEFLATED) as target:
+        for name, payload in entries.items():
+            target.writestr(name, payload)
+
+    with pytest.raises(ValueError, match="replay contract or its SHA-256 is missing"):
+        inspect_archive(
+            path,
+            tag,
+            asset,
+            repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+        )
+
+
+def test_legacy_v2_archive_without_replay_contract_remains_supported(tmp_path):
+    path = tmp_path / "legacy-v2.zip"
+    tag, asset = _write_archive(path, version=2)
+
+    result = inspect_archive(
+        path,
+        tag,
+        asset,
+        repository="gagadanalyst/toronto-housing-bottleneck-analytics",
+    )
+
+    assert "replay_contract" not in result.bundle
+
+
 def test_extract_source_rechecks_archive_and_member_hashes(tmp_path):
     path = tmp_path / "snapshot.zip"
     tag, asset = _write_archive(path, version=2)
