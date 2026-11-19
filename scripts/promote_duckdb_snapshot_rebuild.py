@@ -109,10 +109,16 @@ def _read_report(
             "release_tag",
             "asset_name",
             "order_timestamp",
+            "quarantined_row_count",
+            "quarantined_bad_row_count",
+            "quarantined_business_key_count",
         )
-        if any(item.get(field) in (None, "") for field in required):
+        if any(item.get(field) in (None, "") for field in required) or (
+            "quarantine_sha256" not in item
+        ):
             raise ValueError(
-                f"DuckDB replay ledger entry lacks immutable provenance: {key}."
+                f"DuckDB replay ledger entry lacks immutable provenance "
+                f"or quarantine evidence: {key}."
             )
         if str(item["run_id"]) != str(
             next(
@@ -252,6 +258,21 @@ def _validate_database(
                 (str(row[7]), str(item["asset_name"])),
                 (int(row[8]), int(item["format_version"])),
                 (str(row[9]), str(item["archive_sha256"])),
+                (int(row[10] or 0), int(item["quarantined_row_count"])),
+                (
+                    int(row[11] or 0),
+                    int(item["quarantined_bad_row_count"]),
+                ),
+                (
+                    int(row[12] or 0),
+                    int(item["quarantined_business_key_count"]),
+                ),
+                (
+                    str(row[13]) if row[13] is not None else None,
+                    str(item["quarantine_sha256"])
+                    if item["quarantine_sha256"] is not None
+                    else None,
+                ),
             )
             if any(actual != wanted for actual, wanted in comparisons):
                 raise RuntimeError(
@@ -332,14 +353,18 @@ def _validate_database(
                 if str(row[4]) == "conflicting_duplicate_business_key"
                 and row[5] is not None
             }
-            digest = hashlib.sha256(
-                "".join(str(row[0]) + "\n" for row in rows).encode("ascii")
-            ).hexdigest()
+            digest = (
+                hashlib.sha256(
+                    "".join(str(row[0]) + "\n" for row in rows).encode("ascii")
+                ).hexdigest()
+                if rows
+                else None
+            )
             if (total, bad, len(conflict_keys), digest) != (
                 int(ledger[10] or 0),
                 int(ledger[11] or 0),
                 int(ledger[12] or 0),
-                str(ledger[13] or ""),
+                str(ledger[13]) if ledger[13] is not None else None,
             ):
                 raise RuntimeError(f"Quarantine reconciliation failed for {key}.")
             for row in rows:

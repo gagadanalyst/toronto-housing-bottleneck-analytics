@@ -98,6 +98,7 @@ def validate_full_rebuild(
         "archive_provenance": "passed",
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
+        "quarantine_parity": "passed",
         "explicit_promotion_required": True,
         "promotion_performed": False,
     }
@@ -125,14 +126,10 @@ def validate_full_rebuild(
             "Saved joint backend evidence differs from backend replay reports."
         )
 
-    expected_snapshots = [_snapshot_identity(item) for item in recomputed["snapshots"]]
     saved_snapshots = saved_joint.get("snapshots")
-    if (
-        not isinstance(saved_snapshots, list)
-        or [_snapshot_identity(item) for item in saved_snapshots] != expected_snapshots
-    ):
+    if saved_snapshots != recomputed["snapshots"]:
         raise ValueError(
-            "Saved joint archive provenance differs from backend replay reports."
+            "Saved joint snapshot evidence differs from backend replay reports."
         )
 
     recomputed["backend_validation_policy"] = "both"

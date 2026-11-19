@@ -4,7 +4,10 @@ from copy import deepcopy
 
 import pytest
 
-from scripts.validate_snapshot_replay import validate_reports
+from scripts.validate_snapshot_replay import (
+    validate_backend_report,
+    validate_reports,
+)
 
 
 def _report(backend: str, *, checksum: str = "b" * 64) -> dict:
@@ -25,6 +28,11 @@ def _report(backend: str, *, checksum: str = "b" * 64) -> dict:
                     "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
                     "asset_name": f"toronto-raw-snapshot-v2-bundle-{snapshot_id}.zip",
                     "status": "succeeded",
+                    "warehouse_status": "succeeded",
+                    "quarantined_row_count": 0,
+                    "quarantined_bad_row_count": 0,
+                    "quarantined_business_key_count": 0,
+                    "quarantine_sha256": None,
                 }
             )
     source_metrics = {
@@ -45,7 +53,7 @@ def _report(backend: str, *, checksum: str = "b" * 64) -> dict:
         "mode": "rebuild",
         "history_scope": "full",
         "full_history": True,
-        "history_scope_basis": "all_discoverable_complete_v1_v2_release_archives",
+        "history_scope_basis": "versioned_inventory_verified_v1_v2_release_archives",
         "explicit_promotion_required": True,
         "warehouse_input_staging": "not_used",
         "snapshot_count_discovered": 2,
@@ -75,6 +83,17 @@ def _report(backend: str, *, checksum: str = "b" * 64) -> dict:
     }
 
 
+def test_one_backend_can_be_validated_without_a_second_backend():
+    result = validate_backend_report(_report("duckdb"), "duckdb")
+
+    assert result["mode"] == "rebuild"
+    assert result["history_scope"] == "full"
+    assert result["full_history"] is True
+
+    with pytest.raises(ValueError, match="expected backend"):
+        validate_backend_report(_report("snowflake"), "duckdb")
+
+
 def test_identical_backend_reports_pass_with_complete_ledger_and_history():
     result = validate_reports(_report("duckdb"), _report("snowflake"))
 
@@ -83,10 +102,51 @@ def test_identical_backend_reports_pass_with_complete_ledger_and_history():
     assert result["source_ledger_entries"] == 4
     assert result["archive_provenance"] == "passed"
     assert result["backend_snapshot_coverage"] == "identical"
+    assert result["quarantine_parity"] == "passed"
     assert [item["snapshot_id"] for item in result["snapshots"]] == [
         "snapshot-a",
         "snapshot-b",
     ]
+
+
+def test_quarantine_evidence_must_match_between_backends():
+    duckdb = _report("duckdb")
+    snowflake = _report("snowflake")
+
+    for report in (duckdb, snowflake):
+        record = next(
+            item
+            for item in report["ledger_entries"]
+            if item["snapshot_id"] == "snapshot-a"
+            and item["source_name"] == "active_permits"
+        )
+        record.update(
+            {
+                "quarantined_row_count": 2,
+                "quarantined_bad_row_count": 1,
+                "quarantined_business_key_count": 1,
+                "quarantine_sha256": "c" * 64,
+            }
+        )
+
+    snowflake_record = next(
+        item
+        for item in snowflake["ledger_entries"]
+        if item["snapshot_id"] == "snapshot-a"
+        and item["source_name"] == "active_permits"
+    )
+    snowflake_record["quarantine_sha256"] = "d" * 64
+
+    with pytest.raises(ValueError, match="Quarantine evidence mismatch"):
+        validate_reports(duckdb, snowflake)
+
+
+def test_failed_native_warehouse_ledger_status_is_rejected():
+    duckdb = _report("duckdb")
+    duckdb["ledger_entries"][0]["warehouse_status"] = "failed"
+
+    with pytest.raises(ValueError, match="native warehouse ledger status"):
+        validate_reports(duckdb, _report("snowflake"))
 
 
 def test_different_snapshot_coverage_is_rejected():

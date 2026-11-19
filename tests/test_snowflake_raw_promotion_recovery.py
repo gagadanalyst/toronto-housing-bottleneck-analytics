@@ -41,6 +41,9 @@ finally:
     else:
         sys.modules["snowflake_candidate_utils"] = _existing_helpers
 
+# Import after installing the test stub in sys.modules.
+from scripts import prepare_snowflake_raw_candidate as preparation  # noqa: E402
+
 
 class _FakeCursor:
     def __init__(self) -> None:
@@ -148,3 +151,205 @@ def test_failed_validation_of_already_swapped_raw_restores_previous_schema(
     ]
     assert connection.commits == 3
     assert connection.rollbacks == 0
+
+
+def test_dry_run_refuses_interrupted_raw_swap_without_recovery(monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append(statement)
+
+        def fetchall(self):
+            return [("toronto_active_permits_scd2", "encoded-state")]
+
+        def fetchone(self):
+            return (1,)
+
+    cursor = Cursor()
+    monkeypatch.setattr(
+        preparation,
+        "decode_state",
+        lambda value, pipeline: {"dataset_name": "RAW_STAGE_123_2"},
+    )
+    monkeypatch.setattr(
+        preparation,
+        "rebase_pipeline_state",
+        lambda *args: pytest.fail("Dry run must not rebase canonical DLT state."),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to modify canonical TORONTO.RAW"):
+        preparation._recover_interrupted_raw_swap(cursor, dry_run=True)
+
+    assert len(cursor.statements) == 2
+    assert all(
+        statement.lstrip().upper().startswith("SELECT")
+        for statement in cursor.statements
+    )
+
+
+def test_snowflake_validate_only_reads_candidate_without_swapping(monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append(statement)
+
+        def fetchone(self):
+            return ("TORONTO_INGEST_ROLE", "TORONTO", "RAW")
+
+        def fetchall(self):
+            statement = self.statements[-1]
+            if "SCHEMA_NAME, SCHEMA_OWNER" in statement:
+                return [("RAW_STAGE_123_2", "TORONTO_INGEST_ROLE")]
+            if "GENERATION_ID" in statement:
+                return [("123:2", "READY")]
+            raise AssertionError(f"Unexpected query: {statement}")
+
+        def close(self):
+            pass
+
+    class Connection:
+        def __init__(self):
+            self.value = Cursor()
+            self.closed = False
+
+        def cursor(self):
+            return self.value
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    validated = []
+    monkeypatch.setattr(promotion, "_options", lambda uri, key_path: {})
+    monkeypatch.setattr(
+        promotion.snowflake.connector,
+        "connect",
+        lambda **kwargs: connection,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_validate_candidate",
+        lambda cursor, stage, counts, snapshots: validated.append(
+            (stage, counts, snapshots)
+        ),
+    )
+
+    promotion.validate_candidate_only(
+        "unused",
+        "RAW_STAGE_123_2",
+        "123:2",
+        {"active_permits": 100, "cleared_permits": 200},
+        {"123:1"},
+    )
+
+    assert validated == [
+        ("RAW_STAGE_123_2", {"active_permits": 100, "cleared_permits": 200}, {"123:1"})
+    ]
+    assert connection.closed
+    assert all(
+        statement.lstrip().upper().startswith("SELECT")
+        for statement in connection.value.statements
+    )
+    assert not any(
+        token in statement.upper()
+        for statement in connection.value.statements
+        for token in ("ALTER ", "UPDATE ", "INSERT ", "DELETE ", "DROP ", "GRANT ")
+    )
+
+
+def test_failed_candidate_preparation_drops_only_its_new_owned_clone(monkeypatch):
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+            self.one = None
+            self.all = []
+
+        def execute(self, statement, params=None):
+            self.statements.append(statement)
+            upper = statement.upper()
+
+            if "SELECT CURRENT_ROLE()" in upper:
+                self.one = ("TORONTO_INGEST_ROLE", "TORONTO", "RAW")
+            elif "SELECT SCHEMA_NAME FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA" in upper:
+                self.one = None
+            elif "COUNT_IF(_DLT_VALID_TO IS NULL)" in upper:
+                self.one = (100,)
+            elif "SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS" in upper:
+                self.all = []
+            elif (
+                upper.startswith("CREATE TABLE") and "TORONTO_SCD2_QUARANTINE" in upper
+            ):
+                raise RuntimeError("simulated candidate preparation failure")
+            elif (
+                "SELECT SCHEMA_OWNER FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA" in upper
+            ):
+                self.one = ("TORONTO_INGEST_ROLE",)
+
+        def fetchone(self):
+            return self.one
+
+        def fetchall(self):
+            return self.all
+
+        def close(self):
+            pass
+
+    class Connection:
+        def __init__(self):
+            self.value = Cursor()
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = False
+
+        def cursor(self):
+            return self.value
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+
+    monkeypatch.setattr(preparation, "_connection_options", lambda uri, key: {})
+    monkeypatch.setattr(
+        preparation,
+        "_recover_interrupted_raw_swap",
+        lambda cursor, dry_run=False: 0,
+    )
+    monkeypatch.setattr(
+        preparation.snowflake.connector,
+        "connect",
+        lambda **kwargs: connection,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated candidate preparation failure",
+    ):
+        preparation.prepare("unused", "123", "2", None, dry_run=True)
+
+    statements = connection.value.statements
+
+    assert any(
+        statement.startswith('CREATE SCHEMA TORONTO."RAW_STAGE_123_2" CLONE')
+        for statement in statements
+    )
+    assert any(
+        statement.startswith('DROP SCHEMA TORONTO."RAW_STAGE_123_2" CASCADE')
+        for statement in statements
+    )
+    assert not any(
+        statement.startswith('DROP SCHEMA TORONTO."RAW"') for statement in statements
+    )
+    assert connection.commits == 1
+    assert connection.rollbacks == 1
+    assert connection.closed

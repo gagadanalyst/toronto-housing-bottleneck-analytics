@@ -425,6 +425,154 @@ def _validate_replay_contract(
         raise ValueError("V2 replay contract validation references are invalid.")
 
 
+def validate_warehouse_eligibility(archives: list[SnapshotArchive]) -> None:
+    """Reject poor-quality archives from warehouse replay without deleting them.
+
+    V2 thresholds are read from the checksum-verified replay contract.
+    Row changes are measured against the immediately preceding archive
+    in chronological order. Fingerprint reliability is not itself a
+    warehouse-quality blocker.
+    """
+    ordered = sorted(archives, key=lambda item: item.order)
+    if not ordered:
+        raise ValueError("Warehouse quality gate received no archives.")
+
+    previous_counts: dict[str, tuple[int, str]] = {}
+    blockers: list[str] = []
+
+    for archive in ordered:
+        actual_sources = set(archive.sources)
+        if actual_sources != set(SOURCE_NAMES):
+            blockers.append(
+                f"{archive.snapshot_id}: source set is incomplete or unexpected"
+            )
+
+        for source_name in SOURCE_NAMES:
+            source = archive.sources.get(source_name)
+            if source is None:
+                continue
+
+            if source.error:
+                blockers.append(f"{archive.snapshot_id}/{source_name}: {source.error}")
+                continue
+
+            current_count = source.row_count
+            if (
+                not isinstance(current_count, int)
+                or isinstance(current_count, bool)
+                or current_count < 1
+            ):
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: row count "
+                    f"{current_count!r} is not warehouse-eligible"
+                )
+                continue
+
+            if archive.format_version != 2:
+                previous_counts[source_name] = (
+                    current_count,
+                    archive.snapshot_id,
+                )
+                continue
+
+            warnings = source.manifest.get("quality_warnings", [])
+            if not isinstance(warnings, list) or not all(
+                isinstance(item, str) for item in warnings
+            ):
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: quality_warnings "
+                    "must be a list of strings"
+                )
+            elif warnings:
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: extraction "
+                    f"quality warnings are present: {warnings!r}"
+                )
+
+            contract = archive.bundle.get("replay_contract")
+            if contract is None:
+                # Legacy V2 archives have no threshold contract. Retain
+                # compatibility, while still rejecting warnings and empty data.
+                previous_counts[source_name] = (
+                    current_count,
+                    archive.snapshot_id,
+                )
+                continue
+
+            source_configuration = contract.get("source_configuration")
+            contract_sources = (
+                source_configuration.get("sources")
+                if isinstance(source_configuration, dict)
+                else None
+            )
+            rules = (
+                contract_sources.get(source_name)
+                if isinstance(contract_sources, dict)
+                else None
+            )
+            if not isinstance(rules, dict):
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: replay contract "
+                    "does not define source quality thresholds"
+                )
+                previous_counts[source_name] = (
+                    current_count,
+                    archive.snapshot_id,
+                )
+                continue
+
+            minimum = rules.get("min_row_count")
+            maximum_change = rules.get("max_row_change_percent")
+
+            if type(minimum) is not int or minimum < 1:
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: contract "
+                    f"min_row_count is invalid: {minimum!r}"
+                )
+            elif current_count < minimum:
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: row count "
+                    f"{current_count:,} is below contract minimum {minimum:,}"
+                )
+
+            valid_maximum = (
+                not isinstance(maximum_change, bool)
+                and isinstance(maximum_change, (int, float))
+                and 0 <= maximum_change <= 100
+            )
+            if not valid_maximum:
+                blockers.append(
+                    f"{archive.snapshot_id}/{source_name}: contract "
+                    f"max_row_change_percent is invalid: {maximum_change!r}"
+                )
+            else:
+                previous = previous_counts.get(source_name)
+                if previous is not None:
+                    previous_count, previous_snapshot = previous
+                    change_percent = (
+                        abs(current_count - previous_count) / previous_count * 100.0
+                    )
+                    if change_percent > float(maximum_change):
+                        blockers.append(
+                            f"{archive.snapshot_id}/{source_name}: row count "
+                            f"changed by {change_percent:.2f}% from preceding "
+                            f"snapshot {previous_snapshot}, exceeding the "
+                            f"contract maximum {float(maximum_change):.2f}%"
+                        )
+
+            previous_counts[source_name] = (
+                current_count,
+                archive.snapshot_id,
+            )
+
+    if blockers:
+        details = "\n - ".join(blockers)
+        raise ValueError(
+            "Warehouse quality gate rejected this archive history. "
+            "The permanent raw archives and inventory are unchanged:\n - " + details
+        )
+
+
 def _validate_v2(
     path: Path,
     release_tag: str,

@@ -1,0 +1,250 @@
+name: Mode 1 Incremental Loader (Validated Staging)
+
+on:
+  schedule:
+    # Run after the daily paired-source extraction/publication window.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: Independent backend jobs to run
+        required: true
+        type: choice
+        options: [duckdb, snowflake, both]
+        default: duckdb
+      baseline_run_id:
+        description: Successful full-history Mode 2 workflow run ID (first bootstrap only)
+        required: false
+        type: string
+        default: ""
+      baseline_attempt:
+        description: Successful Mode 2 workflow attempt (first bootstrap only)
+        required: false
+        type: string
+        default: "1"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: toronto-mode1-incremental-loader
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  reject_noncanonical_manual_dispatch:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref != 'refs/heads/refactor/separate-extraction'
+    name: Reject unsupported manual dispatch ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain the accepted review branch
+        run: |
+          echo "Manual Mode 1 dispatch is restricted to refactor/separate-extraction during acceptance." >&2
+          exit 1
+
+  duckdb:
+    if: >-
+      vars.TORONTO_MODE1_ENABLED == 'true' &&
+      (github.event_name != 'workflow_dispatch' ||
+       github.ref == 'refs/heads/refactor/separate-extraction') &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.backends == 'duckdb' || inputs.backends == 'both')))
+    name: Stage Mode 1 DuckDB changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TORONTO_MODE1_ENABLED: ${{ vars.TORONTO_MODE1_ENABLED }}
+      TORONTO_SNAPSHOT_LOADER_ENABLED: ${{ vars.TORONTO_SNAPSHOT_LOADER_ENABLED }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install DuckDB ingestion dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Require the legacy production-derived loader to remain disabled
+        run: |
+          if [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" = "true" ]; then
+            echo "Disable the legacy TORONTO_SNAPSHOT_LOADER_ENABLED workflow gate before enabling this Mode 1 loader." >&2
+            exit 1
+          fi
+
+      - name: Restore or bootstrap the accepted DuckDB Mode 1 state
+        id: prepare
+        run: |
+          python -m scripts.mode1_state prepare \
+            --backend duckdb \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/duckdb/mode1 \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --baseline-run-id "${{ inputs.baseline_run_id }}" \
+            --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+
+      - name: Replay only unprocessed immutable archives into DuckDB staging
+        id: replay
+        run: |
+          python -m scripts.replay_snapshots \
+            --mode incremental \
+            --backend duckdb \
+            --ledger "${{ steps.prepare.outputs.ledger }}" \
+            --database "${{ steps.prepare.outputs.database }}" \
+            --baseline-snapshot-id "${{ steps.prepare.outputs.baseline_snapshot_id }}" \
+            --baseline-snapshot-count "${{ steps.prepare.outputs.baseline_snapshot_count }}" \
+            --archive-dir data/recovery/snapshot-replay/archives \
+            --staging-dir data/staging/duckdb/mode1/snapshot-files \
+            --output data/staging/duckdb/mode1/replay-summary.json
+
+      - name: Require explicit Duckdb replay pending-archive output
+        if: steps.replay.outcome == 'success'
+        env:
+          HAS_PENDING_ARCHIVES: ${{ steps.replay.outputs.has_pending_archives }}
+        run: |
+          case "$HAS_PENDING_ARCHIVES" in
+            true|false) ;;
+            *) echo "Replay succeeded without an explicit has_pending_archives output; refusing state cleanup or bootstrap." >&2; exit 1 ;;
+          esac
+
+      - name: Persist the validated DuckDB staging handoff
+        if: always() && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/duckdb/mode1/replay-summary.json') != ''
+        run: |
+          python -m scripts.mode1_state publish \
+            --backend duckdb \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/duckdb/mode1 \
+            --summary data/staging/duckdb/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Persist initial DuckDB baseline when no archives are pending
+        if: always() && steps.prepare.outputs.needs_initial_checkpoint == 'true' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
+        run: |
+          python -m scripts.mode1_state publish \
+            --bootstrap-only \
+            --backend duckdb \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/duckdb/mode1 \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+  snowflake:
+    if: >-
+      vars.TORONTO_MODE1_ENABLED == 'true' &&
+      (github.event_name != 'workflow_dispatch' ||
+       github.ref == 'refs/heads/refactor/separate-extraction') &&
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.backends == 'snowflake' || inputs.backends == 'both')))
+    name: Stage Mode 1 Snowflake changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
+      TORONTO_SNAPSHOT_LOADER_ENABLED: ${{ vars.TORONTO_SNAPSHOT_LOADER_ENABLED }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install Snowflake-enabled ingestion dependencies
+        run: python -m pip install -e ".[snowflake,dev]"
+
+      - name: Require the legacy production-derived loader to remain disabled
+        run: |
+          if [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" = "true" ]; then
+            echo "Disable the legacy TORONTO_SNAPSHOT_LOADER_ENABLED workflow gate before enabling this Mode 1 loader." >&2
+            exit 1
+          fi
+          if [ "$SNOWFLAKE_OPERATIONS_ENABLED" != "true" ]; then
+            echo "Snowflake Mode 1 was requested while Snowflake operations are disabled." >&2
+            exit 1
+          fi
+
+      - name: Restore or bootstrap the accepted Snowflake Mode 1 state
+        id: prepare
+        run: |
+          python -m scripts.mode1_state prepare \
+            --backend snowflake \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/snowflake/mode1 \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --baseline-run-id "${{ inputs.baseline_run_id }}" \
+            --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+
+      - name: Replay only unprocessed immutable archives into Snowflake staging
+        id: replay
+        run: |
+          python -m scripts.replay_snapshots \
+            --mode incremental \
+            --backend snowflake \
+            --schema "${{ steps.prepare.outputs.schema }}" \
+            --ledger "${{ steps.prepare.outputs.ledger }}" \
+            --baseline-snapshot-id "${{ steps.prepare.outputs.baseline_snapshot_id }}" \
+            --baseline-snapshot-count "${{ steps.prepare.outputs.baseline_snapshot_count }}" \
+            --archive-dir data/recovery/snapshot-replay/archives \
+            --staging-dir data/staging/snowflake/mode1/snapshot-files \
+            --output data/staging/snowflake/mode1/replay-summary.json
+
+      - name: Require explicit Snowflake replay pending-archive output
+        if: steps.replay.outcome == 'success'
+        env:
+          HAS_PENDING_ARCHIVES: ${{ steps.replay.outputs.has_pending_archives }}
+        run: |
+          case "$HAS_PENDING_ARCHIVES" in
+            true|false) ;;
+            *) echo "Replay succeeded without an explicit has_pending_archives output; refusing state cleanup or bootstrap." >&2; exit 1 ;;
+          esac
+
+      - name: Persist the validated Snowflake staging handoff
+        if: always() && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/snowflake/mode1/replay-summary.json') != ''
+        run: |
+          python -m scripts.mode1_state publish \
+            --backend snowflake \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/snowflake/mode1 \
+            --summary data/staging/snowflake/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Persist initial Snowflake baseline when no archives are pending
+        if: always() && steps.prepare.outputs.needs_initial_checkpoint == 'true' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
+        run: |
+          python -m scripts.mode1_state publish \
+            --bootstrap-only \
+            --backend snowflake \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/snowflake/mode1 \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Drop the unused Snowflake clone when no archives are pending
+        if: steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false' && steps.prepare.outputs.needs_initial_checkpoint != 'true'
+        run: |
+          python -m scripts.mode1_state discard \
+            --backend snowflake \
+            --schema "${{ steps.prepare.outputs.schema }}" \
+            --generation-id "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"

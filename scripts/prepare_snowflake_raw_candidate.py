@@ -50,7 +50,7 @@ def _connection_options(uri: str, key_path: Path) -> dict[str, str]:
     }
 
 
-def _recover_interrupted_raw_swap(cursor) -> int:
+def _recover_interrupted_raw_swap(cursor, *, dry_run: bool = False) -> int:
     """Finish a prior SWAP whose DLT-state rebase was interrupted."""
     cursor.execute("SELECT PIPELINE_NAME, STATE FROM TORONTO.RAW._DLT_PIPELINE_STATE")
     rows = cursor.fetchall()
@@ -82,6 +82,14 @@ def _recover_interrupted_raw_swap(cursor) -> int:
             f"Canonical RAW DLT state references {previous_stage}, but that retained "
             "schema does not exist; refusing to guess at recovery."
         )
+    if dry_run:
+        raise RuntimeError(
+            "Mode 1 dry run found an interrupted RAW schema swap requiring "
+            f"recovery from {previous_stage}; refusing to modify canonical "
+            "TORONTO.RAW. Resolve the interrupted production swap through the "
+            "normal recovery path before retrying the dry run."
+        )
+
     updated = rebase_pipeline_state(cursor, "RAW", previous_stage, "RAW")
     cursor.execute(
         "SELECT COUNT(*) FROM TORONTO.INFORMATION_SCHEMA.TABLES "
@@ -100,10 +108,18 @@ def _recover_interrupted_raw_swap(cursor) -> int:
     return updated
 
 
-def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str:
+def prepare(
+    uri: str,
+    run_id: str,
+    attempt: str,
+    github_env: Path | None,
+    *,
+    dry_run: bool = False,
+) -> str:
     if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
         raise ValueError("GitHub run ID and attempt must contain digits only.")
     stage = f"RAW_STAGE_{run_id}_{attempt}"
+    stage_created = False
     with tempfile.TemporaryDirectory(prefix="toronto-raw-stage-") as temp:
         options = _connection_options(uri, Path(temp) / "snowflake_key.p8")
         connection = snowflake.connector.connect(**options)
@@ -121,7 +137,7 @@ def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str
                 raise RuntimeError(
                     f"Unexpected Snowflake context: {role}/{database}/{schema}."
                 )
-            _recover_interrupted_raw_swap(cursor)
+            _recover_interrupted_raw_swap(cursor, dry_run=dry_run)
             cursor.execute(
                 "SELECT SCHEMA_NAME FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
                 "WHERE SCHEMA_NAME = %s",
@@ -159,6 +175,7 @@ def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str
                 and all(statuses[name] == "succeeded" for name in TABLES)
             )
             cursor.execute(f'CREATE SCHEMA TORONTO."{stage}" CLONE TORONTO.RAW')
+            stage_created = True
             quarantine_ddl = f"""CREATE TABLE IF NOT EXISTS TORONTO."{stage}".TORONTO_SCD2_QUARANTINE (
                 QUARANTINE_ID VARCHAR NOT NULL,
                 SNAPSHOT_ID VARCHAR NOT NULL,
@@ -218,7 +235,43 @@ def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str
                 f"rebased {updated} DLT state rows; baseline current counts={counts}."
             )
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception as rollback_error:
+                print(
+                    "WARNING: Snowflake rollback after candidate preparation "
+                    f"failure also failed: {rollback_error}"
+                )
+
+            # Snowflake DDL can commit independently of the surrounding
+            # transaction. Remove only the run-scoped schema created by this
+            # invocation, and only while this role still owns it.
+            if stage_created:
+                try:
+                    cursor.execute(
+                        "SELECT SCHEMA_OWNER FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
+                        "WHERE SCHEMA_NAME = %s",
+                        (stage,),
+                    )
+                    owner_row = cursor.fetchone()
+                    if owner_row and str(owner_row[0]).upper() == "TORONTO_INGEST_ROLE":
+                        cursor.execute(f'DROP SCHEMA TORONTO."{stage}" CASCADE')
+                        connection.commit()
+                        print(
+                            f"Removed incomplete Snowflake candidate TORONTO.{stage} "
+                            "after preparation failed; canonical TORONTO.RAW "
+                            "was not changed."
+                        )
+                    else:
+                        print(
+                            f"WARNING: Refusing automatic cleanup of TORONTO.{stage}; "
+                            f"observed owner={owner_row!r}."
+                        )
+                except Exception as cleanup_error:
+                    print(
+                        f"WARNING: Could not clean up incomplete candidate "
+                        f"TORONTO.{stage}: {cleanup_error}"
+                    )
             raise
         finally:
             cursor.close()
@@ -241,7 +294,7 @@ def prepare(uri: str, run_id: str, attempt: str, github_env: Path | None) -> str
 
 
 def drop_unused_candidate(uri: str, run_id: str, attempt: str) -> bool:
-    """Drop only this run's untouched READY candidate after a no-op backlog scan."""
+    """Drop only this run's unpromoted READY candidate."""
     if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
         raise ValueError("GitHub run ID and attempt must contain digits only.")
     stage = f"RAW_STAGE_{run_id}_{attempt}"
@@ -289,7 +342,7 @@ def drop_unused_candidate(uri: str, run_id: str, attempt: str) -> bool:
             cursor.execute(f'DROP SCHEMA TORONTO."{stage}" CASCADE')
             connection.commit()
             print(
-                f"Dropped unused Snowflake RAW candidate TORONTO.{stage}; "
+                f"Dropped unpromoted Snowflake RAW candidate TORONTO.{stage}; "
                 "production TORONTO.RAW was not changed."
             )
             return True
@@ -304,9 +357,14 @@ def main() -> int:
     parser.add_argument("--attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
     parser.add_argument("--github-env", type=Path)
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Refuse interrupted RAW recovery before creating an isolated candidate.",
+    )
+    parser.add_argument(
         "--drop-candidate",
         action="store_true",
-        help="Drop only this run's untouched READY candidate after a no-op replay.",
+        help="Drop only this run's unpromoted READY candidate.",
     )
     args = parser.parse_args()
     uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
@@ -315,7 +373,7 @@ def main() -> int:
     if args.drop_candidate:
         drop_unused_candidate(uri, args.run_id, args.attempt)
     else:
-        prepare(uri, args.run_id, args.attempt, args.github_env)
+        prepare(uri, args.run_id, args.attempt, args.github_env, dry_run=args.dry_run)
     return 0
 
 

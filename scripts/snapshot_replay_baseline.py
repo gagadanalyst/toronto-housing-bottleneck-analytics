@@ -124,8 +124,7 @@ def snowflake_signature(uri: str) -> dict[str, Any]:
             "EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS, SOURCE_COMMIT, "
             "RELEASE_TAG, ASSET_NAME, ERROR, CREATED_AT, UPDATED_AT, "
             "QUARANTINED_ROW_COUNT, QUARANTINED_BAD_ROW_COUNT, "
-            "QUARANTINED_BUSINESS_KEY_COUNT, QUARANTINE_SHA256, "
-            "FORMAT_VERSION, ARCHIVE_SHA256)) "
+            "QUARANTINED_BUSINESS_KEY_COUNT, QUARANTINE_SHA256)) "
             "FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
         )
         ledger_rows, snapshots, ledger_digest = cursor.fetchone()

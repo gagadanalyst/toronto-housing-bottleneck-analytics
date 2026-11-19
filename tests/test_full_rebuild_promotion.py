@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from scripts import promote_duckdb_snapshot_rebuild as duck_promote
 from scripts import promote_snowflake_snapshot_rebuild as snow_promote
 from scripts import validate_full_rebuild_promotion as promotion
 
@@ -71,7 +73,7 @@ def _complete_duckdb_report():
         "full_history": True,
         "explicit_promotion_required": True,
         "warehouse_input_staging": "not_used",
-        "history_scope_basis": "all_discoverable_complete_v1_v2_release_archives",
+        "history_scope_basis": "versioned_inventory_verified_v1_v2_release_archives",
         "snapshot_count_discovered": 1,
         "snapshot_count_selected": 1,
         "snapshot_count_pending_before_load": 0,
@@ -96,6 +98,11 @@ def _complete_duckdb_report():
                 **identity,
                 "source_name": source,
                 "status": "succeeded",
+                "warehouse_status": "succeeded",
+                "quarantined_row_count": 0,
+                "quarantined_bad_row_count": 0,
+                "quarantined_business_key_count": 0,
+                "quarantine_sha256": None,
             }
             for source in sources
         ],
@@ -120,6 +127,7 @@ def test_full_rebuild_promotion_requires_all_scope_and_joint_fields(monkeypatch)
         "archive_provenance": "passed",
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
+        "quarantine_parity": "passed",
     }
     monkeypatch.setattr(promotion, "validate_reports", lambda *_args: recomputed)
     saved = dict(recomputed)
@@ -148,6 +156,7 @@ def test_full_rebuild_promotion_rejects_missing_joint_promotion_guard(monkeypatc
         "archive_provenance": "passed",
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
+        "quarantine_parity": "passed",
     }
     monkeypatch.setattr(promotion, "validate_reports", lambda *_args: recomputed)
     saved = dict(recomputed)
@@ -314,3 +323,59 @@ def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
     assert "SNOWFLAKE_OPERATIONS_ENABLED" not in duckdb_job
     assert "needs.verify.outputs.backend_policy == 'both'" in snowflake_job
     assert "vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake_job
+
+
+def test_duckdb_promotion_summary_requires_quarantine_counts(tmp_path):
+    report = _complete_duckdb_report()
+    report["candidate"] = (
+        "data/recovery/snapshot-replay/duckdb/toronto-replay-123.duckdb"
+    )
+    path = tmp_path / "duckdb-summary.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    _, expected = duck_promote._read_report(path, "123")
+    assert expected["123:1|active_permits"]["quarantined_row_count"] == 0
+
+    report["ledger_entries"][0].pop("quarantined_bad_row_count")
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="lacks immutable provenance"):
+        duck_promote._read_report(path, "123")
+
+
+def test_snowflake_promotion_summary_requires_quarantine_counts(tmp_path):
+    report = _report("snowflake")
+    report.update(
+        candidate="TORONTO.TORONTO_SNAPSHOT_REPLAY_123",
+        snapshot_count_discovered=1,
+        snapshot_count_selected=1,
+    )
+    report["ledger_entries"] = [
+        {
+            "snapshot_id": "123:1",
+            "source_name": source,
+            "status": "succeeded",
+            "run_id": "123",
+            "run_attempt": 1,
+            "source_commit": "a" * 40,
+            "release_tag": "toronto-raw-snapshot-archive-2026-11",
+            "asset_name": "toronto-raw-snapshot-bundle-123-1.zip",
+            "format_version": 1,
+            "archive_sha256": "b" * 64,
+            "order_timestamp": 1793548800.0,
+            "quarantined_row_count": 0,
+            "quarantined_bad_row_count": 0,
+            "quarantined_business_key_count": 0,
+            "quarantine_sha256": None,
+        }
+        for source in ("active_permits", "cleared_permits")
+    ]
+    path = tmp_path / "snowflake-summary.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    expected = snow_promote._expected_ledger_from_summary(path, "123")
+    assert expected["123:1|active_permits"]["quarantined_row_count"] == 0
+
+    report["ledger_entries"][0].pop("quarantined_business_key_count")
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="lacks immutable identity"):
+        snow_promote._expected_ledger_from_summary(path, "123")

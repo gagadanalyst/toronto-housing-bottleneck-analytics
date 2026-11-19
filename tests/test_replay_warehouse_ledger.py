@@ -92,7 +92,16 @@ def test_native_ledger_retry_preserves_success_and_resets_only_failed_source(tmp
         target, archive, "active_permits", "loading"
     )
     replay_warehouse_ledger.set_snapshot_status(
-        target, archive, "active_permits", "succeeded"
+        target,
+        archive,
+        "active_permits",
+        "succeeded",
+        result={
+            "quarantined_rows": 2,
+            "quarantined_bad_rows": 1,
+            "quarantined_business_keys": 1,
+            "quarantine_sha256": "c" * 64,
+        },
     )
     replay_warehouse_ledger.set_snapshot_status(
         target, archive, "cleared_permits", "loading"
@@ -102,6 +111,19 @@ def test_native_ledger_retry_preserves_success_and_resets_only_failed_source(tmp
     )
 
     replay_warehouse_ledger.register_archive(target, archive)
+
+    records = replay_warehouse_ledger.snapshot_records(target)
+    active = next(
+        record
+        for record in records
+        if record["snapshot_id"] == archive.snapshot_id
+        and record["source_name"] == "active_permits"
+    )
+    assert active["status"] == "succeeded"
+    assert active["quarantined_row_count"] == 2
+    assert active["quarantined_bad_row_count"] == 1
+    assert active["quarantined_business_key_count"] == 1
+    assert active["quarantine_sha256"] == "c" * 64
 
     assert (
         replay_warehouse_ledger.snapshot_status(
@@ -208,3 +230,113 @@ def test_legacy_v1_ledger_identity_still_rejects_changed_release_fields():
 
     with pytest.raises(ValueError, match="identity conflicts"):
         replay_warehouse_ledger._assert_identity(old, values, "DuckDB")
+
+
+def _baseline_target(tmp_path, *, missing_anchor=False):
+    target = _target(tmp_path / "candidate.duckdb")
+    archives = []
+
+    for index, run_id in enumerate(range(42022028598, 42022028626), start=1):
+        if missing_anchor and run_id == 42022028625:
+            continue
+
+        archive = _archive(f"{run_id}:1", index, run_id=run_id)
+        archives.append(archive)
+        replay_warehouse_ledger.register_archive(target, archive)
+
+        for source in ("active_permits", "cleared_permits"):
+            replay_warehouse_ledger.set_snapshot_status(
+                target, archive, source, "succeeded"
+            )
+
+    return target, archives
+
+
+def test_baseline_preflight_accepts_28_snapshots_and_later_pending_snapshot(tmp_path):
+    target, _ = _baseline_target(tmp_path)
+    later = _archive("after-baseline", 29, run_id=42022028626)
+    replay_warehouse_ledger.register_archive(target, later)
+
+    result = replay_warehouse_ledger.validate_canonical_baseline(
+        target, "42022028625:1", 28
+    )
+
+    assert result["status"] == "passed"
+    assert result["snapshot_count"] == 28
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_count", "error"),
+    [
+        ("missing_anchor", 28, "anchor"),
+        ("wrong_count", 27, "expected 27"),
+        ("failed_source", 28, "Both sources must have succeeded"),
+    ],
+)
+def test_baseline_preflight_rejects_invalid_baseline(
+    tmp_path, case, expected_count, error
+):
+    target, archives = _baseline_target(
+        tmp_path, missing_anchor=case == "missing_anchor"
+    )
+
+    if case == "failed_source":
+        replay_warehouse_ledger.set_snapshot_status(
+            target,
+            archives[10],
+            "cleared_permits",
+            "failed",
+            error="test failure",
+        )
+
+    with pytest.raises(RuntimeError, match=error):
+        replay_warehouse_ledger.validate_canonical_baseline(
+            target, "42022028625:1", expected_count
+        )
+
+
+def test_baseline_preflight_rejects_duplicate_snowflake_source_entry():
+    from contextlib import nullcontext
+
+    rows = [
+        (
+            archive.snapshot_id,
+            archive.run_id,
+            archive.run_attempt,
+            archive.extracted_at,
+            source,
+            "succeeded",
+        )
+        for archive in [
+            _archive(f"{run_id}:1", index, run_id=run_id)
+            for index, run_id in enumerate(range(42022028598, 42022028626), start=1)
+        ]
+        for source in ("active_permits", "cleared_permits")
+    ]
+    rows.append(rows[-2])
+
+    class Cursor:
+        def execute(self, query):
+            pass
+
+        def fetchall(self):
+            return rows
+
+        def close(self):
+            pass
+
+    cursor = Cursor()
+
+    class Target:
+        backend = "snowflake"
+        schema = "RAW_STAGE_1_1"
+
+        def _session(self):
+            return nullcontext(
+                type("Connection", (), {"cursor": lambda self: cursor})()
+            )
+
+    with pytest.raises(RuntimeError, match="exactly one entry"):
+        replay_warehouse_ledger.validate_canonical_baseline(
+            Target(), "42022028625:1", 28
+        )

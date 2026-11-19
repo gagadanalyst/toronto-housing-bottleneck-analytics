@@ -7,7 +7,7 @@ from scripts.snowflake_operations import require_snowflake_operations_enabled
 
 def main() -> int:
     require_snowflake_operations_enabled(
-        "Promoting a Snapshot Loader Snowflake candidate"
+        "Validating or promoting a Snapshot Loader Snowflake candidate"
     )
 
     # Import only after authorization so a disabled gate needs no Snowflake connector.

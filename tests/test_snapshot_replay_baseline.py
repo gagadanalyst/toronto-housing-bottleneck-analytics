@@ -94,6 +94,9 @@ def test_snowflake_signature_checks_context_and_aggregates(monkeypatch):
     }
     assert "_DLT_LOAD_ID" in connection.cursor_value.queries[-1]
     assert "UPDATED_AT" in connection.cursor_value.queries[-2]
+    ledger_query = connection.cursor_value.queries[-2].upper()
+    assert "FORMAT_VERSION" not in ledger_query
+    assert "ARCHIVE_SHA256" not in ledger_query
     assert len(connection.cursor_value.queries) == 5
     assert connection.closed
 
@@ -175,6 +178,11 @@ def test_mode1_workflow_fingerprints_production_before_candidate_copy_and_promot
         / "workflows"
         / "snapshot-replay.yml"
     ).read_text(encoding="utf-8")
+
+    assert "options: [rebuild, incremental]\n        default: rebuild" in workflow
+    assert workflow.count("--baseline-snapshot-id") == 2
+    assert workflow.count("--baseline-snapshot-count") == 2
+
     duck_capture = workflow.index(
         "--output data/staging/duckdb/production-baseline.json"
     )
@@ -212,3 +220,46 @@ def test_snowflake_baseline_capture_rejects_disabled_gate(monkeypatch):
             database=None,
             credentials="unused",
         )
+
+
+def test_mode1_dry_run_never_promotes_or_publishes():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "snapshot-replay.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "dry_run:" in workflow
+    assert workflow.count("DRY_RUN: ${{ inputs.dry_run == true }}") == 2
+
+    def step(name):
+        start = workflow.index(f"      - name: {name}")
+        end = workflow.find("\n      - name: ", start + 1)
+        return workflow[start:] if end == -1 else workflow[start:end]
+
+    assert "--dry-run" in step("Prepare the Mode 1 Snowflake candidate clone")
+    assert "--validate-only" in step(
+        "Validate isolated Snowflake candidate without promotion"
+    )
+
+    duckdb_validation = step("Validate complete dbt candidate before promotion")
+    assert 'candidate="${DBT_DUCKDB_PATH:-${REPLAY_DATABASE:-}}"' in duckdb_validation
+
+    assert "env.DRY_RUN != 'true'" in step(
+        "Promote the fully validated DuckDB and dbt candidate"
+    )
+    assert "env.DRY_RUN != 'true'" in step(
+        "Promote the validated Mode 1 Snowflake candidate"
+    )
+    assert "env.DRY_RUN != 'true'" in step(
+        "Publish durable DuckDB, Parquet and dbt assets"
+    )
+    assert "env.DRY_RUN != 'true'" in step("Upload GitHub Pages artifact")
+
+    cleanup = step("Clean up Mode 1 Snowflake dry-run candidate")
+    assert "always()" in cleanup
+    assert "steps.prepare_snowflake_candidate.outcome == 'success'" in cleanup
+    assert "--drop-candidate" in cleanup
+
+    assert "inputs.dry_run != true" in workflow[workflow.index("  deploy-dbt-docs:") :]

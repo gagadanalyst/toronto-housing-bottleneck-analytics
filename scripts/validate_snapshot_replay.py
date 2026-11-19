@@ -30,6 +30,12 @@ IDENTITY_FIELDS = (
     "release_tag",
     "asset_name",
 )
+QUARANTINE_FIELDS = (
+    "quarantined_row_count",
+    "quarantined_bad_row_count",
+    "quarantined_business_key_count",
+    "quarantine_sha256",
+)
 
 
 def _load_json(path: Path, backend: str) -> dict[str, Any]:
@@ -135,6 +141,40 @@ def _validate_report(
         if record.get("status") != "succeeded":
             raise ValueError(
                 f"{backend}/{source_name}/{snapshot_id} ledger status is not succeeded."
+            )
+        if record.get("warehouse_status") != "succeeded":
+            raise ValueError(
+                f"{backend}/{source_name}/{snapshot_id} native warehouse "
+                "ledger status is not succeeded."
+            )
+
+        counts = tuple(record.get(field) for field in QUARANTINE_FIELDS[:3])
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError(
+                f"{backend}/{source_name}/{snapshot_id} has invalid quarantine counts."
+            )
+
+        quarantined, bad_rows, business_keys = counts
+        checksum = record.get("quarantine_sha256")
+
+        if bad_rows > quarantined or business_keys > quarantined:
+            raise ValueError(
+                f"{backend}/{source_name}/{snapshot_id} has inconsistent "
+                "quarantine counts."
+            )
+
+        if quarantined == 0:
+            if checksum is not None:
+                raise ValueError(
+                    f"{backend}/{source_name}/{snapshot_id} has a quarantine "
+                    "hash but no quarantined rows."
+                )
+        elif not isinstance(checksum, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", checksum, re.IGNORECASE
+        ):
+            raise ValueError(
+                f"{backend}/{source_name}/{snapshot_id} has an invalid "
+                "quarantine SHA-256."
             )
         missing = [field for field in IDENTITY_FIELDS if field not in record]
         if missing:
@@ -272,7 +312,7 @@ def _validate_scope(report: dict[str, Any], backend: str) -> dict[str, Any]:
                 f"{backend} rebuild scope does not match its explicit selection."
             )
         expected_basis = (
-            "all_discoverable_complete_v1_v2_release_archives"
+            "versioned_inventory_verified_v1_v2_release_archives"
             if scope == "full"
             else "explicit_rebuild_selection"
         )
@@ -336,6 +376,12 @@ def _parse_scope_date(value: str | None, backend: str, label: str) -> date | Non
         ) from exc
 
 
+def validate_backend_report(report: dict[str, Any], backend: str) -> dict[str, Any]:
+    """Validate one backend's archive, ledger, quarantine, SCD2 and scope evidence."""
+    _validate_report(report, backend)
+    return _validate_scope(report, backend)
+
+
 def validate_reports(
     duckdb_report: dict[str, Any], snowflake_report: dict[str, Any]
 ) -> dict[str, Any]:
@@ -367,6 +413,12 @@ def validate_reports(
                         f"Archive provenance mismatch for {snapshot_id}/"
                         f"{source_name}: {field}."
                     )
+            for field in QUARANTINE_FIELDS:
+                if left[field] != right[field]:
+                    raise ValueError(
+                        f"Quarantine evidence mismatch for {snapshot_id}/"
+                        f"{source_name}: {field}."
+                    )
 
     snapshots = []
     for snapshot_id in sorted(
@@ -390,6 +442,13 @@ def validate_reports(
                 "archive_sha256": active["archive_sha256"],
                 "release_tag": active["release_tag"],
                 "asset_name": active["asset_name"],
+                "quarantine": {
+                    source: {
+                        field: checked["duckdb"][snapshot_id][source][field]
+                        for field in QUARANTINE_FIELDS
+                    }
+                    for source in SOURCE_NAMES
+                },
                 "source_order_timestamps": {
                     source: checked["duckdb"][snapshot_id][source]["order_timestamp"]
                     for source in SOURCE_NAMES
@@ -404,6 +463,7 @@ def validate_reports(
         "archive_provenance": "passed",
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
+        "quarantine_parity": "passed",
         "mode": duck_scope["mode"],
         "history_scope": duck_scope["history_scope"],
         "full_history": duck_scope["full_history"],

@@ -23,6 +23,11 @@ on:
         required: false
         type: boolean
         default: false
+      dry_run:
+        description: Validate Mode 1 candidates without promoting or publishing
+        required: false
+        type: boolean
+        default: false
       from_date:
         description: Rebuild only archives extracted on/after this UTC date (YYYY-MM-DD)
         required: false
@@ -71,6 +76,7 @@ jobs:
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
       REPLAY_MODE: ${{ github.event_name == 'schedule' && 'incremental' || inputs.mode || 'rebuild' }}
+      DRY_RUN: ${{ inputs.dry_run == true }}
       REPLAY_FROM_DATE: ${{ inputs.from_date }}
       REPLAY_TO_DATE: ${{ inputs.to_date }}
       REPLAY_LIMIT: ${{ inputs.limit }}
@@ -90,6 +96,16 @@ jobs:
 
       - name: Install ingestion dependencies
         run: python -m pip install -e ".[dev]"
+
+      - name: Validate Mode 1 dry-run request
+        if: env.DRY_RUN == 'true'
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
+             [ "$REPLAY_MODE" != "incremental" ] || \
+             [ "$CONFIRM_PRODUCTION" = "true" ]; then
+            echo "Dry run requires a manual incremental dispatch with confirm_production=false." >&2
+            exit 1
+          fi
 
       - name: Restore previous rebuild candidate on workflow retry
         if: env.REPLAY_MODE == 'rebuild' && github.run_attempt > 1
@@ -114,20 +130,29 @@ jobs:
         id: prepare_duckdb_candidate
         if: env.REPLAY_MODE == 'incremental'
         run: |
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "Incremental production loading is allowed only from main." >&2
-            exit 1
-          fi
-          if [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ] || \
-             [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
+          if [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
              [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID" ] || \
              [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT" ]; then
-            echo "Incremental production loading is not enabled or its baseline gate is missing." >&2
+            echo "Canonical replay is disabled or its baseline contract is missing." >&2
             exit 1
           fi
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
-            echo "Manual incremental loading requires confirm_production=true." >&2
-            exit 1
+          if [ "$DRY_RUN" = "true" ]; then
+            if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
+               [ "$CONFIRM_PRODUCTION" = "true" ]; then
+              echo "Invalid candidate-only dry-run authorization." >&2
+              exit 1
+            fi
+            echo "Mode 1 candidate-only dry run: promotion and publication are disabled."
+          else
+            if [ "$GITHUB_REF" != "refs/heads/main" ] || \
+               [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ]; then
+              echo "Incremental production loading requires main and TORONTO_SNAPSHOT_LOADER_ENABLED=true." >&2
+              exit 1
+            fi
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
+              echo "Manual incremental loading requires confirm_production=true." >&2
+              exit 1
+            fi
           fi
           mkdir -p data/warehouse data/staging/duckdb
           if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
@@ -205,6 +230,11 @@ jobs:
             --archive-dir "${REPLAY_ARCHIVE_DIR:-data/recovery/snapshot-replay/archives}" \
             --staging-dir "$REPLAY_STAGING_DIR" \
             --output "$REPLAY_OUTPUT")
+          if [ "$REPLAY_MODE" = "incremental" ]; then
+            command+=(--baseline-snapshot-id "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID")
+            command+=(--baseline-snapshot-count "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT")
+          fi
+
           if [ "$REPLAY_MODE" = "rebuild" ]; then
             [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
             [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
@@ -216,7 +246,7 @@ jobs:
           "${command[@]}"
 
       - name: Stage latest approved Parquet snapshots for publication
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         run: |
           python scripts/extract_latest_snapshot_assets.py \
             --summary "$REPLAY_OUTPUT" \
@@ -339,14 +369,19 @@ jobs:
           PY
 
       - name: Validate complete dbt candidate before promotion
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
         run: |
+          candidate="${DBT_DUCKDB_PATH:-${REPLAY_DATABASE:-}}"
+          if [ -z "$candidate" ]; then
+            echo "DuckDB candidate path is missing." >&2
+            exit 1
+          fi
           python scripts/promote_duckdb_candidate.py \
-            --candidate "$DBT_DUCKDB_PATH" \
+            --candidate "$candidate" \
             --validate-only
 
       - name: Verify the production baseline has not changed
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
         run: |
           python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
@@ -354,7 +389,7 @@ jobs:
             --expected data/staging/duckdb/production-baseline.json
 
       - name: Promote the fully validated DuckDB and dbt candidate
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         id: promote_duckdb_candidate
         run: |
           python scripts/promote_duckdb_candidate.py \
@@ -389,13 +424,13 @@ jobs:
           PY
 
       - name: Upload GitHub Pages artifact
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dbt/docs-site
 
       - name: Publish durable DuckDB, Parquet and dbt assets
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         id: publish_assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -404,13 +439,13 @@ jobs:
         run: python scripts/publish_release_assets.py
 
       - name: Preserve immutable DuckDB recovery checkpoint after durable publication
-        if: steps.publish_assets.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && steps.publish_assets.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/publish_duckdb_recovery.py
 
       - name: Preserve quarantine audit if publication fails
-        if: failure() && steps.prepare_duckdb_candidate.outcome == 'success' && steps.publish_assets.outcome != 'success'
+        if: env.DRY_RUN != 'true' && failure() && steps.prepare_duckdb_candidate.outcome == 'success' && steps.publish_assets.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -480,6 +515,7 @@ jobs:
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
       REPLAY_MODE: ${{ github.event_name == 'schedule' && 'incremental' || inputs.mode || 'rebuild' }}
+      DRY_RUN: ${{ inputs.dry_run == true }}
       REPLAY_FROM_DATE: ${{ inputs.from_date }}
       REPLAY_TO_DATE: ${{ inputs.to_date }}
       REPLAY_LIMIT: ${{ inputs.limit }}
@@ -498,17 +534,29 @@ jobs:
             exit 1
           fi
           if [ "$REPLAY_MODE" = "incremental" ]; then
-            if [ "$GITHUB_REF" != "refs/heads/main" ] || \
-               [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ] || \
-               [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
+            if [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
                [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID" ] || \
                [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT" ]; then
-              echo "Snowflake incremental production loading is not enabled or its baseline gate is missing." >&2
+              echo "Snowflake canonical replay is disabled or its baseline contract is missing." >&2
               exit 1
             fi
-            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
-              echo "Manual incremental loading requires confirm_production=true." >&2
-              exit 1
+            if [ "$DRY_RUN" = "true" ]; then
+              if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
+                 [ "$CONFIRM_PRODUCTION" = "true" ]; then
+                echo "Invalid candidate-only dry-run authorization." >&2
+                exit 1
+              fi
+              echo "Mode 1 Snowflake candidate-only dry run; canonical promotion is disabled."
+            else
+              if [ "$GITHUB_REF" != "refs/heads/main" ] || \
+                 [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ]; then
+                echo "Snowflake incremental production loading requires main and TORONTO_SNAPSHOT_LOADER_ENABLED=true." >&2
+                exit 1
+              fi
+              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
+                echo "Manual incremental loading requires confirm_production=true." >&2
+                exit 1
+              fi
             fi
           fi
 
@@ -520,6 +568,16 @@ jobs:
 
       - name: Install Snowflake-enabled ingestion dependencies
         run: python -m pip install -e ".[snowflake,dev]"
+
+      - name: Validate Mode 1 dry-run request
+        if: env.DRY_RUN == 'true'
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
+             [ "$REPLAY_MODE" != "incremental" ] || \
+             [ "$CONFIRM_PRODUCTION" = "true" ]; then
+            echo "Dry run requires a manual incremental dispatch with confirm_production=false." >&2
+            exit 1
+          fi
 
       - name: Restore previous Mode 2 ledger and export state on retry
         if: env.REPLAY_MODE == 'rebuild' && github.run_attempt > 1
@@ -541,6 +599,7 @@ jobs:
           done
 
       - name: Prepare the Mode 1 Snowflake candidate clone
+        id: prepare_snowflake_candidate
         if: env.REPLAY_MODE == 'incremental'
         run: |
           # Capture the canonical baseline before CLONE. A concurrent external
@@ -548,7 +607,11 @@ jobs:
           python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --output data/staging/snowflake/production-baseline.json
-          python scripts/loader_prepare_snowflake_raw.py --github-env "$GITHUB_ENV"
+          prepare_args=(--github-env "$GITHUB_ENV")
+          if [ "$DRY_RUN" = "true" ]; then
+            prepare_args+=(--dry-run)
+          fi
+          python scripts/loader_prepare_snowflake_raw.py "${prepare_args[@]}"
           echo "REPLAY_SCHEMA=RAW_STAGE_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
           echo "REPLAY_LEDGER=data/staging/snowflake/replay-ledger.sqlite" >> "$GITHUB_ENV"
           echo "REPLAY_STAGING_DIR=data/staging/snowflake/snapshot-files" >> "$GITHUB_ENV"
@@ -587,6 +650,10 @@ jobs:
             --archive-dir data/recovery/snapshot-replay/snowflake-archives \
             --staging-dir "$REPLAY_STAGING_DIR" \
             --output "$REPLAY_OUTPUT")
+          if [ "$REPLAY_MODE" = "incremental" ]; then
+            command+=(--baseline-snapshot-id "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID")
+            command+=(--baseline-snapshot-count "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT")
+          fi
           if [ "$REPLAY_MODE" = "rebuild" ]; then
             [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
             [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
@@ -598,21 +665,25 @@ jobs:
           "${command[@]}"
 
       - name: Verify the canonical Snowflake RAW baseline has not changed
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
         run: |
           python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --expected data/staging/snowflake/production-baseline.json
 
+      - name: Validate isolated Snowflake candidate without promotion
+        if: env.DRY_RUN == 'true' && env.REPLAY_MODE == 'incremental' && steps.prepare_snowflake_candidate.outcome == 'success' && steps.replay.outcome == 'success'
+        run: python scripts/loader_promote_snowflake_raw.py --validate-only
+
       - name: Promote the validated Mode 1 Snowflake candidate
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         id: promote_snowflake_candidate
         run: python scripts/loader_promote_snowflake_raw.py
         env:
           SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
 
       - name: Dispatch the isolated Snowflake serving refresh
-        if: steps.promote_snowflake_candidate.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
+        if: env.DRY_RUN != 'true' && steps.promote_snowflake_candidate.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -623,7 +694,11 @@ jobs:
             -f snapshot_loader_run_id="$GITHUB_RUN_ID"
 
       - name: Drop untouched Snowflake candidate when no archives are pending
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives != 'true'
+        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
+        run: python scripts/loader_prepare_snowflake_raw.py --drop-candidate
+
+      - name: Clean up Mode 1 Snowflake dry-run candidate
+        if: always() && env.DRY_RUN == 'true' && env.REPLAY_MODE == 'incremental' && steps.prepare_snowflake_candidate.outcome == 'success'
         run: python scripts/loader_prepare_snowflake_raw.py --drop-candidate
 
       - name: Preserve Mode 2 Snowflake evidence for retries
@@ -719,7 +794,7 @@ jobs:
 
   deploy-dbt-docs:
     name: Deploy dbt documentation to GitHub Pages
-    if: needs.duckdb.outputs.has_pending_archives == 'true' && needs.duckdb.result == 'success'
+    if: needs.duckdb.outputs.has_pending_archives == 'true' && needs.duckdb.result == 'success' && inputs.dry_run != true
     needs: duckdb
     permissions:
       pages: write

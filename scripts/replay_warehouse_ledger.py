@@ -117,6 +117,139 @@ def ensure_ledger(target: Any) -> None:
             cursor.close()
 
 
+def _snapshot_order(snapshot_id: str, entries: list[tuple[Any, ...]]):
+    """Return a consistent chronological identity for one snapshot."""
+    identities = set()
+
+    for row in entries:
+        try:
+            run_id = int(row[1])
+            attempt = int(row[2])
+            timestamp = row[3]
+
+            if not isinstance(timestamp, datetime):
+                timestamp = datetime.fromisoformat(
+                    str(timestamp).replace("Z", "+00:00")
+                )
+
+            if timestamp.tzinfo is None:
+                raise ValueError("Missing timezone.")
+
+            timestamp = timestamp.astimezone(UTC)
+
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Snapshot {snapshot_id} has invalid ledger identity metadata."
+            ) from exc
+
+        identities.add((timestamp, run_id, attempt))
+
+    if len(identities) != 1:
+        raise RuntimeError(f"Snapshot {snapshot_id} has conflicting source identities.")
+
+    timestamp, run_id, attempt = next(iter(identities))
+
+    # V1 snapshot IDs encode the originating run and attempt.
+    parts = snapshot_id.rsplit(":", 1)
+    if (
+        len(parts) == 2
+        and parts[0].isdigit()
+        and parts[1].isdigit()
+        and (int(parts[0]), int(parts[1])) != (run_id, attempt)
+    ):
+        raise RuntimeError(
+            f"Snapshot {snapshot_id} conflicts with its ledger run identity."
+        )
+
+    return timestamp, run_id, attempt, snapshot_id
+
+
+def validate_canonical_baseline(
+    target: Any,
+    baseline_snapshot_id: str,
+    expected_snapshot_count: int,
+) -> dict[str, Any]:
+    """Verify the approved historical prefix before incremental replay."""
+    if (
+        not baseline_snapshot_id
+        or isinstance(expected_snapshot_count, bool)
+        or not isinstance(expected_snapshot_count, int)
+        or expected_snapshot_count < 1
+    ):
+        raise ValueError("Invalid canonical baseline ID or snapshot count.")
+
+    if target.backend == "duckdb":
+        import duckdb
+
+        with duckdb.connect(str(target.database), read_only=True) as connection:
+            rows = connection.execute(
+                f'''SELECT snapshot_id, source_run_id, source_run_attempt,
+                           extraction_started_at_utc, source_name, status
+                    FROM "{target.dataset}".toronto_snapshot_ledger'''
+            ).fetchall()
+    elif target.backend == "snowflake":
+        with target._session() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    f'''SELECT SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
+                               EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS
+                        FROM TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER'''
+                )
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+    else:
+        raise ValueError(f"Unsupported backend: {target.backend!r}.")
+
+    grouped: dict[str, list[tuple[Any, ...]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row[0]), []).append(tuple(row))
+
+    if baseline_snapshot_id not in grouped:
+        raise RuntimeError(
+            f"Canonical baseline anchor {baseline_snapshot_id!r} is missing."
+        )
+
+    orders = {
+        snapshot_id: _snapshot_order(snapshot_id, entries)
+        for snapshot_id, entries in grouped.items()
+    }
+    anchor = orders[baseline_snapshot_id]
+
+    prefix = sorted(order for order in orders.values() if order <= anchor)
+
+    if len(prefix) != expected_snapshot_count or prefix[-1] != anchor:
+        raise RuntimeError(
+            f"Canonical baseline expected {expected_snapshot_count} snapshots "
+            f"through {baseline_snapshot_id}; found {len(prefix)}."
+        )
+
+    expected_sources = set(SOURCE_NAMES)
+
+    for order in prefix:
+        snapshot_id = order[3]
+        entries = grouped[snapshot_id]
+        sources = [str(row[4]).lower() for row in entries]
+
+        if len(entries) != 2 or set(sources) != expected_sources:
+            raise RuntimeError(
+                f"Snapshot {snapshot_id} must have exactly one entry "
+                f"for each source; found {sources}."
+            )
+
+        if any(str(row[5]).lower() != "succeeded" for row in entries):
+            raise RuntimeError(
+                f"Both sources must have succeeded for snapshot {snapshot_id}."
+            )
+
+    return {
+        "status": "passed",
+        "baseline_snapshot_id": baseline_snapshot_id,
+        "snapshot_count": expected_snapshot_count,
+    }
+
+
 def completed_snapshot_ids(target: Any) -> set[str]:
     if target.backend == "duckdb":
         import duckdb
@@ -172,6 +305,52 @@ def snapshot_status(target: Any, snapshot_id: str, source_name: str) -> str | No
             return str(row[0]).lower() if row else None
         finally:
             cursor.close()
+
+
+def snapshot_records(target: Any) -> list[dict[str, Any]]:
+    """Read persisted status and quarantine evidence from the candidate ledger."""
+    if target.backend == "duckdb":
+        import duckdb
+
+        with duckdb.connect(str(target.database), read_only=True) as connection:
+            rows = connection.execute(
+                f"""SELECT snapshot_id, source_name, status,
+                           COALESCE(quarantined_row_count, 0),
+                           COALESCE(quarantined_bad_row_count, 0),
+                           COALESCE(quarantined_business_key_count, 0),
+                           quarantine_sha256
+                    FROM "{target.dataset}".toronto_snapshot_ledger
+                    ORDER BY snapshot_id, source_name"""
+            ).fetchall()
+    else:
+        with target._session() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    f"""SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS,
+                               COALESCE(QUARANTINED_ROW_COUNT, 0),
+                               COALESCE(QUARANTINED_BAD_ROW_COUNT, 0),
+                               COALESCE(QUARANTINED_BUSINESS_KEY_COUNT, 0),
+                               QUARANTINE_SHA256
+                        FROM TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
+                        ORDER BY SNAPSHOT_ID, SOURCE_NAME"""
+                )
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+
+    return [
+        {
+            "snapshot_id": str(row[0]),
+            "source_name": str(row[1]),
+            "status": str(row[2]).lower(),
+            "quarantined_row_count": int(row[3]),
+            "quarantined_bad_row_count": int(row[4]),
+            "quarantined_business_key_count": int(row[5]),
+            "quarantine_sha256": str(row[6]) if row[6] is not None else None,
+        }
+        for row in rows
+    ]
 
 
 def _assert_identity(old: tuple[Any, ...], values: tuple[Any, ...], label: str) -> None:
