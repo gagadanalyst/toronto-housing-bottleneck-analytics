@@ -340,3 +340,42 @@ def test_baseline_preflight_rejects_duplicate_snowflake_source_entry():
         replay_warehouse_ledger.validate_canonical_baseline(
             Target(), "42022028625:1", 28
         )
+
+
+def test_snowflake_replay_order_binds_source_name():
+    from contextlib import nullcontext
+
+    archive = _archive("snapshot-a", 1, run_id=1001)
+    calls = []
+
+    class Cursor:
+        def execute(self, query, parameters):
+            calls.append((query, parameters))
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    cursor = Cursor()
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    class Target:
+        backend = "snowflake"
+        schema = "TORONTO_SNAPSHOT_REPLAY_44499240202"
+
+        def _session(self):
+            return nullcontext(Connection())
+
+    replay_warehouse_ledger.assert_replay_order(
+        Target(), archive, "active_permits"
+    )
+
+    assert len(calls) == 1
+    query, parameters = calls[0]
+    assert "WHERE SOURCE_NAME=%s" in query
+    assert parameters == ("active_permits",)

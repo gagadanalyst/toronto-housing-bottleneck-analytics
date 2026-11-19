@@ -580,7 +580,8 @@ def assert_replay_order(
                     f"SELECT SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT, "
                     f"EXTRACTION_STARTED_AT_UTC, STATUS "
                     f'FROM TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER '
-                    "WHERE SOURCE_NAME=%s"
+                    "WHERE SOURCE_NAME=%s",
+                    (source_name,),
                 )
                 rows = cursor.fetchall()
             finally:
