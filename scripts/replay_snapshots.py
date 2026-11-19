@@ -20,6 +20,12 @@ from scripts.replay_targets import (
     SnowflakeReplayTarget,
     replay_backend,
 )
+from scripts.snapshot_inventory import (
+    list_release_assets,
+    load_inventory,
+    validate_inventory_archives,
+    validate_inventory_assets,
+)
 
 V1_TAG = re.compile(r"toronto-raw-snapshot-archive-\d{4}-\d{2}\Z")
 V2_TAG = re.compile(r"toronto-raw-snapshot-v2-archive-\d{4}-\d{2}\Z")
@@ -273,15 +279,34 @@ def _build_target(args: argparse.Namespace) -> Any:
     raise ValueError(f"Unsupported replay backend: {args.backend!r}.")
 
 
+def _validate_full_history_inventory(args: argparse.Namespace) -> list[SnapshotArchive]:
+    """Verify the complete Release set and every archive before opening a candidate."""
+    inventory = load_inventory(args.inventory, args.repository)
+    assets = list_release_assets(args.repository)
+    validate_inventory_assets(inventory, assets)
+    archives = discover_archives(
+        args.repository,
+        args.archive_dir,
+        exclude_snapshot_ids=set(),
+    )
+    validate_inventory_archives(inventory, archives, args.repository)
+    return archives
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     # Validate scope before loading config, creating the local ledger, connecting
     # to Snowflake, or opening a DuckDB candidate.
     _validate_selection_request(args)
+    # Mode 2 verifies the complete source history before creating or opening a
+    # DuckDB/Snowflake candidate. Incremental Mode 1 keeps its production-ledger path.
+    prevalidated_rebuild_archives = (
+        _validate_full_history_inventory(args) if args.mode == "rebuild" else None
+    )
     source_configs = _source_configs(args.config)
     ledger = ReplayLedger(args.ledger)
 
-    # The target carries the durable warehouse ledger. Open it before archive
-    # discovery so daily Mode 1 downloads only snapshots not already promoted.
+    # Mode 1 opens its target first to skip already-promoted archive IDs.
+    # Full-history Mode 2 has already verified and downloaded every archive above.
     target = _build_target(args)
     target_completed = target.completed_snapshot_ids()
     run_completed = ledger.completed_snapshot_ids(args.backend)
@@ -300,11 +325,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # For rebuilds, discover the full archive sequence first. This keeps
         # --limit N stable across retries: completed items are skipped by the
         # persisted ledgers only after the date range and N-snapshot scope is fixed.
-        archives_discovered = discover_archives(
-            args.repository,
-            args.archive_dir,
-            exclude_snapshot_ids=set(),
-        )
+        if prevalidated_rebuild_archives is None:
+            raise RuntimeError("Full-history inventory verification did not run.")
+        archives_discovered = prevalidated_rebuild_archives
         selected_archives, history_scope = select_archives(
             archives_discovered,
             mode=args.mode,
@@ -330,7 +353,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "history_scope": history_scope,
             "full_history": history_scope == "full",
             "history_scope_basis": (
-                "all_discoverable_complete_v1_v2_release_archives"
+                "versioned_inventory_verified_v1_v2_release_archives"
                 if history_scope == "full"
                 else (
                     "pending_incremental_backlog"
@@ -409,6 +432,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=("duckdb", "snowflake"), required=True)
     parser.add_argument(
         "--repository", default="gagadanalyst/toronto-housing-bottleneck-analytics"
+    )
+    parser.add_argument(
+        "--inventory",
+        type=Path,
+        default=Path("snapshot_inventory.json"),
+        help="Versioned inventory required for every full-history rebuild",
     )
     parser.add_argument("--config", type=Path, default=Path("open_data_config.yml"))
     parser.add_argument(

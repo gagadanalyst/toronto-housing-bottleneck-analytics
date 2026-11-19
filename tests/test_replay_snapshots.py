@@ -334,6 +334,13 @@ def test_rebuild_discovers_all_archives_before_selecting_scope(tmp_path, monkeyp
     monkeypatch.setattr(replay_snapshots, "ReplayLedger", lambda path: local_ledger)
     monkeypatch.setattr(replay_snapshots, "_build_target", lambda args: target)
     monkeypatch.setattr(replay_snapshots, "discover_archives", fake_discover)
+    monkeypatch.setattr(
+        replay_snapshots,
+        "_validate_full_history_inventory",
+        lambda args: fake_discover(
+            args.repository, args.archive_dir, exclude_snapshot_ids=set()
+        ),
+    )
     monkeypatch.setattr(replay_snapshots, "replay_backend", fake_replay_backend)
 
     args = replay_snapshots._parser().parse_args(
@@ -403,3 +410,35 @@ def test_rebuild_last_n_selects_newest_archives_within_date_window():
     )
     assert scope == "partial"
     assert [item.snapshot_id for item in selected] == ["in-window-two"]
+
+
+def test_rebuild_inventory_gate_runs_before_candidate_open(tmp_path, monkeypatch):
+    import pytest
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("candidate/config/ledger opened before inventory check")
+
+    def reject_inventory(args):
+        raise ValueError("inventory does not match Release assets")
+
+    monkeypatch.setattr(
+        replay_snapshots, "_validate_full_history_inventory", reject_inventory
+    )
+    monkeypatch.setattr(replay_snapshots, "_source_configs", forbidden)
+    monkeypatch.setattr(replay_snapshots, "ReplayLedger", forbidden)
+    monkeypatch.setattr(replay_snapshots, "_build_target", forbidden)
+
+    args = replay_snapshots._parser().parse_args(
+        [
+            "--mode",
+            "rebuild",
+            "--backend",
+            "duckdb",
+            "--ledger",
+            str(tmp_path / "ledger.sqlite"),
+            "--output",
+            str(tmp_path / "summary.json"),
+        ]
+    )
+    with pytest.raises(ValueError, match="inventory does not match"):
+        replay_snapshots.run(args)
