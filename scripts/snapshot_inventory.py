@@ -519,7 +519,18 @@ def _archive_location(path: Path) -> tuple[str, str]:
         if version == 1
         else "toronto-raw-snapshot-v2-archive-"
     )
-    return f"{prefix}{started:%Y-%m}", path.name
+
+    if version == 1:
+        asset_name = path.name
+    else:
+        snapshot_id = bundle.get("snapshot_id")
+        if not isinstance(snapshot_id, str):
+            raise ValueError("V2 archive snapshot ID is missing or invalid.")
+        asset_name = f"toronto-raw-snapshot-v2-bundle-{snapshot_id}.zip"
+        if _asset_id(asset_name) != snapshot_id:
+            raise ValueError("V2 archive snapshot ID is invalid.")
+
+    return f"{prefix}{started:%Y-%m}", asset_name
 
 
 def append_published_archive(

@@ -193,7 +193,7 @@ def test_append_is_idempotent_and_rejects_other_unindexed_assets(tmp_path, monke
         tmp_path / "baseline.zip", version=1, day=1, run_id="100", snapshot_id="100:1"
     )
     new_archive = _archive(
-        tmp_path / "toronto-raw-snapshot-v2-bundle-new-snapshot.zip",
+        tmp_path / "new-snapshot.zip",
         version=2,
         day=2,
         run_id="200",
@@ -211,10 +211,14 @@ def test_append_is_idempotent_and_rejects_other_unindexed_assets(tmp_path, monke
     new_archive.archive_sha256 = hashlib.sha256(
         new_archive.path.read_bytes()
     ).hexdigest()
-    # The appender obtains the fully inspected archive from the reader.
-    monkeypatch.setattr(
-        replay_archive, "inspect_archive", lambda *args, **kwargs: new_archive
-    )
+    # The local extraction filename differs from the canonical Release asset name.
+    inspected_asset_names: list[str] = []
+
+    def fake_inspect_archive(*args, **kwargs):
+        inspected_asset_names.append(args[2])
+        return new_archive
+
+    monkeypatch.setattr(replay_archive, "inspect_archive", fake_inspect_archive)
 
     baseline_inventory = inventory.build_inventory("owner/repo", [baseline])
     inventory_path = tmp_path / "snapshot_inventory.json"
@@ -232,6 +236,7 @@ def test_append_is_idempotent_and_rejects_other_unindexed_assets(tmp_path, monke
     assert not inventory.append_published_archive(
         new_archive.path, inventory_path, "owner/repo"
     )
+    assert inspected_asset_names == [new_archive.asset_name] * 2
     assert len(inventory.load_inventory(inventory_path, "owner/repo")["archives"]) == 2
 
     def extra_assets(_repo):
