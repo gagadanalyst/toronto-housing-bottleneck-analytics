@@ -115,7 +115,7 @@ jobs:
                   "The selected source workflow attempt does not match its evidence artifact."
               )
           if (
-              run.get("name") != "Snapshot Loader (Incremental and Rebuild)"
+              run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
               or run.get("status") != "completed"
               or run.get("conclusion") != "success"
               or run.get("headBranch") != "main"
@@ -219,24 +219,16 @@ jobs:
           test -s "$root/snowflake/exports/raw_cleared_permits_history.csv.gz"
           test -s "$root/joint-validation.json"
 
-      - name: Verify the production baselines have not changed since reconstruction began
+      - name: Verify the authoritative DuckDB production baseline has not changed since reconstruction began
         run: |
           mkdir -p data/warehouse
-          if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
-            echo "Restored current immutable DuckDB production checkpoint."
-          else
-            status=$?
-            if [ "$status" -ne 2 ]; then
-              echo "Could not restore current DuckDB checkpoint; refusing fallback." >&2
-              exit "$status"
-            fi
-            gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
-              --pattern toronto.duckdb --dir data/warehouse
-          fi
+          python -m scripts.restore_duckdb_production \
+            --output data/warehouse/toronto.duckdb
           python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
+
       - name: Verify unchanged Snowflake production baseline
         if: steps.policy.outputs.snowflake_enabled == 'true'
         env:
@@ -395,20 +387,16 @@ jobs:
             -C data/recovery/snapshot-replay
           test -s data/recovery/snapshot-replay/promotion-authorized.json
           test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
-      - name: Restore and recheck the current DuckDB production baseline
+      - name: Restore and recheck the authoritative DuckDB production baseline
         run: |
           mkdir -p data/warehouse
-          if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
-            echo "Restored current immutable DuckDB production checkpoint."
-          else
-            status=$?
-            if [ "$status" -ne 2 ]; then exit "$status"; fi
-            gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
-              --pattern toronto.duckdb --dir data/warehouse
-          fi
+          python -m scripts.restore_duckdb_production \
+            --output data/warehouse/toronto.duckdb
           python -m scripts.snapshot_replay_baseline \
-            --backend duckdb --database data/warehouse/toronto.duckdb \
+            --backend duckdb \
+            --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
+
       - name: Prepare isolated dbt candidate from the rebuilt DuckDB history
         run: |
           mkdir -p data/warehouse/dbt-ci

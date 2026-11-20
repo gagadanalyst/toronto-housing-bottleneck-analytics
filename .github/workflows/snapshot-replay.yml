@@ -1,33 +1,14 @@
-name: Snapshot Loader (Incremental and Rebuild)
+name: Snapshot Loader (Full-History Rebuild and Parity)
 
 on:
-  schedule:
-    # Run after the V2 archive extraction window, without changing extraction itself.
-    - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
-      mode:
-        description: Incremental production update (staged) or historical rebuild (isolated)
-        required: true
-        type: choice
-        options: [rebuild, incremental]
-        default: rebuild
       backends:
         description: Backends to run
         required: true
         type: choice
         options: [both, duckdb, snowflake]
         default: both
-      confirm_production:
-        description: Explicitly authorize a staged incremental production promotion
-        required: false
-        type: boolean
-        default: false
-      dry_run:
-        description: Validate Mode 1 candidates without promoting or publishing
-        required: false
-        type: boolean
-        default: false
       from_date:
         description: Rebuild only archives extracted on/after this UTC date (YYYY-MM-DD)
         required: false
@@ -58,44 +39,32 @@ permissions:
   contents: read
   actions: read
 
-# Keep production updates serialized, but do not let an isolated Mode 2
-# reconstruction hold the production-publication lock while it replays history.
-# Its later promotion workflow acquires the shared publication lock and rechecks
-# the production baseline before touching either canonical backend.
+# Mode 2 reconstruction is isolated. The explicit promotion workflow acquires
+# the shared publication lock and rechecks canonical baselines before promotion.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'rebuild' && 'toronto-historical-scd2-replay-and-parity' || 'toronto-housing-data-publication' }}
+  group: toronto-historical-scd2-replay-and-parity
   cancel-in-progress: false
   queue: max
 
 jobs:
   duckdb:
-    outputs:
-      has_pending_archives: ${{ steps.replay.outputs.has_pending_archives }}
     if: >-
-      (github.event_name == 'schedule' && vars.TORONTO_SNAPSHOT_LOADER_ENABLED == 'true') ||
-      (github.event_name == 'workflow_dispatch' &&
-       inputs.compare_run_id == '' &&
-       (inputs.backends == 'both' || inputs.backends == 'duckdb'))
-    name: Load DuckDB (${{ github.event_name == 'schedule' && 'incremental' || inputs.mode }})
+      github.event_name == 'workflow_dispatch' &&
+      inputs.compare_run_id == '' &&
+      (inputs.backends == 'both' || inputs.backends == 'duckdb')
+    name: Load DuckDB (rebuild)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
-      contents: write
+      contents: read
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
-      REPLAY_MODE: ${{ github.event_name == 'schedule' && 'incremental' || inputs.mode || 'rebuild' }}
-      DRY_RUN: ${{ inputs.dry_run == true }}
       REPLAY_FROM_DATE: ${{ inputs.from_date }}
       REPLAY_TO_DATE: ${{ inputs.to_date }}
       REPLAY_LIMIT: ${{ inputs.limit }}
-      TORONTO_SNAPSHOT_LOADER_ENABLED: ${{ vars.TORONTO_SNAPSHOT_LOADER_ENABLED }}
-      TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
-      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID }}
-      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT }}
-      CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,18 +77,7 @@ jobs:
       - name: Install ingestion dependencies
         run: python -m pip install -e ".[dev]"
 
-      - name: Validate Mode 1 dry-run request
-        if: env.DRY_RUN == 'true'
-        run: |
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
-             [ "$REPLAY_MODE" != "incremental" ] || \
-             [ "$CONFIRM_PRODUCTION" = "true" ]; then
-            echo "Dry run requires a manual incremental dispatch with confirm_production=false." >&2
-            exit 1
-          fi
-
       - name: Restore previous rebuild candidate on workflow retry
-        if: env.REPLAY_MODE == 'rebuild' && github.run_attempt > 1
         run: |
           for attempt in $(seq $((GITHUB_RUN_ATTEMPT - 1)) -1 1); do
             temp="$(mktemp -d)"
@@ -137,67 +95,7 @@ jobs:
             rm -rf "$temp"
           done
 
-      - name: Prepare the Mode 1 DuckDB candidate from production
-        id: prepare_duckdb_candidate
-        if: env.REPLAY_MODE == 'incremental'
-        run: |
-          if [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
-             [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID" ] || \
-             [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT" ]; then
-            echo "Canonical replay is disabled or its baseline contract is missing." >&2
-            exit 1
-          fi
-          if [ "$DRY_RUN" = "true" ]; then
-            if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
-               [ "$CONFIRM_PRODUCTION" = "true" ]; then
-              echo "Invalid candidate-only dry-run authorization." >&2
-              exit 1
-            fi
-            echo "Mode 1 candidate-only dry run: promotion and publication are disabled."
-          else
-            if [ "$GITHUB_REF" != "refs/heads/main" ] || \
-               [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ]; then
-              echo "Incremental production loading requires main and TORONTO_SNAPSHOT_LOADER_ENABLED=true." >&2
-              exit 1
-            fi
-            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
-              echo "Manual incremental loading requires confirm_production=true." >&2
-              exit 1
-            fi
-          fi
-          mkdir -p data/warehouse data/staging/duckdb
-          if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
-            echo "Restored the latest verified immutable recovery checkpoint."
-          else
-            status=$?
-            if [ "$status" -ne 2 ]; then
-              echo "Recovery checkpoint restoration failed; refusing fallback." >&2
-              exit "$status"
-            fi
-            gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
-              --pattern toronto.duckdb --dir data/warehouse
-          fi
-          # Capture before candidate copy. If production changes between these
-          # operations, the pre-promotion comparison rejects the candidate.
-          python -m scripts.snapshot_replay_baseline \
-            --backend duckdb \
-            --database data/warehouse/toronto.duckdb \
-            --output data/staging/duckdb/production-baseline.json
-          candidate="data/staging/duckdb/candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.duckdb"
-          audit="data/staging/duckdb/quarantine-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.duckdb"
-          python scripts/prepare_duckdb_candidate.py \
-            --source data/warehouse/toronto.duckdb \
-            --candidate "$candidate" \
-            --audit-copy "$audit" \
-            --github-env "$GITHUB_ENV"
-          echo "REPLAY_DATABASE=$candidate" >> "$GITHUB_ENV"
-          echo "REPLAY_ARCHIVE_DIR=data/recovery/snapshot-replay/archives" >> "$GITHUB_ENV"
-          echo "REPLAY_LEDGER=data/staging/duckdb/replay-ledger.sqlite" >> "$GITHUB_ENV"
-          echo "REPLAY_STAGING_DIR=data/staging/duckdb/snapshot-files" >> "$GITHUB_ENV"
-          echo "REPLAY_OUTPUT=data/staging/duckdb/replay-summary.json" >> "$GITHUB_ENV"
-
       - name: Select the Mode 2 isolated DuckDB rebuild target
-        if: env.REPLAY_MODE == 'rebuild'
         run: |
           mkdir -p data/recovery/snapshot-replay/duckdb
           echo "REPLAY_DATABASE=data/recovery/snapshot-replay/duckdb/toronto-replay-${GITHUB_RUN_ID}.duckdb" >> "$GITHUB_ENV"
@@ -205,23 +103,13 @@ jobs:
           echo "REPLAY_STAGING_DIR=data/recovery/snapshot-replay/duckdb/staging" >> "$GITHUB_ENV"
           echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/duckdb-summary.json" >> "$GITHUB_ENV"
 
-      - name: Capture the current DuckDB baseline before Mode 2 reconstruction
-        if: env.REPLAY_MODE == 'rebuild'
+      - name: Capture the authoritative DuckDB baseline before Mode 2 reconstruction
         run: |
           mkdir -p data/warehouse data/recovery/snapshot-replay
           baseline=data/recovery/snapshot-replay/duckdb-production-baseline.json
           if [ ! -s "$baseline" ]; then
-            if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
-              echo "Restored current DuckDB production checkpoint for the rebuild baseline."
-            else
-              status=$?
-              if [ "$status" -ne 2 ]; then
-                echo "DuckDB production baseline restoration failed; refusing fallback." >&2
-                exit "$status"
-              fi
-              gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
-                --pattern toronto.duckdb --dir data/warehouse
-            fi
+            python -m scripts.restore_duckdb_production \
+              --output data/warehouse/toronto.duckdb
             python -m scripts.snapshot_replay_baseline \
               --backend duckdb \
               --database data/warehouse/toronto.duckdb \
@@ -234,259 +122,20 @@ jobs:
         id: replay
         run: |
           command=(python -m scripts.replay_snapshots \
-            --mode "$REPLAY_MODE" \
+            --mode rebuild \
             --backend duckdb \
             --ledger "$REPLAY_LEDGER" \
             --database "$REPLAY_DATABASE" \
-            --archive-dir "${REPLAY_ARCHIVE_DIR:-data/recovery/snapshot-replay/archives}" \
+            --archive-dir data/recovery/snapshot-replay/archives \
             --staging-dir "$REPLAY_STAGING_DIR" \
             --output "$REPLAY_OUTPUT")
-          if [ "$REPLAY_MODE" = "incremental" ]; then
-            command+=(--baseline-snapshot-id "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID")
-            command+=(--baseline-snapshot-count "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT")
-          fi
-
-          if [ "$REPLAY_MODE" = "rebuild" ]; then
-            [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
-            [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
-            [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
-          elif [ -n "$REPLAY_FROM_DATE$REPLAY_TO_DATE$REPLAY_LIMIT" ]; then
-            echo "Date and N-snapshot selection are available only in rebuild mode." >&2
-            exit 1
-          fi
+          [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
+          [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
+          [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
           "${command[@]}"
 
-      - name: Stage latest approved Parquet snapshots for publication
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        run: |
-          python scripts/extract_latest_snapshot_assets.py \
-            --summary "$REPLAY_OUTPUT" \
-            --archive-dir "${REPLAY_ARCHIVE_DIR:-data/recovery/snapshot-replay/archives}" \
-            --output-dir data-assets \
-            --repository "$GITHUB_REPOSITORY"
-
-      - name: Create isolated dbt environment for the Mode 1 candidate
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        run: |
-          python -m venv "$RUNNER_TEMP/dbt-venv"
-          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
-          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
-
-      - name: Prepare fresh dbt candidate copy
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        run: |
-          mkdir -p data/warehouse/dbt-ci
-          cp "$REPLAY_DATABASE" data/warehouse/dbt-ci/toronto.duckdb
-          echo "DBT_DUCKDB_PATH=${GITHUB_WORKSPACE}/data/warehouse/dbt-ci/toronto.duckdb" >> "$GITHUB_ENV"
-          echo "TORONTO_DBT_AS_OF_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
-
-      - name: Configure dbt profile
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: cp profiles.yml.example profiles.yml
-
-      - name: Install dbt package dependencies
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
-
-      - name: Check dbt connection and project
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: |
-          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
-          "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
-
-      - name: Check dbt source freshness
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: |
-          "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
-
-      - name: Build dbt models and run tests on the candidate
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: |
-          "$RUNNER_TEMP/dbt-venv/bin/dbt" build \
-            --profiles-dir . \
-            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
-
-      - name: Generate dbt documentation for publication
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        working-directory: dbt
-        run: |
-          "$RUNNER_TEMP/dbt-venv/bin/dbt" docs generate --profiles-dir . --output-dir docs-site
-
-      - name: Inject Google Analytics into generated dbt docs
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          measurement_id = "G-7F7JW7LG51"
-          script_url = "https://www.googletagmanager.com/gtag/js?id=" + measurement_id
-          index = Path("dbt/docs-site/index.html")
-          html = index.read_text(encoding="utf-8")
-          if script_url not in html:
-              if html.count("</head>") != 1:
-                  raise SystemExit("Expected one </head> in generated dbt docs")
-              tag = (
-                  '    <!-- Google tag (gtag.js) -->\n'
-                  f'    <script async src="{script_url}"></script>\n'
-                  '    <script>\n'
-                  '      window.dataLayer = window.dataLayer || [];\n'
-                  '      function gtag() { window.dataLayer.push(arguments); }\n'
-                  '      gtag("js", new Date());\n'
-                  f'      gtag("config", "{measurement_id}");\n'
-                  '    </script>\n'
-              )
-              html = html.replace("</head>", tag + "</head>", 1)
-              index.write_text(html, encoding="utf-8")
-          html = index.read_text(encoding="utf-8")
-          if script_url not in html or f'gtag("config", "{measurement_id}")' not in html:
-              raise SystemExit("Google Analytics tag injection failed")
-          PY
-
-      - name: Record successful dashboard refresh metadata
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-          WORKFLOW_RUN_ID: ${{ github.run_id }}
-        run: |
-          python - <<'PY'
-          from datetime import datetime, timezone
-          import os
-          import duckdb
-          path = os.environ["DBT_DUCKDB_PATH"]
-          with duckdb.connect(path) as connection:
-              connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
-              connection.execute("""CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
-                  refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
-                  last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
-                  source_commit VARCHAR NOT NULL,
-                  workflow_run_id VARCHAR NOT NULL
-              )""")
-              connection.execute("DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1")
-              connection.execute(
-                  "INSERT INTO metadata.dashboard_refresh_metadata "
-                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id) "
-                  "VALUES (?, ?, ?, ?)",
-                  (1, datetime.now(timezone.utc), os.environ["SOURCE_COMMIT"], os.environ["WORKFLOW_RUN_ID"]),
-              )
-              row = connection.execute(
-                  "SELECT last_successful_refresh_utc FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1"
-              ).fetchone()
-              if not row or row[0] is None:
-                  raise RuntimeError("DuckDB dashboard refresh metadata did not persist")
-          PY
-
-      - name: Validate complete dbt candidate before promotion
-        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
-        run: |
-          candidate="${DBT_DUCKDB_PATH:-${REPLAY_DATABASE:-}}"
-          if [ -z "$candidate" ]; then
-            echo "DuckDB candidate path is missing." >&2
-            exit 1
-          fi
-          python scripts/promote_duckdb_candidate.py \
-            --candidate "$candidate" \
-            --validate-only
-
-      - name: Verify the production baseline has not changed
-        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
-        run: |
-          python -m scripts.snapshot_replay_baseline \
-            --backend duckdb \
-            --database data/warehouse/toronto.duckdb \
-            --expected data/staging/duckdb/production-baseline.json
-
-      - name: Promote the fully validated DuckDB and dbt candidate
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        id: promote_duckdb_candidate
-        run: |
-          python scripts/promote_duckdb_candidate.py \
-            --candidate "$DBT_DUCKDB_PATH" \
-            --production data/warehouse/toronto.duckdb
-          sha256sum data/warehouse/toronto.duckdb
-
-      - name: Package dbt documentation archive
-        if: env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        run: |
-          test -s dbt/docs-site/index.html
-          mkdir -p data-assets/dbt-docs
-          cp -R dbt/docs-site/. data-assets/dbt-docs/
-          cat > data-assets/dbt-docs/README.txt <<'EOF'
-          Toronto Housing Analytics — dbt documentation
-          Extract toronto-dbt-docs.zip, then run `python3 -m http.server 8000` in that directory and open http://localhost:8000/.
-          EOF
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-          source = Path("data-assets/dbt-docs")
-          archive = Path("data-assets/toronto-dbt-docs.zip")
-          files = sorted(path for path in source.rglob("*") if path.is_file())
-          if not any(path.name == "index.html" for path in files):
-              raise SystemExit("Generated dbt docs are missing index.html")
-          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
-              for path in files:
-                  zipped.write(path, path.relative_to(source).as_posix())
-          with ZipFile(archive) as zipped:
-              if zipped.testzip() is not None or "index.html" not in zipped.namelist():
-                  raise SystemExit("Generated dbt docs ZIP failed verification")
-          PY
-
-      - name: Upload GitHub Pages artifact
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: dbt/docs-site
-
-      - name: Publish durable DuckDB, Parquet and dbt assets
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        id: publish_assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
-          WAREHOUSE_LATEST_TARGET_SHA: ${{ github.sha }}
-        run: python scripts/publish_release_assets.py
-
-      - name: Preserve immutable DuckDB recovery checkpoint after durable publication
-        if: env.DRY_RUN != 'true' && steps.publish_assets.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/publish_duckdb_recovery.py
-
-      - name: Preserve quarantine audit if publication fails
-        if: env.DRY_RUN != 'true' && failure() && steps.prepare_duckdb_candidate.outcome == 'success' && steps.publish_assets.outcome != 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ -s "$TORONTO_QUARANTINE_AUDIT_DUCKDB_PATH" ]; then
-            python scripts/publish_duckdb_quarantine_audit.py
-          else
-            echo "No quarantine audit database was prepared."
-          fi
-
-      - name: Retain recovery backup if rolling Release rollback fails
-        if: failure() && steps.publish_assets.outcome == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: warehouse-latest-recovery-${{ github.run_id }}
-          path: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}/last-known-good/
-          if-no-files-found: ignore
-          compression-level: 0
-          retention-days: 30
-
-      - name: Upload dbt logs on failure
-        if: failure() && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: snapshot-loader-dbt-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dbt/logs/
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Preserve Mode 2 rebuild state for retries
-        if: always() && env.REPLAY_MODE == 'rebuild'
+        if: always()
         run: |
           mkdir -p data/recovery/snapshot-replay
           tar -czf "$RUNNER_TEMP/state.tar.gz" \
@@ -500,7 +149,6 @@ jobs:
           name: snapshot-loader-duckdb-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/state.tar.gz
-            data/staging/duckdb/replay-summary.json
             data/recovery/snapshot-replay/duckdb-summary.json
           if-no-files-found: warn
           compression-level: 0
@@ -508,35 +156,25 @@ jobs:
 
   snowflake:
     if: >-
-      (github.event_name == 'schedule' &&
-       vars.TORONTO_SNAPSHOT_LOADER_ENABLED == 'true' &&
-       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true') ||
-      (github.event_name == 'workflow_dispatch' &&
-       inputs.compare_run_id == '' &&
-       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
-       (inputs.backends == 'both' || inputs.backends == 'snowflake'))
-    name: Load Snowflake (${{ github.event_name == 'schedule' && 'incremental' || inputs.mode }})
+      github.event_name == 'workflow_dispatch' &&
+      inputs.compare_run_id == '' &&
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+      (inputs.backends == 'both' || inputs.backends == 'snowflake')
+    name: Load Snowflake (rebuild)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
       contents: read
-      actions: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DO_NOT_TRACK: "1"
-      REPLAY_MODE: ${{ github.event_name == 'schedule' && 'incremental' || inputs.mode || 'rebuild' }}
-      DRY_RUN: ${{ inputs.dry_run == true }}
       REPLAY_FROM_DATE: ${{ inputs.from_date }}
       REPLAY_TO_DATE: ${{ inputs.to_date }}
       REPLAY_LIMIT: ${{ inputs.limit }}
-      TORONTO_SNAPSHOT_LOADER_ENABLED: ${{ vars.TORONTO_SNAPSHOT_LOADER_ENABLED }}
-      TORONTO_CANONICAL_REPLAY_ENABLED: ${{ vars.TORONTO_CANONICAL_REPLAY_ENABLED }}
-      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID }}
-      TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT: ${{ vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT }}
       SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
-      CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
 
     steps:
       - name: Require Snowflake operations to be enabled
@@ -544,32 +182,6 @@ jobs:
           if [ "$SNOWFLAKE_OPERATIONS_ENABLED" != "true" ]; then
             echo "Snowflake loading was requested, but SNOWFLAKE_OPERATIONS_ENABLED is not true." >&2
             exit 1
-          fi
-          if [ "$REPLAY_MODE" = "incremental" ]; then
-            if [ "$TORONTO_CANONICAL_REPLAY_ENABLED" != "true" ] || \
-               [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID" ] || \
-               [ -z "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT" ]; then
-              echo "Snowflake canonical replay is disabled or its baseline contract is missing." >&2
-              exit 1
-            fi
-            if [ "$DRY_RUN" = "true" ]; then
-              if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
-                 [ "$CONFIRM_PRODUCTION" = "true" ]; then
-                echo "Invalid candidate-only dry-run authorization." >&2
-                exit 1
-              fi
-              echo "Mode 1 Snowflake candidate-only dry run; canonical promotion is disabled."
-            else
-              if [ "$GITHUB_REF" != "refs/heads/main" ] || \
-                 [ "$TORONTO_SNAPSHOT_LOADER_ENABLED" != "true" ]; then
-                echo "Snowflake incremental production loading requires main and TORONTO_SNAPSHOT_LOADER_ENABLED=true." >&2
-                exit 1
-              fi
-              if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM_PRODUCTION" != "true" ]; then
-                echo "Manual incremental loading requires confirm_production=true." >&2
-                exit 1
-              fi
-            fi
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -581,18 +193,7 @@ jobs:
       - name: Install Snowflake-enabled ingestion dependencies
         run: python -m pip install -e ".[snowflake,dev]"
 
-      - name: Validate Mode 1 dry-run request
-        if: env.DRY_RUN == 'true'
-        run: |
-          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || \
-             [ "$REPLAY_MODE" != "incremental" ] || \
-             [ "$CONFIRM_PRODUCTION" = "true" ]; then
-            echo "Dry run requires a manual incremental dispatch with confirm_production=false." >&2
-            exit 1
-          fi
-
       - name: Restore previous Mode 2 ledger and export state on retry
-        if: env.REPLAY_MODE == 'rebuild' && github.run_attempt > 1
         run: |
           for attempt in $(seq $((GITHUB_RUN_ATTEMPT - 1)) -1 1); do
             temp="$(mktemp -d)"
@@ -610,27 +211,7 @@ jobs:
             rm -rf "$temp"
           done
 
-      - name: Prepare the Mode 1 Snowflake candidate clone
-        id: prepare_snowflake_candidate
-        if: env.REPLAY_MODE == 'incremental'
-        run: |
-          # Capture the canonical baseline before CLONE. A concurrent external
-          # mutation between capture and clone will be caught before promotion.
-          python -m scripts.snapshot_replay_baseline \
-            --backend snowflake \
-            --output data/staging/snowflake/production-baseline.json
-          prepare_args=(--github-env "$GITHUB_ENV")
-          if [ "$DRY_RUN" = "true" ]; then
-            prepare_args+=(--dry-run)
-          fi
-          python scripts/loader_prepare_snowflake_raw.py "${prepare_args[@]}"
-          echo "REPLAY_SCHEMA=RAW_STAGE_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
-          echo "REPLAY_LEDGER=data/staging/snowflake/replay-ledger.sqlite" >> "$GITHUB_ENV"
-          echo "REPLAY_STAGING_DIR=data/staging/snowflake/snapshot-files" >> "$GITHUB_ENV"
-          echo "REPLAY_OUTPUT=data/staging/snowflake/replay-summary.json" >> "$GITHUB_ENV"
-
       - name: Select the Mode 2 isolated Snowflake rebuild schema
-        if: env.REPLAY_MODE == 'rebuild'
         run: |
           mkdir -p data/recovery/snapshot-replay/snowflake
           echo "REPLAY_SCHEMA=TORONTO_SNAPSHOT_REPLAY_${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
@@ -639,7 +220,6 @@ jobs:
           echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/snowflake-summary.json" >> "$GITHUB_ENV"
 
       - name: Capture the current Snowflake RAW baseline before Mode 2 reconstruction
-        if: env.REPLAY_MODE == 'rebuild'
         run: |
           mkdir -p data/recovery/snapshot-replay
           baseline=data/recovery/snapshot-replay/snowflake-production-baseline.json
@@ -655,66 +235,20 @@ jobs:
         id: replay
         run: |
           command=(python -m scripts.replay_snapshots \
-            --mode "$REPLAY_MODE" \
+            --mode rebuild \
             --backend snowflake \
             --schema "$REPLAY_SCHEMA" \
             --ledger "$REPLAY_LEDGER" \
             --archive-dir data/recovery/snapshot-replay/snowflake-archives \
             --staging-dir "$REPLAY_STAGING_DIR" \
             --output "$REPLAY_OUTPUT")
-          if [ "$REPLAY_MODE" = "incremental" ]; then
-            command+=(--baseline-snapshot-id "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID")
-            command+=(--baseline-snapshot-count "$TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT")
-          fi
-          if [ "$REPLAY_MODE" = "rebuild" ]; then
-            [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
-            [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
-            [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
-          elif [ -n "$REPLAY_FROM_DATE$REPLAY_TO_DATE$REPLAY_LIMIT" ]; then
-            echo "Date and N-snapshot selection are available only in rebuild mode." >&2
-            exit 1
-          fi
+          [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
+          [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
+          [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
           "${command[@]}"
 
-      - name: Verify the canonical Snowflake RAW baseline has not changed
-        if: env.REPLAY_MODE == 'incremental' && (steps.replay.outputs.has_pending_archives == 'true' || env.DRY_RUN == 'true')
-        run: |
-          python -m scripts.snapshot_replay_baseline \
-            --backend snowflake \
-            --expected data/staging/snowflake/production-baseline.json
-
-      - name: Validate isolated Snowflake candidate without promotion
-        if: env.DRY_RUN == 'true' && env.REPLAY_MODE == 'incremental' && steps.prepare_snowflake_candidate.outcome == 'success' && steps.replay.outcome == 'success'
-        run: python scripts/loader_promote_snowflake_raw.py --validate-only
-
-      - name: Promote the validated Mode 1 Snowflake candidate
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        id: promote_snowflake_candidate
-        run: python scripts/loader_promote_snowflake_raw.py
-        env:
-          SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-
-      - name: Dispatch the isolated Snowflake serving refresh
-        if: env.DRY_RUN != 'true' && steps.promote_snowflake_candidate.outcome == 'success' && env.REPLAY_MODE == 'incremental' && steps.replay.outputs.has_pending_archives == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run snowflake-serving-schema.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f confirm_serving_schema=true \
-            -f snapshot_loader_run_id="$GITHUB_RUN_ID"
-
-      - name: Drop untouched Snowflake candidate when no archives are pending
-        if: env.DRY_RUN != 'true' && env.REPLAY_MODE == 'incremental' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
-        run: python scripts/loader_prepare_snowflake_raw.py --drop-candidate
-
-      - name: Clean up Mode 1 Snowflake dry-run candidate
-        if: always() && env.DRY_RUN == 'true' && env.REPLAY_MODE == 'incremental' && steps.prepare_snowflake_candidate.outcome == 'success'
-        run: python scripts/loader_prepare_snowflake_raw.py --drop-candidate
-
       - name: Preserve Mode 2 Snowflake evidence for retries
-        if: always() && env.REPLAY_MODE == 'rebuild'
+        if: always()
         run: |
           mkdir -p data/recovery/snapshot-replay
           tar -czf "$RUNNER_TEMP/state.tar.gz" \
@@ -728,7 +262,6 @@ jobs:
           name: snapshot-loader-snowflake-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/state.tar.gz
-            data/staging/snowflake/replay-summary.json
             data/recovery/snapshot-replay/snowflake-summary.json
           if-no-files-found: warn
           compression-level: 0
@@ -742,7 +275,6 @@ jobs:
       needs.snowflake.result == 'success' &&
       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
       github.event_name == 'workflow_dispatch' &&
-      inputs.mode == 'rebuild' &&
       inputs.backends == 'both' &&
       inputs.compare_run_id == ''
     name: Validate and compare rebuilt SCD2 histories
@@ -849,8 +381,11 @@ jobs:
 
           run = json.loads(Path(os.environ["RUNNER_TEMP"], "source-run.json").read_text())
           jobs = json.loads(Path(os.environ["RUNNER_TEMP"], "source-jobs.json").read_text())
-          if run.get("path") != ".github/workflows/snapshot-replay.yml":
-              raise SystemExit("The selected run is not from snapshot-replay.yml.")
+          if (
+              run.get("path") != ".github/workflows/snapshot-replay.yml"
+              or run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
+          ):
+              raise SystemExit("The selected run is not a Mode 2 full-history replay.")
           if run.get("event") != "workflow_dispatch" or run.get("status") != "completed":
               raise SystemExit("The selected source run must be a completed manual dispatch.")
           required = {"Load DuckDB (rebuild)", "Load Snowflake (rebuild)"}
@@ -916,20 +451,3 @@ jobs:
           path: data/recovery/snapshot-replay/joint-validation.json
           if-no-files-found: warn
           retention-days: 30
-
-  deploy-dbt-docs:
-    name: Deploy dbt documentation to GitHub Pages
-    if: needs.duckdb.outputs.has_pending_archives == 'true' && needs.duckdb.result == 'success' && inputs.dry_run != true
-    needs: duckdb
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Deploy dbt documentation
-        id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

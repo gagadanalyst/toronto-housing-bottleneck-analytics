@@ -175,11 +175,35 @@ def test_v2_push_and_pull_request_are_ci_only():
     assert "github.event_name != 'pull_request' && steps.change_check" not in workflow
 
 
-def test_snapshot_replay_defaults_to_rebuild_and_cleanup_fails_closed():
-    workflow = (ROOT / ".github/workflows/snapshot-replay.yml").read_text(
+def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/snapshot-replay.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "options: [rebuild, incremental]\n        default: rebuild" in workflow
-    assert "steps.replay.outputs.has_pending_archives == 'false'" in workflow
-    assert "steps.replay.outputs.has_pending_archives != 'true'" not in workflow
+    assert "name: Snapshot Loader (Full-History Rebuild and Parity)" in workflow
+    assert "  schedule:" not in workflow
+    assert "incremental" not in workflow.lower()
+    assert "REPLAY_MODE" not in workflow
+    assert "DRY_RUN" not in workflow
+    assert "TORONTO_SNAPSHOT_LOADER_ENABLED" not in workflow
+    assert "TORONTO_CANONICAL_REPLAY" not in workflow
+    assert "has_pending_archives" not in workflow
+    assert "deploy-dbt-docs" not in workflow
+    assert workflow.count("--mode rebuild") == 2
+
+    for marker in (
+        "name: Load DuckDB (rebuild)",
+        "name: Load Snowflake (rebuild)",
+        "Validate and compare rebuilt SCD2 histories",
+        "Revalidate saved Mode 2 evidence",
+    ):
+        assert marker in workflow
+
+    promotion = (root / ".github/workflows/promote-snapshot-rebuild.yml").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        'run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"'
+        in promotion
+    )

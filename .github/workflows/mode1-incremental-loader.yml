@@ -94,21 +94,14 @@ jobs:
             exit 1
           fi
 
-      - name: Restore current DuckDB production and capture its baseline
+      - name: Restore authoritative DuckDB production and capture its baseline
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p data/warehouse data/staging/duckdb
           rm -f data/warehouse/toronto.duckdb
-          if ! gh release download warehouse-latest \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern toronto.duckdb \
-            --dir data/warehouse || ! test -s data/warehouse/toronto.duckdb; then
-            rm -f data/warehouse/toronto.duckdb
-            echo "warehouse-latest could not be restored; trying the latest verified immutable DuckDB checkpoint."
-            python -m scripts.restore_duckdb_recovery --output data/warehouse/toronto.duckdb
-          fi
-          test -s data/warehouse/toronto.duckdb
+          python -m scripts.restore_duckdb_production \
+            --output data/warehouse/toronto.duckdb
           python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \

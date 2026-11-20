@@ -125,44 +125,6 @@ def test_bundle_claiming_approval_must_not_contain_quality_blockers(tmp_path):
         _validate_archive_metadata(path, tag, asset)
 
 
-def test_manual_snowflake_replay_includes_every_earlier_approved_archive():
-    from types import SimpleNamespace
-
-    from scripts.replay_snowflake_snapshot_backlog import _archives_through_selection
-
-    archives = [
-        SimpleNamespace(run_id="100", attempt="1"),
-        SimpleNamespace(run_id="101", attempt="2"),
-        SimpleNamespace(run_id="102", attempt="1"),
-    ]
-    result = _archives_through_selection(archives, run_id="101", attempt="2")
-    assert [(item.run_id, item.attempt) for item in result] == [
-        ("100", "1"),
-        ("101", "2"),
-    ]
-
-
-def test_manual_snowflake_replay_rejects_target_not_in_backlog():
-    from scripts.replay_snowflake_snapshot_backlog import _archives_through_selection
-
-    with pytest.raises(ValueError, match="missing or not approved"):
-        _archives_through_selection([], run_id="100", attempt="1")
-
-
-def test_pending_snowflake_backlog_filters_only_fully_completed_ids():
-    from types import SimpleNamespace
-
-    from scripts.replay_snowflake_snapshot_backlog import _pending_archives
-
-    archives = [
-        SimpleNamespace(snapshot_id="100:1"),
-        SimpleNamespace(snapshot_id="101:1"),
-        SimpleNamespace(snapshot_id="102:2"),
-    ]
-    result = _pending_archives(archives, {"100:1", "102:2"})
-    assert [item.snapshot_id for item in result] == ["101:1"]
-
-
 def test_discovery_skips_fully_completed_assets_before_downloading(
     tmp_path, monkeypatch
 ):

@@ -60,15 +60,17 @@ Tests are organized alongside the models and grouped by the contract they verify
 
 ## Source freshness
 
-The Active and Cleared load-metadata definitions use dbt's native loaded_at_field and freshness filters against raw._dlt_loads. Each definition filters to its own dlt pipeline and completed loads (status = 0). These checks measure successful warehouse load freshness, not the age of permit application records. The separate ingestion freshness assessment evaluates Toronto's source metadata.
+The Active and Cleared load-metadata definitions use dbt's native loaded_at_field and freshness filters against `raw._dlt_loads`. Each definition filters to its own dlt pipeline and completed loads (`status = 0`). These checks measure successful warehouse load freshness, not the age of permit application records. The separate extraction freshness assessment evaluates Toronto's source metadata.
 
-Freshness warns after 36 hours and errors after 48 hours, matching the sources'
-daily expected cadence and the ingestion pipeline's existing 48-hour stale-data
-boundary. The production CD workflow runs `dbt freshness` after ingestion and
-before the dbt build, against the warehouse copy being prepared for publication.
-Run the same check manually from this directory with `dbt freshness --profiles-dir .`.
+Freshness warns after 36 hours and errors after 48 hours, matching the sources' daily expected cadence and the ingestion pipeline's existing 48-hour stale-data boundary. The Mode 1 DuckDB job runs `dbt debug` and `dbt freshness` against the staged candidate before it builds the serving models. The Snowflake serving workflow performs its own freshness and dbt checks against its isolated serving candidate. Run the same check manually from this directory with `dbt freshness --profiles-dir .`.
 
 ## Data scope and interpretation
+
+The V2 Snapshot Archive workflow publishes validated, full-source Active and Cleared Parquet bundles to immutable snapshot Releases. The Mode 1 DuckDB path consumes approved archives and publishes the current DuckDB warehouse, current Parquet assets, and generated dbt documentation through the rolling `warehouse-latest` release. Mode 2 historical replay is isolated and does not publish a serving warehouse; its separate promotion workflow is explicitly authorized.
+
+The Parquet snapshots represent full-source Active and Cleared Permits data. The warehouse tables are scoped to records with `APPLICATION_DATE >= 2020-01-01`.
+
+
 
 The production CD workflow publishes two Parquet snapshots and a DuckDB warehouse through the repository's rolling `warehouse-latest` GitHub release after a successful eligible CI run.
 
