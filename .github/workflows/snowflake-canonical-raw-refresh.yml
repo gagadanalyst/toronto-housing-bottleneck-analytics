@@ -34,7 +34,7 @@ permissions:
 
 # Queue up to 100 pending refreshes instead of replacing the prior pending run.
 concurrency:
-  group: toronto-snowflake-production-promotion
+  group: toronto-housing-data-publication
   cancel-in-progress: false
   queue: max
 

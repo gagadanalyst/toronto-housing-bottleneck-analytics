@@ -3,20 +3,27 @@ name: V2 Snapshot Archive
 on:
   push:
     branches:
+      - main
       - refactor/separate-extraction
     paths:
       - .github/workflows/v2-snapshot-archive.yml
       - extraction/**
   pull_request:
     branches:
-      - refactor/separate-extraction
       - main
+      - refactor/separate-extraction
     paths:
       - .github/workflows/v2-snapshot-archive.yml
       - extraction/**
   schedule:
     - cron: "17 10 * * *"
   workflow_dispatch:
+    inputs:
+      confirm_publish:
+        description: Explicitly authorize permanent V2 Release publication
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +37,7 @@ jobs:
   archive:
     if: >-
       github.event_name != 'schedule' ||
-      vars.TORONTO_EXTRACTION_ENABLED == 'true'
+      vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'
     name: Extract and publish V2 source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -61,10 +68,30 @@ jobs:
           ruff format --check src tests
           pytest -q
 
+      - name: Authorize manual V2 archive publication
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}
+          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+        run: |
+          if [ "$EXTRACTION_ENABLED" != "true" ] ||
+             [ "$CONFIRM_PUBLISH" != "true" ] ||
+             [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Manual V2 publication requires TORONTO_EXTRACTION_ENABLED=true, confirm_publish=true, and main." >&2
+            exit 1
+          fi
+
+      - name: Require a branch ref for archive publication
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then
+            echo "V2 archive publication and inventory updates require a branch ref." >&2
+            exit 1
+          fi
+
       - name: Check whether source snapshots changed
         id: change_check
-        if: github.event_name != 'pull_request'
-        continue-on-error: true
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: extraction
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,7 +100,17 @@ jobs:
 
       - name: Extract and validate Active/Cleared snapshot
         id: extract
-        if: github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true'
+        if: >-
+          (
+            (github.event_name == 'schedule' &&
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
+             inputs.confirm_publish == true &&
+             github.ref == 'refs/heads/main')
+          ) &&
+          steps.change_check.outcome == 'success' &&
+          steps.change_check.outputs.no_change != 'true'
         working-directory: extraction
         env:
           SNAPSHOT_SOURCE_COMMIT: ${{ github.sha }}
@@ -101,11 +138,33 @@ jobs:
           PY
 
       - name: Report unchanged source snapshots
-        if: steps.change_check.outputs.no_change == 'true'
+        if: >-
+          (
+            (github.event_name == 'schedule' &&
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
+             inputs.confirm_publish == true &&
+             github.ref == 'refs/heads/main')
+          ) &&
+          steps.change_check.outcome == 'success' &&
+          steps.change_check.outputs.no_change == 'true'
         run: echo "Active and Cleared are unchanged; extraction and publication skipped."
 
       - name: Preserve validated snapshot for retry
-        if: always() && github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true' && steps.extract.outcome == 'success'
+        if: >-
+          always() &&
+          (
+            (github.event_name == 'schedule' &&
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
+             inputs.confirm_publish == true &&
+             github.ref == 'refs/heads/main')
+          ) &&
+          steps.change_check.outcome == 'success' &&
+          steps.change_check.outputs.no_change != 'true' &&
+          steps.extract.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -116,7 +175,18 @@ jobs:
           retention-days: 90
 
       - name: Publish and verify V2 GitHub Release asset
-        if: github.event_name != 'pull_request' && steps.change_check.outputs.no_change != 'true' && steps.extract.outcome == 'success'
+        if: >-
+          (
+            (github.event_name == 'schedule' &&
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
+             inputs.confirm_publish == true &&
+             github.ref == 'refs/heads/main')
+          ) &&
+          steps.change_check.outcome == 'success' &&
+          steps.change_check.outputs.no_change != 'true' &&
+          steps.extract.outcome == 'success'
         working-directory: extraction
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,3 +194,39 @@ jobs:
           toronto-publish-snapshot \
             --archive "${{ steps.extract.outputs.archive }}" \
             --repository "$GITHUB_REPOSITORY"
+
+      - name: Append verified archive to snapshot inventory
+        if: >-
+          (
+            (github.event_name == 'schedule' &&
+             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
+             inputs.confirm_publish == true &&
+             github.ref == 'refs/heads/main')
+          ) &&
+          steps.change_check.outcome == 'success' &&
+          steps.change_check.outputs.no_change != 'true' &&
+          steps.extract.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then
+            echo "Inventory updates require a branch ref." >&2
+            exit 1
+          fi
+          python -m scripts.snapshot_inventory append \
+            --archive "${{ steps.extract.outputs.workspace_archive }}" \
+            --repository "$GITHUB_REPOSITORY"
+          git ls-files --error-unmatch snapshot_inventory.json >/dev/null
+          if git diff --quiet HEAD -- snapshot_inventory.json; then
+            echo "Snapshot inventory already contains this archive."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- snapshot_inventory.json
+            git commit --only -m "chore: append verified snapshot inventory entry" -- snapshot_inventory.json
+            auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth_header}" \
+              push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

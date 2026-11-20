@@ -22,10 +22,8 @@ jobs:
       RUNTIME__DLTHUB_TELEMETRY: "false"
       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
       DO_NOT_TRACK: "1"
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event != 'pull_request' &&
-      github.event.workflow_run.head_branch == 'main'
+    # Retired: replaced by V2 Snapshot Archive and Snapshot Loader.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -683,11 +681,8 @@ jobs:
 
   deploy-dbt-docs:
     name: Deploy dbt documentation to GitHub Pages
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event != 'pull_request' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      vars.TORONTO_CANONICAL_REPLAY_ENABLED == 'true' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_ID != '' && vars.TORONTO_CANONICAL_REPLAY_BASELINE_SNAPSHOT_COUNT != ''
+    # Retired: documentation deployment is handled separately after promotion.
+    if: false
     needs: data-assets
     permissions:
       pages: write
