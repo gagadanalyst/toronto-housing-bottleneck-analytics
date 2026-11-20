@@ -165,51 +165,59 @@ jobs:
 
       - name: Download DuckDB full-history evidence
         run: |
-          mkdir -p data/recovery/snapshot-replay/source-artifacts/duckdb
-          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "snapshot-loader-duckdb-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
-            --dir data/recovery/snapshot-replay/source-artifacts/duckdb
+          root=data/recovery/snapshot-replay
+          artifact_dir="$root/source-artifacts/duckdb"
+          mkdir -p "$artifact_dir"
 
-          test -s data/recovery/snapshot-replay/source-artifacts/duckdb/state.tar.gz
-          test -s data/recovery/snapshot-replay/source-artifacts/duckdb/duckdb-summary.json
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-duckdb-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$artifact_dir"
 
-          tar -xzf data/recovery/snapshot-replay/source-artifacts/duckdb/state.tar.gz \
-            -C data/recovery/snapshot-replay
+          mapfile -t state_archives < <(find "$artifact_dir" -type f -name state.tar.gz -print)
+          if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+            echo "DuckDB evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+            exit 1
+          fi
 
-          cp data/recovery/snapshot-replay/source-artifacts/duckdb/duckdb-summary.json \
-            data/recovery/snapshot-replay/duckdb-summary.json
+          tar -tzf "${state_archives[0]}" >/dev/null
+          tar -xzf "${state_archives[0]}" -C "$root"
 
-          test -s data/recovery/snapshot-replay/duckdb-production-baseline.json
+          test -s "$root/duckdb-summary.json"
+          test -s "$root/duckdb-production-baseline.json"
+          test -s "$root/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
 
       - name: Download Snowflake and joint-validation evidence
         if: steps.policy.outputs.snowflake_enabled == 'true'
         run: |
-          mkdir -p \
-            data/recovery/snapshot-replay/source-artifacts/snowflake \
-            data/recovery/snapshot-replay/source-artifacts/joint
+          root=data/recovery/snapshot-replay
+          snowflake_dir="$root/source-artifacts/snowflake"
+          joint_dir="$root/source-artifacts/joint"
+          mkdir -p "$snowflake_dir" "$joint_dir" "$root"
 
-          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "snapshot-loader-snowflake-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
-            --dir data/recovery/snapshot-replay/source-artifacts/snowflake
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-snowflake-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$snowflake_dir"
 
-          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
-            --dir data/recovery/snapshot-replay/source-artifacts/joint
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$joint_dir"
 
-          test -s data/recovery/snapshot-replay/source-artifacts/snowflake/state.tar.gz
-          test -s data/recovery/snapshot-replay/source-artifacts/snowflake/snowflake-summary.json
-          test -s data/recovery/snapshot-replay/source-artifacts/joint/joint-validation.json
+          mapfile -t state_archives < <(find "$snowflake_dir" -type f -name state.tar.gz -print)
+          if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+            echo "Snowflake evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+            exit 1
+          fi
 
-          tar -xzf data/recovery/snapshot-replay/source-artifacts/snowflake/state.tar.gz \
-            -C data/recovery/snapshot-replay
+          tar -tzf "${state_archives[0]}" >/dev/null
+          tar -xzf "${state_archives[0]}" -C "$root"
 
-          cp data/recovery/snapshot-replay/source-artifacts/snowflake/snowflake-summary.json \
-            data/recovery/snapshot-replay/snowflake-summary.json
+          mapfile -t joint_reports < <(find "$joint_dir" -type f -name joint-validation.json -print)
+          if [ "${#joint_reports[@]}" -ne 1 ] || ! test -s "${joint_reports[0]:-}"; then
+            echo "Joint-validation evidence must contain exactly one non-empty joint-validation.json; found ${#joint_reports[@]}." >&2
+            exit 1
+          fi
 
-          cp data/recovery/snapshot-replay/source-artifacts/joint/joint-validation.json \
-            data/recovery/snapshot-replay/joint-validation.json
+          cp "${joint_reports[0]}" "$root/joint-validation.json"
 
-          test -s data/recovery/snapshot-replay/snowflake-production-baseline.json
+          test -s "$root/snowflake-summary.json"
+          test -s "$root/snowflake-production-baseline.json"
+          test -s "$root/snowflake/exports/raw_active_permits_history.csv.gz"
+          test -s "$root/snowflake/exports/raw_cleared_permits_history.csv.gz"
+          test -s "$root/joint-validation.json"
 
       - name: Verify the production baselines have not changed since reconstruction began
         run: |
