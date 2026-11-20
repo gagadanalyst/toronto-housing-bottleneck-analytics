@@ -318,7 +318,7 @@ def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
     assert "backend_policy: ${{ steps.policy.outputs.backend_policy }}" in workflow
     assert 'echo "backend_policy=duckdb-only"' in verify_job
     assert 'echo "backend_policy=both"' in verify_job
-    assert "validate_full_rebuild_promotion.py" in verify_job
+    assert "python -m scripts.validate_full_rebuild_promotion" in verify_job
     assert "needs: verify" in duckdb_job
     assert "SNOWFLAKE_OPERATIONS_ENABLED" not in duckdb_job
     assert "needs.verify.outputs.backend_policy == 'both'" in snowflake_job
