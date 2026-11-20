@@ -16,7 +16,10 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from backend_config import resolve_dashboard_backend
-from refresh_metadata import format_refresh_timestamp
+from refresh_metadata import (
+    format_refresh_timestamp,
+    latest_source_extraction_timestamp,
+)
 from snowflake_backend import REQUIRED_QUALITY_METRICS, load_snowflake_dashboard_data
 from streamlit.errors import StreamlitSecretNotFoundError
 
@@ -452,6 +455,7 @@ def load_dashboard_data(
     int,
     dict[str, int],
     Any | None,
+    Any | None,
 ]:
     """Read the same tested dbt serving contract from the selected backend."""
     if backend == "snowflake":
@@ -528,6 +532,9 @@ def load_dashboard_data(
                 ).fetchone()
                 if refresh_row:
                     last_successful_refresh_utc = refresh_row[0]
+            last_successful_source_extraction_utc = latest_source_extraction_timestamp(
+                connection, available
+            )
         finally:
             connection.close()
 
@@ -562,6 +569,7 @@ def load_dashboard_data(
         cleared_revision_count,
         quality_counts,
         last_successful_refresh_utc,
+        last_successful_source_extraction_utc,
     )
 
 
@@ -1908,6 +1916,7 @@ def main() -> None:
                         cleared_count,
                         quality_counts,
                         last_successful_refresh_utc,
+                        last_successful_source_extraction_utc,
                     ) = load_dashboard_data(backend, config_fingerprint, duckdb_path)
                 except Exception:
                     loading_panel.markdown(
@@ -1933,6 +1942,7 @@ def main() -> None:
                 cleared_count,
                 quality_counts,
                 last_successful_refresh_utc,
+                last_successful_source_extraction_utc,
             ) = load_dashboard_data(backend, config_fingerprint, duckdb_path)
         st.session_state["_dashboard_loaded"] = True
         st.session_state["_dashboard_backend_key"] = backend_key
@@ -1962,32 +1972,34 @@ def main() -> None:
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
 
+    source_extraction_display = format_refresh_timestamp(
+        last_successful_source_extraction_utc
+    )
     last_refresh_display = format_refresh_timestamp(last_successful_refresh_utc)
     with last_successful_refresh_slot.container():
         st.divider()
         st.markdown(
             f"""<div style="padding-top:.15rem;padding-bottom:.65rem;">
               <div style="font-size:.70rem;font-weight:750;letter-spacing:.10em;
-                          color:#C0CAD3;margin-bottom:.55rem;">
-                LAST SUCCESSFUL DATA REFRESH
-              </div>
-              <div style="display:flex;align-items:center;gap:.55rem;">
-                <svg xmlns="http://www.w3.org/2000/svg" width="21" height="21"
-                     viewBox="0 0 24 24" fill="none" stroke="#21B6E8"
-                     stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
-                     aria-hidden="true" style="flex:0 0 auto;">
-                  <rect x="3" y="4" width="18" height="17" rx="2"></rect>
-                  <path d="M8 2v4M16 2v4M3 10h12"></path>
-                  <circle cx="17" cy="17" r="4"></circle>
-                  <path d="M17 15v2l1.3 1"></path>
-                </svg>
-                <span style="font-weight:700;color:#F4F7FA;font-size:.92rem;
-                             line-height:1.35;">Date and time of completed refresh</span>
+                          color:#C0CAD3;margin-bottom:.35rem;">
+                LATEST SOURCE EXTRACTION IN LOADED DATA
               </div>
               <div style="font-weight:750;color:#F4F7FA;font-size:1rem;
-                          line-height:1.35;margin-top:.4rem;">{last_refresh_display}</div>
-              <div style="font-size:.75rem;color:#C0CAD3;margin-top:.4rem;">
-                Displayed in Toronto local time (ET).
+                          line-height:1.35;">{source_extraction_display}</div>
+              <div style="font-size:.75rem;color:#C0CAD3;margin-top:.25rem;">
+                Latest complete Active + Cleared snapshot loaded into this warehouse.
+                New-format archives show extraction completion; older archives use
+                their recorded extraction timestamp.
+              </div>
+              <div style="font-size:.70rem;font-weight:750;letter-spacing:.10em;
+                          color:#C0CAD3;margin-top:.9rem;margin-bottom:.35rem;">
+                LAST SUCCESSFUL WAREHOUSE REFRESH
+              </div>
+              <div style="font-weight:750;color:#F4F7FA;font-size:1rem;
+                          line-height:1.35;">{last_refresh_display}</div>
+              <div style="font-size:.75rem;color:#C0CAD3;margin-top:.25rem;">
+                When this backend's dashboard tables were last successfully built
+                and validated. Times are shown in Toronto local time (ET).
               </div>
             </div>""",
             unsafe_allow_html=True,
