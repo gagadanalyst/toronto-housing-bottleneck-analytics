@@ -352,6 +352,27 @@ def _validate_snowflake_candidate_marker(
         )
 
 
+def _validate_snowflake_promoted_raw_marker(
+    cursor: Any, *, expected_mode2_run_id: str
+) -> None:
+    """Require canonical RAW to contain the expected promoted Mode 2 marker."""
+    expected_mode2_run_id = str(expected_mode2_run_id)
+    if not expected_mode2_run_id.isdecimal():
+        raise ValueError("Expected Mode 2 run ID must be numeric.")
+
+    cursor.execute(
+        "SELECT GENERATION_ID, PROMOTION_STATE "
+        "FROM TORONTO.RAW.TORONTO_CANDIDATE_CONTROL"
+    )
+    rows = cursor.fetchall()
+    expected = [(f"rebuild:{expected_mode2_run_id}", "PROMOTED")]
+    if rows != expected:
+        raise RuntimeError(
+            "Canonical TORONTO.RAW does not carry the expected promoted "
+            f"Mode 2 marker for run {expected_mode2_run_id}: {rows!r}."
+        )
+
+
 def _validate_snowflake_checkpoint_schema(
     *, credentials: str, schema: str, expected_generation_id: str
 ) -> None:
@@ -393,8 +414,9 @@ def _clone_snowflake_schema(
     run_id: str,
     run_attempt: str,
     expected_generation_id: str | None = None,
+    expected_mode2_run_id: str | None = None,
 ) -> str:
-    "Clone an accepted schema after validating any persisted Mode 1 marker."
+    "Clone an accepted schema after validating its applicable control marker."
     from scripts.replay_targets import (
         INCREMENTAL_SNOWFLAKE_SCHEMA_RE,
         REBUILD_SNOWFLAKE_SCHEMA_RE,
@@ -402,7 +424,15 @@ def _clone_snowflake_schema(
     )
 
     source_schema = str(source_schema).upper()
-    if not (
+    if expected_mode2_run_id is not None:
+        if source_schema != "RAW" or expected_generation_id is not None:
+            raise ValueError(
+                "The promoted Mode 2 bootstrap must clone canonical RAW "
+                "without a Mode 1 checkpoint marker."
+            )
+        if not str(expected_mode2_run_id).isdecimal():
+            raise ValueError("Expected Mode 2 run ID must be numeric.")
+    elif not (
         REBUILD_SNOWFLAKE_SCHEMA_RE.fullmatch(source_schema)
         or INCREMENTAL_SNOWFLAKE_SCHEMA_RE.fullmatch(source_schema)
     ):
@@ -429,6 +459,11 @@ def _clone_snowflake_schema(
                 (source_schema,),
             )
             _validate_snowflake_schema_owner(source_schema, cursor.fetchone())
+            if expected_mode2_run_id is not None:
+                _validate_snowflake_promoted_raw_marker(
+                    cursor,
+                    expected_mode2_run_id=expected_mode2_run_id,
+                )
             if expected_generation_id is not None:
                 _validate_snowflake_candidate_marker(
                     cursor,
@@ -540,15 +575,19 @@ def bootstrap_snowflake_working_state(
 ) -> dict[str, Any]:
     """Bootstrap the SQLite ledger and clone the accepted Mode 2 Snowflake schema."""
     metadata = _mode2_generation(mode2_ledger_path, "snowflake", generation_id)
-    candidate = str(metadata["candidate"])
-    if not candidate.startswith("TORONTO."):
-        raise RuntimeError(f"Invalid accepted Snowflake candidate: {candidate}.")
-    source_schema = candidate.split(".", 1)[1].strip('"').upper()
+    mode2_candidate = str(metadata["candidate"])
+    if not mode2_candidate.startswith("TORONTO."):
+        raise RuntimeError(f"Invalid accepted Snowflake candidate: {mode2_candidate}.")
+    mode2_candidate_schema = mode2_candidate.split(".", 1)[1].strip('"').upper()
     mode2_run_id, _mode2_attempt = _generation_parts(generation_id)
-    if source_schema != f"TORONTO_SNAPSHOT_REPLAY_{mode2_run_id}":
+    if mode2_candidate_schema != f"TORONTO_SNAPSHOT_REPLAY_{mode2_run_id}":
         raise RuntimeError(
             "Snowflake schema does not match the accepted Mode 2 generation run ID."
         )
+
+    # Mode 2 promotion swaps the accepted candidate into canonical RAW.
+    # The ledger candidate name now refers to the previous production schema.
+    source_schema = "RAW"
 
     working_dir = Path(working_dir).resolve()
     if working_dir.exists() and any(working_dir.iterdir()):
@@ -569,6 +608,7 @@ def bootstrap_snowflake_working_state(
             source_schema=source_schema,
             run_id=run_id,
             run_attempt=run_attempt,
+            expected_mode2_run_id=mode2_run_id,
         )
         metadata["mode2_candidate"] = metadata.pop("candidate")
         metadata.update(
@@ -576,6 +616,7 @@ def bootstrap_snowflake_working_state(
                 "format_version": STATE_FORMAT_VERSION,
                 "candidate_schema": schema,
                 "candidate": f"TORONTO.{schema}",
+                "mode2_promoted_source_schema": "TORONTO.RAW",
                 "created_at_utc": datetime.now(UTC).isoformat(),
             }
         )
