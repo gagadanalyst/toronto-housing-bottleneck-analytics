@@ -233,7 +233,7 @@ jobs:
             gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
               --pattern toronto.duckdb --dir data/warehouse
           fi
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
@@ -243,7 +243,7 @@ jobs:
           SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
           SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
         run: |
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
 
@@ -406,7 +406,7 @@ jobs:
             gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
               --pattern toronto.duckdb --dir data/warehouse
           fi
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend duckdb --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
       - name: Prepare isolated dbt candidate from the rebuilt DuckDB history
@@ -477,7 +477,7 @@ jobs:
           PY
       - name: Recheck DuckDB production baseline immediately before promotion
         run: |
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
@@ -636,7 +636,7 @@ jobs:
             -C data/recovery/snapshot-replay
       - name: Recheck the canonical Snowflake RAW baseline before promotion
         run: |
-          python scripts/snapshot_replay_baseline.py \
+          python -m scripts.snapshot_replay_baseline \
             --backend snowflake \
             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
       - name: Promote the fully validated Snowflake RAW history
