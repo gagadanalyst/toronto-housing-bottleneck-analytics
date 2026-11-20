@@ -164,8 +164,8 @@ independently verifying the intended RAW generation is already canonical.
 `SNOWFLAKE_OPERATIONS_ENABLED` is an **operational gate, not a secret and not
 the dashboard backend setting**. The exact string `true` is required for
 Snowflake Mode 1, Snowflake serving, the Snowflake side of Mode 2 replay and
-comparison, the Snowflake full-history promotion leg, and the dedicated
-Snowflake validation workflows.
+comparison, the Snowflake full-history promotion leg, and the remaining
+manual, non-production Snowflake smoke workflow (`snowflake.yml`).
 
 When the variable is `false` or unset:
 

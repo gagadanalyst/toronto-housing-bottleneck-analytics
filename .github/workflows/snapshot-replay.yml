@@ -103,22 +103,13 @@ jobs:
           echo "REPLAY_STAGING_DIR=data/recovery/snapshot-replay/duckdb/staging" >> "$GITHUB_ENV"
           echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/duckdb-summary.json" >> "$GITHUB_ENV"
 
-      - name: Capture the current DuckDB baseline before Mode 2 reconstruction
+      - name: Capture the authoritative DuckDB baseline before Mode 2 reconstruction
         run: |
           mkdir -p data/warehouse data/recovery/snapshot-replay
           baseline=data/recovery/snapshot-replay/duckdb-production-baseline.json
           if [ ! -s "$baseline" ]; then
-            if python scripts/restore_duckdb_recovery.py --output data/warehouse/toronto.duckdb; then
-              echo "Restored current DuckDB production checkpoint for the rebuild baseline."
-            else
-              status=$?
-              if [ "$status" -ne 2 ]; then
-                echo "DuckDB production baseline restoration failed; refusing fallback." >&2
-                exit "$status"
-              fi
-              gh release download warehouse-latest --repo "$GITHUB_REPOSITORY" \
-                --pattern toronto.duckdb --dir data/warehouse
-            fi
+            python -m scripts.restore_duckdb_production \
+              --output data/warehouse/toronto.duckdb
             python -m scripts.snapshot_replay_baseline \
               --backend duckdb \
               --database data/warehouse/toronto.duckdb \

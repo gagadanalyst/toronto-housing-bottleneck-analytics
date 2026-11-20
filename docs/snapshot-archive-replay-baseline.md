@@ -85,13 +85,14 @@ activation switch for Mode 1.
 
 Mode 1 does not load new snapshots directly into canonical production.
 
-For DuckDB, it restores the current published warehouse (or a verified immutable
-recovery checkpoint when required), captures a production baseline, restores
-the accepted Mode 1 working state, and replays only unprocessed approved archives
-into an isolated candidate. The candidate then goes through source, SCD2,
-quarantine, baseline, and dbt validation. The production baseline is checked
-again before promotion. After a successful promotion, the workflow publishes
-the rolling DuckDB, Parquet, and dbt documentation assets.
+For DuckDB, it restores `warehouse-latest` first and uses the latest verified
+immutable recovery checkpoint only when the rolling database asset is unavailable.
+It captures a production baseline, restores the accepted Mode 1 working state,
+and replays only unprocessed approved archives into an isolated candidate.
+The candidate then goes through source, SCD2, quarantine, baseline, and dbt
+validation. The production baseline is checked again before promotion. After
+a successful promotion, the workflow publishes the rolling DuckDB, Parquet,
+and dbt documentation assets.
 
 For Snowflake, Mode 1 captures the canonical RAW baseline and stages work in a
 run-scoped clone of `TORONTO.RAW`. It restores the accepted Mode 1 state and
