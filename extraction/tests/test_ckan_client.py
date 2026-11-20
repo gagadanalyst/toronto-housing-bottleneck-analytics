@@ -186,3 +186,45 @@ def test_datastore_fingerprint_includes_cache_marker_and_total_estimation():
     assert fingerprint["datastore_cache_last_update"] == ("2026-11-16T10:23:21.445419")
     assert fingerprint["datastore_total"] == 123
     assert fingerprint["total_was_estimated"] is False
+
+
+def test_estimated_datastore_total_paginates_until_empty_page(tmp_path, monkeypatch):
+    records = [
+        {"_id": 1, "PERMIT_NUM": "001"},
+        {"_id": 2, "PERMIT_NUM": "002"},
+        {"_id": 3, "PERMIT_NUM": "003"},
+    ]
+    offsets = []
+
+    def fake_action(action_name, **params):
+        assert action_name == "datastore_search"
+        offset = params["offset"]
+        offsets.append(offset)
+        return {
+            "records": records[offset : offset + params["limit"]],
+            "total": 1,  # Deliberately lower than the real row count.
+            "total_was_estimated": True,
+        }
+
+    output = tmp_path / "active.parquet"
+    checkpoint_dir = tmp_path / "staging"
+
+    with TorontoCKANClient("https://example.com") as client:
+        monkeypatch.setattr(client, "action", fake_action)
+        row_count = client.fetch_datastore(
+            resource_id="resource-1",
+            page_size=2,
+            checkpoint_dir=checkpoint_dir,
+            fingerprint={"resource_hash": "abc", "total_was_estimated": True},
+            source_name="active_permits",
+            output_path=output,
+            pagination_sort="_id asc",
+            required_columns=("PERMIT_NUM",),
+            total_was_estimated=True,
+        )
+
+    table = pq.read_table(output)
+    assert row_count == 3
+    assert offsets == [0, 2, 3]
+    assert table.column("PERMIT_NUM").to_pylist() == ["001", "002", "003"]
+    assert not checkpoint_dir.exists()

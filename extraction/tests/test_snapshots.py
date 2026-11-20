@@ -12,6 +12,7 @@ from toronto_housing_extraction.snapshots import (
     build_source_manifest,
     create_snapshot_bundle,
     validate_release_provenance,
+    validate_replay_contract,
 )
 
 
@@ -271,3 +272,72 @@ def test_rejects_invalid_github_source_commit():
 
     with pytest.raises(ValueError, match="full source commit SHA"):
         build_provenance(env)
+
+
+def test_snapshot_bundle_contains_versioned_checksummed_replay_contract(
+    tmp_path,
+):
+    config = load_config(Path("config/sources.yml"))
+    extractions = (
+        make_extraction(tmp_path / "active.parquet", "active_permits"),
+        make_extraction(tmp_path / "cleared.parquet", "cleared_permits"),
+    )
+    output = tmp_path / "snapshot.zip"
+
+    bundle = create_snapshot_bundle(extractions, config, output)
+    contract = bundle["replay_contract"]
+
+    assert contract["contract_id"] == "toronto-housing-snapshot-replay"
+    assert contract["contract_version"] == 1
+    assert contract["snapshot_format_version"] == 2
+    assert contract["source_configuration"]["ckan"]["page_size"] == (
+        config.ckan.page_size
+    )
+    assert contract["source_configuration"]["sources"]["active_permits"][
+        "business_key"
+    ] == ["PERMIT_NUM", "REVISION_NUM", "PERMIT_TYPE"]
+    assert contract["normalization"]["field_types"]["PERMIT_NUM"] == "text"
+    assert contract["replay_implementation"]["mode2_entrypoint"] == (
+        "scripts/replay_snapshots.py"
+    )
+    assert contract["scd2_replay"]["observation_boundary"] == (
+        "manifest.extraction_started_at_utc"
+    )
+    assert contract["scd2_replay"]["archive_order"] == [
+        "bundle.extraction_started_at_utc",
+        "run_id",
+        "run_attempt",
+        "snapshot_id",
+    ]
+    assert contract["scd2_replay"]["change_detection"] == "row_hash"
+    assert contract["scd2_replay"]["validity_columns"] == {
+        "from": "_dlt_valid_from",
+        "to": "_dlt_valid_to",
+    }
+    assert len(bundle["replay_contract_sha256"]) == 64
+
+    with ZipFile(output) as archive:
+        archived = json.loads(archive.read("bundle.json"))
+        assert archived["replay_contract"] == contract
+        validate_replay_contract(
+            archived["replay_contract"], archived["replay_contract_sha256"]
+        )
+
+
+def test_replay_contract_rejects_modified_content(tmp_path):
+    config = load_config(Path("config/sources.yml"))
+    extractions = (
+        make_extraction(tmp_path / "active.parquet", "active_permits"),
+        make_extraction(tmp_path / "cleared.parquet", "cleared_permits"),
+    )
+    bundle = create_snapshot_bundle(extractions, config, tmp_path / "snapshot.zip")
+    altered = json.loads(json.dumps(bundle["replay_contract"]))
+    altered["source_configuration"]["ckan"]["page_size"] += 1
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_replay_contract(altered, bundle["replay_contract_sha256"])
+
+    unsupported = dict(bundle["replay_contract"])
+    unsupported["contract_version"] = 2
+    with pytest.raises(ValueError, match="version is unsupported"):
+        validate_replay_contract(unsupported, bundle["replay_contract_sha256"])

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -272,3 +273,82 @@ def test_discards_datastore_snapshot_if_source_marker_changes_during_extract(
                 ckan=config.ckan,
                 run_dir=tmp_path,
             )
+
+
+def _reliable_source_result(source_name):
+    marker = "2026-11-15T10:00:00.000000"
+    return replace(
+        _source_result(source_name),
+        fingerprint={
+            "datastore_cache_last_update": marker,
+            "resource_last_modified": None,
+        },
+        fingerprint_reliable=True,
+    )
+
+
+def test_rechecks_both_source_markers_after_pair_completes(tmp_path, monkeypatch):
+    config = load_config(Path("config/sources.yml"))
+    extracted = []
+    checked = []
+    marker = "2026-11-15T10:00:00.000000"
+
+    def fake_extract_source(**kwargs):
+        name = kwargs["source"].name
+        extracted.append(name)
+        return _reliable_source_result(name)
+
+    monkeypatch.setattr(
+        "toronto_housing_extraction.extraction.extract_source",
+        fake_extract_source,
+    )
+
+    with TorontoCKANClient(config.ckan.base_url) as client:
+
+        def fake_action(action_name, **params):
+            assert action_name == "resource_show"
+            checked.append(params["id"])
+            return {"datastore_cache_last_update": marker, "last_modified": None}
+
+        monkeypatch.setattr(client, "action", fake_action)
+        results = extract_sources(client=client, config=config, run_dir=tmp_path)
+
+    assert len(results) == 2
+    assert extracted == ["active_permits", "cleared_permits"]
+    assert checked == ["active_permits-resource", "cleared_permits-resource"]
+
+
+def test_pair_fails_when_first_source_changes_during_second_extraction(
+    tmp_path, monkeypatch
+):
+    config = load_config(Path("config/sources.yml"))
+    current_active_marker = "2026-11-15T10:00:00.000000"
+
+    def fake_extract_source(**kwargs):
+        nonlocal current_active_marker
+        name = kwargs["source"].name
+        if name == "cleared_permits":
+            # Simulate Active changing after its own extraction check but while
+            # Cleared is still being extracted.
+            current_active_marker = "2026-11-15T10:05:00.000000"
+        return _reliable_source_result(name)
+
+    monkeypatch.setattr(
+        "toronto_housing_extraction.extraction.extract_source",
+        fake_extract_source,
+    )
+
+    with TorontoCKANClient(config.ckan.base_url) as client:
+
+        def fake_action(action_name, **params):
+            assert action_name == "resource_show"
+            marker = (
+                current_active_marker
+                if params["id"] == "active_permits-resource"
+                else "2026-11-15T10:00:00.000000"
+            )
+            return {"datastore_cache_last_update": marker, "last_modified": None}
+
+        monkeypatch.setattr(client, "action", fake_action)
+        with pytest.raises(RuntimeError, match="changed during paired extraction"):
+            extract_sources(client=client, config=config, run_dir=tmp_path)

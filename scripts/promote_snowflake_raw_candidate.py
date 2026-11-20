@@ -357,6 +357,74 @@ def _validate_candidate(
             raise RuntimeError(f"Candidate has no successful DLT loads for {pipeline}.")
 
 
+def validate_candidate_only(
+    uri: str,
+    stage: str,
+    generation: str,
+    baseline_counts: dict[str, int],
+    baseline_snapshot_ids: set[str],
+) -> None:
+    """Validate a run-scoped candidate without changing canonical RAW."""
+    if not re.fullmatch(r"RAW_STAGE_[0-9]+_[0-9]+", stage):
+        raise ValueError(f"Unsafe candidate schema name: {stage!r}.")
+    expected_generation = ":".join(stage.removeprefix("RAW_STAGE_").split("_"))
+    if generation != expected_generation:
+        raise ValueError(
+            f"Candidate generation mismatch: stage={stage}, generation={generation}."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="toronto-raw-validate-") as temp:
+        options = _options(uri, Path(temp) / "snowflake_key.p8")
+        connection = snowflake.connector.connect(**options)
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT CURRENT_ROLE(), CURRENT_DATABASE(), CURRENT_SCHEMA()"
+            )
+            role, database, schema = cursor.fetchone()
+            if (str(role).upper(), str(database).upper(), str(schema).upper()) != (
+                "TORONTO_INGEST_ROLE",
+                "TORONTO",
+                "RAW",
+            ):
+                raise RuntimeError(
+                    f"Unexpected Snowflake validation context: {role}/{database}/{schema}."
+                )
+
+            cursor.execute(
+                "SELECT SCHEMA_NAME, SCHEMA_OWNER "
+                "FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
+                "WHERE SCHEMA_NAME = %s",
+                (stage,),
+            )
+            owners = {
+                str(name).upper(): str(owner).upper()
+                for name, owner in cursor.fetchall()
+            }
+            if owners.get(stage) != "TORONTO_INGEST_ROLE":
+                raise RuntimeError(
+                    f"TORONTO.{stage} must be owned by TORONTO_INGEST_ROLE; "
+                    f"observed={owners.get(stage)!r}."
+                )
+
+            stage_generation, stage_state = _control_generation(cursor, stage)
+            if stage_generation != generation or stage_state != "READY":
+                raise RuntimeError(
+                    "Candidate control marker mismatch: "
+                    f"observed={stage_generation}/{stage_state}, "
+                    f"expected={generation}/READY."
+                )
+
+            _validate_candidate(cursor, stage, baseline_counts, baseline_snapshot_ids)
+            print(
+                f"SNOWFLAKE RAW CANDIDATE VALIDATION PASSED: TORONTO.{stage}; "
+                "canonical TORONTO.RAW was not changed."
+            )
+        finally:
+            cursor.close()
+            connection.close()
+
+
 def promote(
     uri: str,
     stage: str,
@@ -550,19 +618,35 @@ def main() -> int:
         "--baseline-snapshot-ids",
         default=os.environ.get("TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS", ""),
     )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate the isolated candidate without swapping it into canonical RAW.",
+    )
     args = parser.parse_args()
     uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
     if not uri:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION is required.")
     if not args.baseline_counts or not args.baseline_snapshot_ids:
         raise ValueError("Quarantine baseline counts and snapshot IDs are required.")
-    promote(
-        uri,
-        args.stage_schema,
-        args.generation,
-        json.loads(args.baseline_counts),
-        set(json.loads(args.baseline_snapshot_ids)),
-    )
+    baseline_counts = json.loads(args.baseline_counts)
+    baseline_snapshot_ids = set(json.loads(args.baseline_snapshot_ids))
+    if args.validate_only:
+        validate_candidate_only(
+            uri,
+            args.stage_schema,
+            args.generation,
+            baseline_counts,
+            baseline_snapshot_ids,
+        )
+    else:
+        promote(
+            uri,
+            args.stage_schema,
+            args.generation,
+            baseline_counts,
+            baseline_snapshot_ids,
+        )
     return 0
 
 

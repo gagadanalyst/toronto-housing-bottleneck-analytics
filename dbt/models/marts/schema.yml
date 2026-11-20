@@ -464,3 +464,124 @@ models:
         description: 90th percentile of non-negative elapsed calendar days for the matched cohort, rounded to two decimal places.
         data_tests:
           - not_null
+
+
+  - name: mart_active_backlog_summary
+    config:
+      contract:
+        enforced: true
+    description: >-
+      Dashboard-ready Active backlog summaries at overall, application-year, and
+      permit-type levels. All medians and P90s are calculated from individual
+      eligible logical revisions, not from previously aggregated groups. The
+      overall row also carries the 2024-and-later cohort share, top-five permit
+      type share of the over-365-day backlog, and latest observed application year.
+    columns:
+      - name: summary_level
+        data_type: VARCHAR
+        description: One of overall, application_year, or permit_type.
+        data_tests: [not_null]
+      - name: application_year
+        data_type: INTEGER
+        description: Application year for application_year rows; null for other summary levels and for undated revisions.
+      - name: permit_type
+        data_type: VARCHAR
+        description: Permit type for permit_type rows; null for other summary levels.
+      - name: current_active_revision_count
+        data_type: BIGINT
+        description: Current logical Active revisions in the selected summary group.
+        data_tests: [not_null]
+      - name: age_eligible_count
+        data_type: BIGINT
+        description: Revisions eligible for Active age analysis.
+        data_tests: [not_null]
+      - name: age_ineligible_count
+        data_type: BIGINT
+        description: Revisions excluded from Active age analysis.
+        data_tests: [not_null]
+      - name: over_365_days_count
+        data_type: BIGINT
+        description: Eligible revisions older than 365 calendar days.
+        data_tests: [not_null]
+      - name: over_730_days_count
+        data_type: BIGINT
+        description: Eligible revisions older than 730 calendar days.
+        data_tests: [not_null]
+      - name: over_1095_days_count
+        data_type: BIGINT
+        description: Eligible revisions older than 1,095 calendar days.
+        data_tests: [not_null]
+      - name: median_age_days
+        data_type: DOUBLE
+        description: Median age from individual eligible revisions in the group.
+      - name: p90_age_days
+        data_type: DOUBLE
+        description: 90th percentile age from individual eligible revisions in the group.
+      - name: eligible_backlog_share_pct
+        data_type: DOUBLE
+        description: Group contribution to all eligible current Active revisions; 100 for the overall row.
+      - name: recent_cohort_2024_plus_share_pct
+        data_type: DOUBLE
+        description: Overall-row share of eligible backlog with application year 2024 or later.
+      - name: top_five_over_365_share_pct
+        data_type: DOUBLE
+        description: Overall-row share of the over-365-day eligible backlog accounted for by the five largest permit types.
+      - name: latest_application_year
+        data_type: INTEGER
+        description: Latest non-null application year, populated on the overall row.
+
+  - name: mart_cleared_lifecycle_pooled
+    config:
+      contract:
+        enforced: true
+    description: >-
+      Pooled lifecycle duration statistics calculated directly from individual
+      Closed logical revisions in one shared matched cohort with all three dates
+      present and application_date <= issued_date <= completed_date.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [measure]
+    columns:
+      - name: measure
+        data_type: VARCHAR
+        description: Lifecycle interval being summarized.
+        data_tests: [not_null]
+      - name: matched_cohort_count
+        data_type: BIGINT
+        description: Number of revisions in the shared matched cohort.
+        data_tests: [not_null]
+      - name: median_days
+        data_type: DOUBLE
+        description: Pooled median elapsed calendar days across individual revisions.
+        data_tests: [not_null]
+      - name: p90_days
+        data_type: DOUBLE
+        description: Pooled 90th percentile elapsed calendar days across individual revisions.
+        data_tests: [not_null]
+
+  - name: mart_data_quality_summary
+    config:
+      contract:
+        enforced: true
+    description: >-
+      Metric-level Active and Cleared data-quality aggregates and Active age
+      exclusion counts. Dashboard adapters read these prepared values and do
+      not reproduce quality aggregation SQL.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [metric_name]
+    columns:
+      - name: metric_name
+        data_type: VARCHAR
+        description: Stable metric key consumed by the dashboard.
+        data_tests: [not_null]
+      - name: metric_value
+        data_type: BIGINT
+        description: Non-negative logical-revision count for the metric.
+        data_tests: [not_null]
+      - name: metric_group
+        data_type: VARCHAR
+        description: Dashboard section grouping for the metric.
+        data_tests: [not_null]

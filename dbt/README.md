@@ -32,6 +32,9 @@ The models follow three layers:
 | `mart_active_backlog_by_year_type` | Aggregates current Active backlog counts, ageing thresholds, and age statistics by application year and permit type. |
 | `mart_cleared_lifecycle_by_year_type` | Summarizes lifecycle durations, eligible date pairs, and negative-duration exceptions by application year and permit type. |
 | `mart_cleared_lifecycle_matched_by_year_type` | Compares all three Closed-permit lifecycle intervals using one matched cohort with complete, chronological dates. |
+| `mart_active_backlog_summary` | Supplies overall, application-year, and permit-type Active backlog summaries, including pooled age percentiles. |
+| `mart_cleared_lifecycle_pooled` | Supplies pooled lifecycle medians and P90s from one matched Closed cohort. |
+| `mart_data_quality_summary` | Supplies metric-level Active and Cleared quality counts and Active exclusion reasons. |
 
 Staging models are materialized as views. Marts are materialized as tables. Model materializations and static-analysis settings are defined in `dbt_project.yml`.
 
@@ -292,8 +295,9 @@ For a quick review of the analytics implementation:
 1. Read `dbt_project.yml`, `packages.yml`, and `package-lock.yml`.
 2. Follow `models/sources.yml` into the two staging models.
 3. Review the two logical permit-revision facts and the dimensions.
-4. Inspect the Active age and Cleared lifecycle marts.
-5. Review the singular tests under `tests/` for their documented contracts.
-6. Recreate the development setup and run `dbt debug`, `dbt parse`, and `dbt build`.
+4. Inspect the Active age, Active backlog summary, and Cleared lifecycle marts.
+5. Review the data-quality summary mart and its reconciliation tests.
+6. Review the singular tests under `tests/` for their documented contracts.
+7. Recreate the development setup and run `dbt debug`, `dbt parse`, and `dbt build`.
 
 Public conclusions should be drawn from verified model outputs and the published dashboard, with the eligibility rules and analytical limitations above kept visible.

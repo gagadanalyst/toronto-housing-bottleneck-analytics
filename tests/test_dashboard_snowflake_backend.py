@@ -15,13 +15,20 @@ CONFIG = {
     "private_key": "fake-pem",
 }
 
+QUALITY_METRIC_VALUES = {
+    "active_revisions_analysed": 100,
+    "active_revisions_age_eligible": 80,
+    "active_revisions_age_ineligible": 20,
+    "active_exclusion_status_conflict": 2,
+    "cleared_revision_count": 200,
+    "application_date_usable": 150,
+    "closed_both_dates_available": 80,
+}
+
 
 class FakePrivateKey:
     def private_bytes(
-        self,
-        encoding: object,
-        format: object,
-        encryption_algorithm: object,
+        self, encoding: object, format: object, encryption_algorithm: object
     ) -> bytes:
         return b"test-private-key-der"
 
@@ -40,59 +47,45 @@ class FakeConnection:
 
 class FakeCursor:
     def __init__(
-        self,
-        relations: set[str],
-        refresh_timestamp: datetime | None = None,
+        self, relations: set[str], refresh_timestamp: datetime | None = None
     ) -> None:
         self.relations = relations
         self.refresh_timestamp = refresh_timestamp
         self.description: list[tuple[str]] | None = None
         self.rows: list[tuple[Any, ...]] = []
         self.closed = False
-        self.last_query = ""
         self.queries: list[str] = []
 
     def execute(self, query: str, params: object = None) -> None:
-        self.last_query = query
         self.queries.append(query)
-        if "INFORMATION_SCHEMA.TABLES" in query:
+        upper = query.upper()
+        if "INFORMATION_SCHEMA.TABLES" in upper:
             self.rows = [(name,) for name in sorted(self.relations)]
-        elif "DASHBOARD_REFRESH_METADATA" in query:
+        elif "DASHBOARD_REFRESH_METADATA" in upper:
             self.description = [("LAST_SUCCESSFUL_REFRESH_UTC",)]
             self.rows = (
                 [(self.refresh_timestamp,)]
-                if "DASHBOARD_REFRESH_METADATA" in self.relations
-                and self.refresh_timestamp is not None
+                if self.refresh_timestamp is not None
                 else []
             )
-        elif "MART_ACTIVE_PERMIT_AGE" in query:
-            self.description = [("PERMIT_NUM",), ("IS_AGE_ELIGIBLE",)]
-            self.rows = [("00123", True)]
-        elif "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE" in query:
-            self.description = [
-                ("APPLICATION_YEAR",),
-                ("PERMIT_TYPE",),
-                ("MEASURE",),
-            ]
+        elif "MART_ACTIVE_PERMIT_AGE" in upper:
+            self.description = [("PERMIT_NUM",), ("IS_AGE_ELIGIBLE",), ("AS_OF_DATE",)]
+            self.rows = [("00123", True, "2026-11-19")]
+        elif "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE" in upper:
+            self.description = [("APPLICATION_YEAR",), ("PERMIT_TYPE",), ("MEASURE",)]
             self.rows = [(2025, "Residential", "Application to issue")]
-        elif "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE" in query:
+        elif "MART_ACTIVE_BACKLOG_SUMMARY" in upper:
             self.description = [
+                ("SUMMARY_LEVEL",),
                 ("APPLICATION_YEAR",),
                 ("PERMIT_TYPE",),
-                ("CURRENT_ACTIVE_REVISION_COUNT",),
-                ("AGE_ELIGIBLE_COUNT",),
-                ("AGE_INELIGIBLE_COUNT",),
-                ("OVER_365_DAYS_COUNT",),
-                ("OVER_730_DAYS_COUNT",),
-                ("OVER_1095_DAYS_COUNT",),
-                ("MEDIAN_AGE_DAYS",),
-                ("P90_AGE_DAYS",),
-                ("ELIGIBLE_BACKLOG_SHARE_PCT",),
             ]
             self.rows = [
-                (2025, "Residential", 100, 98, 2, 80, 50, 20, 490.0, 900.0, 0.1)
+                ("overall", None, None),
+                ("application_year", 2025, None),
+                ("permit_type", None, "Residential"),
             ]
-        elif "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE" in query:
+        elif "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE" in upper:
             self.description = [
                 ("APPLICATION_YEAR",),
                 ("PERMIT_TYPE",),
@@ -102,7 +95,7 @@ class FakeCursor:
                 ("P90_DAYS",),
             ]
             self.rows = [(2025, "Residential", "Application to issue", 25, 28.0, 129.0)]
-        elif "matched_closed_cohort" in query.lower():
+        elif "MART_CLEARED_LIFECYCLE_POOLED" in upper:
             self.description = [
                 ("MEASURE",),
                 ("MATCHED_COHORT_COUNT",),
@@ -114,55 +107,12 @@ class FakeCursor:
                 ("Issue to completion", 25, 292.0, 1054.0),
                 ("Application to completion", 25, 345.0, 1163.0),
             ]
-        elif "FCT_ACTIVE_PERMIT_REVISION" in query:
-            self.description = [
-                (field.upper(),) for field in backend.ACTIVE_AGGREGATE_FIELDS
-            ]
-            active_counts = {
-                "active_builder_name_conflict": 1,
-                "active_builder_name_missing": 3,
-                "active_has_status_conflict": 0,
-                "active_application_date_conflict": 0,
-                "active_issued_date_conflict": 0,
-                "active_geo_id_conflict": 0,
-                "active_status_missing": 0,
-                "active_application_date_missing": 0,
-                "active_issued_date_missing": 0,
-                "active_geo_id_missing": 0,
-                "active_revisions_with_findings": 1,
-            }
+        elif "MART_DATA_QUALITY_SUMMARY" in upper:
+            self.description = [("METRIC_NAME",), ("METRIC_VALUE",)]
             self.rows = [
-                tuple(active_counts[field] for field in backend.ACTIVE_AGGREGATE_FIELDS)
+                (name, QUALITY_METRIC_VALUES.get(name, 0))
+                for name in backend.REQUIRED_QUALITY_METRICS
             ]
-        elif "FCT_CLEARED_PERMIT_REVISION" in query:
-            all_quality_fields = (
-                *backend.FLAG_FIELDS,
-                *backend.DATE_COVERAGE_FIELDS,
-                *backend.CLEARED_AGGREGATE_FIELDS,
-            )
-            self.description = [("CLEARED_REVISION_COUNT",)] + [
-                (field.upper(),) for field in all_quality_fields
-            ]
-            coverage_counts = {
-                "application_date_usable": 2,
-                "application_date_no_usable": 0,
-                "issued_date_usable": 2,
-                "issued_date_no_usable": 0,
-                "completion_date_usable": 1,
-                "completion_date_no_usable": 1,
-                "both_dates_available": 1,
-                "closed_revision_count": 2,
-                "closed_both_dates_available": 1,
-                "cleared_builder_name_missing": 1,
-                "cleared_status_missing": 0,
-                "cleared_geo_id_missing": 2,
-                "cleared_revisions_with_findings": 1,
-            }
-            counts = tuple(
-                1 if field == "builder_name_conflict" else coverage_counts.get(field, 0)
-                for field in all_quality_fields
-            )
-            self.rows = [(3, *counts)]
         else:
             raise AssertionError(f"Unexpected SQL query: {query}")
 
@@ -174,16 +124,13 @@ class FakeCursor:
 
 
 def install_snowflake_stubs(
-    monkeypatch: pytest.MonkeyPatch,
-    connection: FakeConnection,
+    monkeypatch: pytest.MonkeyPatch, connection: FakeConnection
 ) -> dict[str, Any]:
-    """Provide fake optional dependencies and a fake Snowflake connection."""
     serialization = ModuleType("cryptography.hazmat.primitives.serialization")
     serialization.Encoding = SimpleNamespace(DER="DER")
     serialization.PrivateFormat = SimpleNamespace(PKCS8="PKCS8")
     serialization.NoEncryption = lambda: "no-encryption"
     serialization.load_pem_private_key = lambda key, password: FakePrivateKey()
-
     cryptography = ModuleType("cryptography")
     cryptography.__path__ = []
     hazmat = ModuleType("cryptography.hazmat")
@@ -193,7 +140,6 @@ def install_snowflake_stubs(
     cryptography.hazmat = hazmat
     hazmat.primitives = primitives
     primitives.serialization = serialization
-
     connector = ModuleType("snowflake.connector")
     connection_args: dict[str, Any] = {}
 
@@ -205,18 +151,15 @@ def install_snowflake_stubs(
     snowflake = ModuleType("snowflake")
     snowflake.__path__ = []
     snowflake.connector = connector
-
-    modules = {
+    for name, module in {
         "cryptography": cryptography,
         "cryptography.hazmat": hazmat,
         "cryptography.hazmat.primitives": primitives,
         "cryptography.hazmat.primitives.serialization": serialization,
         "snowflake": snowflake,
         "snowflake.connector": connector,
-    }
-    for name, module in modules.items():
+    }.items():
         monkeypatch.setitem(sys.modules, name, module)
-
     return connection_args
 
 
@@ -227,7 +170,6 @@ def test_missing_configuration_fails_before_connection() -> None:
 
 def test_invalid_database_identifier_is_rejected() -> None:
     config = {**CONFIG, "database": 'TORONTO"; DROP DATABASE TORONTO; --'}
-
     with pytest.raises(ValueError, match="Invalid Snowflake database identifier"):
         backend.load_snowflake_dashboard_data(config)
 
@@ -235,18 +177,15 @@ def test_invalid_database_identifier_is_rejected() -> None:
 def test_missing_relations_fail_and_close_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = FakeCursor({"MART_ACTIVE_PERMIT_AGE"})
-    connection = FakeConnection(cursor)
+    connection = FakeConnection(FakeCursor({"MART_ACTIVE_PERMIT_AGE"}))
     install_snowflake_stubs(monkeypatch, connection)
-
     with pytest.raises(RuntimeError, match="missing required dashboard relations"):
         backend.load_snowflake_dashboard_data(CONFIG)
-
-    assert cursor.closed
+    assert connection.fake_cursor.closed
     assert connection.closed
 
 
-def test_successful_read_returns_dashboard_contract_and_closes_connection(
+def test_read_uses_only_dbt_marts_and_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
@@ -256,71 +195,57 @@ def test_successful_read_returns_dashboard_contract_and_closes_connection(
     )
     connection = FakeConnection(cursor)
     connection_args = install_snowflake_stubs(monkeypatch, connection)
-
     (
         active,
         summary,
-        active_backlog,
-        matched_lifecycle,
-        pooled_lifecycle,
+        backlog,
+        matched,
+        pooled,
         cleared_count,
-        flags,
-        actual_refresh_timestamp,
+        quality,
+        actual_refresh,
     ) = backend.load_snowflake_dashboard_data(CONFIG)
-
     assert active.loc[0, "permit_num"] == "00123"
-    assert bool(active.loc[0, "is_age_eligible"])
     assert summary.loc[0, "permit_type"] == "Residential"
-    assert active_backlog.loc[0, "over_365_days_count"] == 80
-    assert matched_lifecycle.loc[0, "matched_cohort_count"] == 25
-    assert pooled_lifecycle.loc[0, "median_days"] == 28.0
-    assert len(backend.REQUIRED_RELATIONS) == 6
-    assert cleared_count == 3
-    assert actual_refresh_timestamp == refresh_timestamp
-    assert flags["builder_name_conflict"] == 1
-    assert flags["application_date_usable"] == 2
-    assert flags["application_date_no_usable"] == 0
-    assert flags["issued_date_usable"] == 2
-    assert flags["issued_date_no_usable"] == 0
-    assert flags["completion_date_usable"] == 1
-    assert flags["completion_date_no_usable"] == 1
-    assert flags["both_dates_available"] == 1
-    assert flags["closed_revision_count"] == 2
-    assert flags["closed_both_dates_available"] == 1
-    assert flags["cleared_status_missing"] == 0
-    assert flags["cleared_revisions_with_findings"] == 1
-    assert flags["active_builder_name_conflict"] == 1
-    assert flags["active_builder_name_missing"] == 3
-    assert flags["active_issued_date_missing"] == 0
-    assert flags["active_geo_id_missing"] == 0
-    assert flags["active_revisions_with_findings"] == 1
-    assert flags["cleared_builder_name_missing"] == 1
-    assert flags["cleared_geo_id_missing"] == 2
-    assert flags["cleared_revisions_with_findings"] == 1
-    assert sum("FCT_ACTIVE_PERMIT_REVISION" in query for query in cursor.queries) == 1
-    assert "application_date IS NULL" in cursor.last_query
-    assert "NOT COALESCE(application_date_conflict, FALSE)" in cursor.last_query
-    assert all(
-        flags[field] == 0
-        for field in backend.FLAG_FIELDS
-        if field != "builder_name_conflict"
+    assert backlog.loc[0, "summary_level"] == "overall"
+    assert matched.loc[0, "matched_cohort_count"] == 25
+    assert pooled.loc[0, "median_days"] == 28.0
+    assert cleared_count == 200
+    assert actual_refresh == refresh_timestamp
+    assert set(backend.REQUIRED_RELATIONS) == {
+        "MART_ACTIVE_PERMIT_AGE",
+        "MART_ACTIVE_BACKLOG_SUMMARY",
+        "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
+        "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
+        "MART_CLEARED_LIFECYCLE_POOLED",
+        "MART_DATA_QUALITY_SUMMARY",
+    }
+    assert set(backend.REQUIRED_QUALITY_METRICS).issubset(quality)
+    assert quality["active_revisions_analysed"] == 100
+    assert quality["active_revisions_age_eligible"] == 80
+    assert quality["active_exclusion_status_conflict"] == 2
+    assert quality["cleared_revision_count"] == 200
+    assert quality["application_date_usable"] == 150
+    assert quality["closed_both_dates_available"] == 80
+    assert not any(
+        "FCT_ACTIVE_PERMIT_REVISION" in query or "FCT_CLEARED_PERMIT_REVISION" in query
+        for query in cursor.queries
+    )
+    assert not any(
+        "MEDIAN(" in query.upper() or "PERCENTILE_CONT" in query.upper()
+        for query in cursor.queries
     )
     assert connection_args["role"] == "TORONTO_DASHBOARD_ROLE"
     assert connection_args["warehouse"] == "TORONTO_XS_WH"
     assert connection_args["database"] == "TORONTO"
-    assert cursor.closed
-    assert connection.closed
+    assert cursor.closed and connection.closed
 
 
 def test_refresh_timestamp_is_optional_before_first_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cursor = FakeCursor(set(backend.REQUIRED_RELATIONS))
-    connection = FakeConnection(cursor)
+    connection = FakeConnection(FakeCursor(set(backend.REQUIRED_RELATIONS)))
     install_snowflake_stubs(monkeypatch, connection)
-
     result = backend.load_snowflake_dashboard_data(CONFIG)
-
     assert result[7] is None
-    assert cursor.closed
-    assert connection.closed
+    assert connection.fake_cursor.closed and connection.closed

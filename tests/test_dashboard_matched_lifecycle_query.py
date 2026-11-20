@@ -1,28 +1,28 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import duckdb
 
-from dashboard.snowflake_backend import MATCHED_LIFECYCLE_POOLED_SQL
 
-
-def test_pooled_lifecycle_query_uses_one_chronological_closed_cohort() -> None:
+def test_pooled_lifecycle_mart_uses_one_chronological_closed_cohort() -> None:
+    model_path = Path("dbt/models/marts/mart_cleared_lifecycle_pooled.sql")
+    sql = model_path.read_text(encoding="utf-8")
+    sql = sql.replace("{{ config(materialized='table') }}", "")
+    sql = sql.replace(
+        "{{ ref('fct_cleared_permit_revision') }}", "fct_cleared_permit_revision"
+    )
     connection = duckdb.connect(":memory:")
     try:
-        connection.execute(
-            """
+        connection.execute("""
             CREATE TABLE fct_cleared_permit_revision (
-                status VARCHAR,
-                application_date DATE,
-                issued_date DATE,
-                completed_date DATE,
+                status VARCHAR, application_date DATE, issued_date DATE, completed_date DATE,
                 application_to_issue_days_raw BIGINT,
                 application_to_completion_days_raw BIGINT,
                 issue_to_completion_days_raw BIGINT
             )
-            """
-        )
-        connection.execute(
-            """
+        """)
+        connection.execute("""
             INSERT INTO fct_cleared_permit_revision VALUES
                 ('Closed', DATE '2024-01-01', DATE '2024-01-11', DATE '2024-04-10', 10, 100, 90),
                 ('Closed', DATE '2024-02-01', DATE '2024-02-21', DATE '2024-08-19', 20, 200, 180),
@@ -30,20 +30,19 @@ def test_pooled_lifecycle_query_uses_one_chronological_closed_cohort() -> None:
                 ('Active', DATE '2024-01-01', DATE '2024-01-11', DATE '2024-04-10', 10, 100, 90),
                 ('Closed', DATE '2024-01-01', NULL, DATE '2024-04-10', NULL, NULL, NULL),
                 ('Closed', DATE '2024-05-01', DATE '2024-04-01', DATE '2024-06-01', -30, 31, 61)
-            """
+        """)
+        result = connection.execute(sql).fetchdf()
+        result = (
+            result.set_index("measure")
+            .loc[
+                [
+                    "Application to issue",
+                    "Issue to completion",
+                    "Application to completion",
+                ]
+            ]
+            .reset_index()
         )
-
-        result = connection.execute(
-            MATCHED_LIFECYCLE_POOLED_SQL.format(
-                fact_relation="fct_cleared_permit_revision"
-            )
-        ).fetchdf()
-
-        assert result["measure"].tolist() == [
-            "Application to issue",
-            "Issue to completion",
-            "Application to completion",
-        ]
         assert result["matched_cohort_count"].tolist() == [3, 3, 3]
         assert result["median_days"].tolist() == [20.0, 180.0, 200.0]
         assert result["p90_days"].tolist() == [28.0, 252.0, 280.0]

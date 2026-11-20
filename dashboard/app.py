@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import time
@@ -16,12 +17,7 @@ import requests
 import streamlit as st
 from backend_config import resolve_dashboard_backend
 from refresh_metadata import format_refresh_timestamp
-from snowflake_backend import (
-    ACTIVE_FLAG_FIELDS,
-    FLAG_FIELDS,
-    MATCHED_LIFECYCLE_POOLED_SQL,
-    load_snowflake_dashboard_data,
-)
+from snowflake_backend import REQUIRED_QUALITY_METRICS, load_snowflake_dashboard_data
 from streamlit.errors import StreamlitSecretNotFoundError
 
 FAVICON_SVG = (
@@ -444,7 +440,9 @@ def snowflake_dashboard_settings() -> dict[str, Any]:
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, max_entries=1, show_spinner=False)
 def load_dashboard_data(
-    backend: str = "duckdb", config_fingerprint: str = ""
+    backend: str = "duckdb",
+    config_fingerprint: str = "",
+    duckdb_path: str = "",
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -455,20 +453,28 @@ def load_dashboard_data(
     dict[str, int],
     Any | None,
 ]:
-    """Load dashboard data from the explicitly selected backend.
-
-    config_fingerprint participates in Streamlit's cache key so a change to
-    Snowflake connection settings cannot reuse results from the prior settings.
-    """
+    """Read the same tested dbt serving contract from the selected backend."""
     if backend == "snowflake":
         return load_snowflake_dashboard_data(snowflake_dashboard_settings())
     if backend != "duckdb":
         raise ValueError("Unsupported dashboard backend.")
 
-    with TemporaryDirectory(prefix="toronto-housing-dashboard-") as temp_dir:
-        # Keep the filename aligned with the dbt warehouse/catalog name.
-        database_path = Path(temp_dir) / "toronto.duckdb"
-        download_release_database(database_path)
+    with ExitStack() as stack:
+        configured_path = duckdb_path.strip()
+        if configured_path:
+            database_path = Path(configured_path).expanduser()
+            if not database_path.is_file():
+                raise FileNotFoundError(
+                    "DASHBOARD_DUCKDB_PATH does not point to an existing file: "
+                    f"{database_path}"
+                )
+        else:
+            temp_dir = stack.enter_context(
+                TemporaryDirectory(prefix="toronto-housing-dashboard-")
+            )
+            database_path = Path(temp_dir) / "toronto.duckdb"
+            download_release_database(database_path)
+
         connection = duckdb.connect(str(database_path), read_only=True)
         try:
             available = {
@@ -479,11 +485,11 @@ def load_dashboard_data(
             }
             required = {
                 (DBT_SCHEMA, "mart_active_permit_age"),
-                (DBT_SCHEMA, "fct_active_permit_revision"),
-                (DBT_SCHEMA, "mart_active_backlog_by_year_type"),
+                (DBT_SCHEMA, "mart_active_backlog_summary"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_by_year_type"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_matched_by_year_type"),
-                (DBT_SCHEMA, "fct_cleared_permit_revision"),
+                (DBT_SCHEMA, "mart_cleared_lifecycle_pooled"),
+                (DBT_SCHEMA, "mart_data_quality_summary"),
             }
             missing = sorted(required - available)
             if missing:
@@ -492,7 +498,7 @@ def load_dashboard_data(
                 )
                 raise RuntimeError(
                     "The downloaded release does not contain required dbt relations: "
-                    f"{missing_names}. The release may not yet contain a dbt-built warehouse."
+                    f"{missing_names}. The release may not yet contain the new dbt serving contract."
                 )
 
             active = connection.execute(
@@ -502,129 +508,20 @@ def load_dashboard_data(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type"
             ).fetchdf()
             active_backlog = connection.execute(
-                f"SELECT * FROM {DBT_SCHEMA}.mart_active_backlog_by_year_type"
+                f"SELECT * FROM {DBT_SCHEMA}.mart_active_backlog_summary"
             ).fetchdf()
             matched_lifecycle = connection.execute(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_matched_by_year_type"
             ).fetchdf()
             pooled_lifecycle = connection.execute(
-                MATCHED_LIFECYCLE_POOLED_SQL.format(
-                    fact_relation=f"{DBT_SCHEMA}.fct_cleared_permit_revision"
-                )
+                f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_pooled"
+            ).fetchdf()
+            quality_frame = connection.execute(
+                f"SELECT metric_name, metric_value FROM {DBT_SCHEMA}.mart_data_quality_summary"
             ).fetchdf()
 
-            # The data-quality page needs aggregates, not the full Cleared fact.
-            flag_expressions = [
-                f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) AS {field}"
-                for field in FLAG_FIELDS
-            ]
-            date_coverage_expressions = [
-                "SUM(CASE WHEN application_date IS NOT NULL THEN 1 ELSE 0 END) "
-                "AS application_date_usable",
-                "SUM(CASE WHEN application_date IS NULL "
-                "AND NOT COALESCE(application_date_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS application_date_no_usable",
-                "SUM(CASE WHEN issued_date IS NOT NULL THEN 1 ELSE 0 END) "
-                "AS issued_date_usable",
-                "SUM(CASE WHEN issued_date IS NULL "
-                "AND NOT COALESCE(issued_date_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS issued_date_no_usable",
-                "SUM(CASE WHEN completed_date IS NOT NULL THEN 1 ELSE 0 END) "
-                "AS completion_date_usable",
-                "SUM(CASE WHEN completed_date IS NULL "
-                "AND NOT COALESCE(completed_date_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS completion_date_no_usable",
-                "SUM(CASE WHEN application_date IS NOT NULL "
-                "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
-                "AS both_dates_available",
-                "SUM(CASE WHEN status = 'Closed' THEN 1 ELSE 0 END) "
-                "AS closed_revision_count",
-                "SUM(CASE WHEN status = 'Closed' "
-                "AND application_date IS NOT NULL "
-                "AND completed_date IS NOT NULL THEN 1 ELSE 0 END) "
-                "AS closed_both_dates_available",
-                "SUM(CASE WHEN observed_builder_names IS NULL "
-                "AND NOT COALESCE(builder_name_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS cleared_builder_name_missing",
-                "SUM(CASE WHEN status IS NULL "
-                "AND NOT COALESCE(has_status_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS cleared_status_missing",
-                "SUM(CASE WHEN geo_id IS NULL "
-                "AND NOT COALESCE(geo_id_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS cleared_geo_id_missing",
-                "SUM(CASE WHEN "
-                + " OR ".join(
-                    [f"COALESCE({field}, FALSE)" for field in FLAG_FIELDS]
-                    + ["(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))"]
-                )
-                + " THEN 1 ELSE 0 END) AS cleared_revisions_with_findings",
-            ]
-            result = connection.execute(
-                "SELECT COUNT(*) AS cleared_revision_count, "
-                f"{', '.join(flag_expressions + date_coverage_expressions)} "
-                f"FROM {DBT_SCHEMA}.fct_cleared_permit_revision"
-            )
-            values = result.fetchone()
-            columns = [item[0] for item in result.description]
-            totals = dict(zip(columns, values, strict=True))
-            cleared_revision_count = int(totals.pop("cleared_revision_count") or 0)
-            quality_counts = {key: int(value or 0) for key, value in totals.items()}
-
-            active_flag_expressions = [
-                f"SUM(CASE WHEN COALESCE({field}, FALSE) THEN 1 ELSE 0 END) "
-                f"AS active_{field}"
-                for field in ACTIVE_FLAG_FIELDS
-            ]
-            active_finding_conditions = [
-                f"COALESCE({field}, FALSE)" for field in ACTIVE_FLAG_FIELDS
-            ] + [
-                "(status IS NULL AND NOT COALESCE(has_status_conflict, FALSE))",
-                "(application_date IS NULL "
-                "AND NOT COALESCE(application_date_conflict, FALSE))",
-            ]
-            active_aggregate_expressions = active_flag_expressions + [
-                "SUM(CASE WHEN builder_name IS NULL "
-                "AND NOT COALESCE(builder_name_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS active_builder_name_missing",
-                "SUM(CASE WHEN status IS NULL "
-                "AND NOT COALESCE(has_status_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS active_status_missing",
-                "SUM(CASE WHEN application_date IS NULL "
-                "AND NOT COALESCE(application_date_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS active_application_date_missing",
-                "SUM(CASE WHEN issued_date IS NULL "
-                "AND NOT COALESCE(issued_date_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS active_issued_date_missing",
-                "SUM(CASE WHEN geo_id IS NULL "
-                "AND NOT COALESCE(geo_id_conflict, FALSE) "
-                "THEN 1 ELSE 0 END) AS active_geo_id_missing",
-                "SUM(CASE WHEN "
-                + " OR ".join(active_finding_conditions)
-                + " THEN 1 ELSE 0 END) AS active_revisions_with_findings",
-            ]
-            active_quality_result = connection.execute(
-                "SELECT "
-                + ", ".join(active_aggregate_expressions)
-                + f" FROM {DBT_SCHEMA}.fct_active_permit_revision"
-            )
-            active_quality_values = active_quality_result.fetchone()
-            active_quality_columns = [
-                item[0] for item in active_quality_result.description
-            ]
-            quality_counts.update(
-                {
-                    key: int(value or 0)
-                    for key, value in zip(
-                        active_quality_columns, active_quality_values, strict=True
-                    )
-                }
-            )
-
-            # The refresh timestamp is written by CD only after a successful
-            # dbt build/test run, then published as part of this DuckDB release.
             last_successful_refresh_utc = None
-            refresh_metadata_relation = ("metadata", "dashboard_refresh_metadata")
-            if refresh_metadata_relation in available:
+            if ("metadata", "dashboard_refresh_metadata") in available:
                 refresh_row = connection.execute(
                     "SELECT last_successful_refresh_utc "
                     "FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
@@ -634,20 +531,28 @@ def load_dashboard_data(
         finally:
             connection.close()
 
-    if active.empty:
-        raise RuntimeError(f"{DBT_SCHEMA}.mart_active_permit_age returned no records.")
-    if summary.empty:
+    for label, frame in (
+        ("mart_active_permit_age", active),
+        ("mart_cleared_lifecycle_by_year_type", summary),
+        ("mart_active_backlog_summary", active_backlog),
+        ("mart_cleared_lifecycle_matched_by_year_type", matched_lifecycle),
+        ("mart_cleared_lifecycle_pooled", pooled_lifecycle),
+        ("mart_data_quality_summary", quality_frame),
+    ):
+        if frame.empty:
+            raise RuntimeError(f"analytics.{label} returned no records.")
+
+    quality_counts = {
+        str(row.metric_name): int(row.metric_value or 0)
+        for row in quality_frame.itertuples(index=False)
+    }
+    missing_metrics = sorted(set(REQUIRED_QUALITY_METRICS) - set(quality_counts))
+    if missing_metrics:
         raise RuntimeError(
-            f"{DBT_SCHEMA}.mart_cleared_lifecycle_by_year_type returned no records."
+            "analytics.mart_data_quality_summary is missing metrics: "
+            + ", ".join(missing_metrics)
         )
-    if active_backlog.empty:
-        raise RuntimeError(
-            f"{DBT_SCHEMA}.mart_active_backlog_by_year_type returned no records."
-        )
-    if matched_lifecycle.empty or pooled_lifecycle.empty:
-        raise RuntimeError(
-            "The matched Closed-permit lifecycle relations returned no records."
-        )
+    cleared_revision_count = quality_counts["cleared_revision_count"]
     return (
         active,
         summary,
@@ -743,7 +648,7 @@ def selected_or_all(
     return df[df[column].astype(str).isin(selection)]
 
 
-def report_sidebar(backend: str) -> tuple[str, Any, Any]:
+def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, Any]:
     with st.sidebar:
         st.markdown(
             '<div class="sidebar-brand">'
@@ -767,6 +672,10 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
                 "Reads the dashboard-facing dbt relations in TORONTO.ANALYTICS "
                 "using the configured Snowflake role."
             )
+        elif local_duckdb:
+            st.caption(
+                "Reads the configured local DuckDB database using read-only access."
+            )
         else:
             st.markdown(
                 f"[Latest published DuckDB database on GitHub ↗]({RELEASE_PAGE_URL})"
@@ -782,8 +691,12 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
             help=(
                 "Re-query the Snowflake dashboard marts."
                 if backend == "snowflake"
-                else "Fetch the latest published database from GitHub. "
-                "The file is about 120 MB."
+                else (
+                    "Re-read the configured local DuckDB database."
+                    if local_duckdb
+                    else "Fetch the latest published database from GitHub. "
+                    "The file is about 120 MB."
+                )
             ),
         ):
             load_dashboard_data.clear()
@@ -793,6 +706,11 @@ def report_sidebar(backend: str) -> tuple[str, Any, Any]:
         if backend == "snowflake":
             st.caption(
                 "Data is cached for up to 24 hours. Refreshing re-queries Snowflake."
+            )
+        elif local_duckdb:
+            st.caption(
+                "Data is cached for up to 24 hours. Refreshing re-reads the configured "
+                "local DuckDB database."
             )
         else:
             st.caption(
@@ -822,63 +740,70 @@ def overview(
         "Where current Active permit records are concentrated, how long they have remained open, and how elapsed time is distributed across matched Closed-permit lifecycles.",
     )
 
-    active["is_age_eligible"] = normalize_bool(active["is_age_eligible"])
-    active["age_since_application_days"] = number(active["age_since_application_days"])
-    eligible_active = active.loc[active["is_age_eligible"]].copy()
-    eligible_ages = eligible_active["age_since_application_days"].dropna()
-
-    count_columns = [
+    required_columns = {
+        "summary_level",
+        "application_year",
+        "permit_type",
         "current_active_revision_count",
         "age_eligible_count",
         "age_ineligible_count",
         "over_365_days_count",
         "over_730_days_count",
         "over_1095_days_count",
-    ]
-    required_columns = {"application_year", "permit_type", *count_columns}
+        "median_age_days",
+        "p90_age_days",
+        "eligible_backlog_share_pct",
+    }
     missing_columns = required_columns - set(active_backlog.columns)
     if missing_columns:
         raise RuntimeError(
-            "The Active backlog mart is missing required columns: "
+            "The Active backlog summary mart is missing required columns: "
             + ", ".join(sorted(missing_columns))
         )
-    active_backlog["application_year"] = number(active_backlog["application_year"])
-    for column in count_columns:
-        active_backlog[column] = number(active_backlog[column]).fillna(0)
-
-    cohort = (
-        active_backlog.groupby("application_year", dropna=False)[count_columns]
-        .sum()
-        .reset_index()
-    )
-    eligible_active["application_year"] = pd.to_datetime(
-        eligible_active["application_date"], errors="coerce"
-    ).dt.year
-    cohort_age = (
-        eligible_active.dropna(subset=["application_year"])
-        .groupby("application_year", as_index=False)
-        .agg(
-            median_age_days=("age_since_application_days", "median"),
-            p90_age_days=(
-                "age_since_application_days",
-                lambda values: values.quantile(0.90),
-            ),
+    overall_rows = active_backlog.loc[active_backlog["summary_level"] == "overall"]
+    if len(overall_rows) != 1:
+        raise RuntimeError(
+            "The Active backlog summary mart must contain exactly one overall row."
         )
-    )
-    cohort = cohort.merge(cohort_age, on="application_year", how="left")
+    overall = overall_rows.iloc[0]
+    cohort = active_backlog.loc[
+        active_backlog["summary_level"] == "application_year"
+    ].copy()
+    by_type = active_backlog.loc[
+        active_backlog["summary_level"] == "permit_type"
+    ].copy()
+    if cohort.empty or by_type.empty:
+        raise RuntimeError(
+            "The Active backlog summary mart is missing year or permit-type groups."
+        )
+
+    cohort["application_year"] = number(cohort["application_year"])
     cohort["application_year_label"] = cohort["application_year"].map(
         lambda value: str(int(value)) if pd.notna(value) else "Unknown year"
     )
     cohort = cohort.sort_values("application_year", na_position="last")
+    for column in (
+        "current_active_revision_count",
+        "age_eligible_count",
+        "age_ineligible_count",
+        "over_365_days_count",
+        "over_730_days_count",
+        "over_1095_days_count",
+    ):
+        cohort[column] = number(cohort[column]).fillna(0)
 
-    total_active = int(cohort["current_active_revision_count"].sum())
-    eligible_count = int(cohort["age_eligible_count"].sum())
-    ineligible_count = int(cohort["age_ineligible_count"].sum())
-    over_365 = int(cohort["over_365_days_count"].sum())
-    over_730 = int(cohort["over_730_days_count"].sum())
-    over_1095 = int(cohort["over_1095_days_count"].sum())
-    median_active_age = eligible_ages.median() if not eligible_ages.empty else None
-    p90_active_age = eligible_ages.quantile(0.90) if not eligible_ages.empty else None
+    total_active = int(overall["current_active_revision_count"])
+    eligible_count = int(overall["age_eligible_count"])
+    ineligible_count = int(overall["age_ineligible_count"])
+    over_365 = int(overall["over_365_days_count"])
+    over_730 = int(overall["over_730_days_count"])
+    over_1095 = int(overall["over_1095_days_count"])
+    median_active_age = overall["median_age_days"]
+    p90_active_age = overall["p90_age_days"]
+    recent_share = float(overall.get("recent_cohort_2024_plus_share_pct") or 0) / 100.0
+    top_five_share = float(overall.get("top_five_over_365_share_pct") or 0) / 100.0
+    latest_year_value = overall.get("latest_application_year")
+    latest_year = int(latest_year_value) if pd.notna(latest_year_value) else None
 
     asof_values = (
         pd.to_datetime(active["as_of_date"], errors="coerce").dropna()
@@ -891,7 +816,11 @@ def overview(
         else "Not available"
     )
     backend_label = (
-        "Snowflake warehouse" if backend == "snowflake" else "Published DuckDB snapshot"
+        "Snowflake warehouse"
+        if backend == "snowflake"
+        else "Local DuckDB database"
+        if os.environ.get("DASHBOARD_DUCKDB_PATH", "").strip()
+        else "Published DuckDB snapshot"
     )
 
     with st.container(key="story_data_context"):
@@ -966,10 +895,6 @@ def overview(
     cohort_fig.update_yaxes(title="Current Active records")
     st.plotly_chart(chart_layout(cohort_fig, 360), width="stretch")
 
-    eligible_total = max(eligible_count, 1)
-    cohort["eligible_backlog_share_pct"] = (
-        100.0 * cohort["age_eligible_count"] / eligible_total
-    )
     cohort_table = cohort[
         [
             "application_year_label",
@@ -998,15 +923,6 @@ def overview(
         }
     )
     st.dataframe(cohort_table, hide_index=True, width="stretch")
-    recent_cohorts = cohort.loc[
-        cohort["application_year"] >= 2024, "age_eligible_count"
-    ].sum()
-    recent_share = recent_cohorts / eligible_total if eligible_count else 0.0
-    latest_year = (
-        int(cohort["application_year"].dropna().max())
-        if cohort["application_year"].notna().any()
-        else None
-    )
     st.markdown(
         f"**{recent_share:.1%}** of the age-eligible backlog belongs to 2024 and later application cohorts. "
         + (f"The {latest_year} cohort is partial." if latest_year else "")
@@ -1023,19 +939,6 @@ def overview(
         "Median and P90 ages are calculated from individual Active records, not averages of permit-type summaries.</div>",
         unsafe_allow_html=True,
     )
-    by_type = (
-        active_backlog.groupby("permit_type", dropna=False)[count_columns]
-        .sum()
-        .reset_index()
-    )
-    type_age = eligible_active.groupby("permit_type", as_index=False).agg(
-        median_age_days=("age_since_application_days", "median"),
-        p90_age_days=(
-            "age_since_application_days",
-            lambda values: values.quantile(0.90),
-        ),
-    )
-    by_type = by_type.merge(type_age, on="permit_type", how="left")
     by_type = by_type.sort_values(
         ["over_365_days_count", "current_active_revision_count"],
         ascending=[False, False],
@@ -1050,12 +953,8 @@ def overview(
         title="Top permit types by Active records open over one year",
     )
     type_fig.update_xaxes(title="Age-eligible Active records open >365 days")
-    type_fig.update_yaxes(title="Permit type")
+    type_fig.update_yaxes(title="")
     st.plotly_chart(chart_layout(type_fig, 420), width="stretch")
-
-    top_five_share = (
-        by_type.head(5)["over_365_days_count"].sum() / over_365 if over_365 else 0.0
-    )
     st.markdown(
         f"The five permit types with the largest over-one-year counts account for **{top_five_share:.1%}** "
         "of all age-eligible Active records open more than 365 days."
@@ -1116,7 +1015,6 @@ def overview(
             )
 
     st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
-
     lifecycle_fig = go.Figure()
     lifecycle_fig.add_trace(
         go.Bar(
@@ -1162,9 +1060,7 @@ def overview(
         if permit_types:
             choose_type, choose_measure = st.columns(2, gap="medium")
             selected_type = choose_type.selectbox(
-                "Permit type",
-                permit_types,
-                key="story_matched_permit_type",
+                "Permit type", permit_types, key="story_matched_permit_type"
             )
             selected_measure = choose_measure.selectbox(
                 "Lifecycle interval",
@@ -1522,16 +1418,10 @@ def quality_page(
         "Data quality and definitions",
         "Findings, analysis exclusions and date completeness are reported separately so their counts are not confused.",
     )
-    active = active.copy()
-    for field in ["is_age_eligible"]:
-        if field in active:
-            active[field] = normalize_bool(active[field])
-
-    eligible_n = (
-        int(active["is_age_eligible"].sum()) if "is_age_eligible" in active else 0
-    )
-    active_n = len(active)
-    excluded_n = active_n - eligible_n
+    # Counts and exclusion classifications are prepared and tested in dbt.
+    active_n = int(quality_counts.get("active_revisions_analysed", 0))
+    eligible_n = int(quality_counts.get("active_revisions_age_eligible", 0))
+    excluded_n = int(quality_counts.get("active_revisions_age_ineligible", 0))
     active_findings_n = int(quality_counts.get("active_revisions_with_findings", 0))
     cleared_findings_n = int(quality_counts.get("cleared_revisions_with_findings", 0))
 
@@ -1657,51 +1547,26 @@ def quality_page(
         "Each excluded revision is assigned its first applicable reason. "
         "This chart is an eligibility breakdown, not a count of data-quality defects."
     )
-    reason_series = active.get(
-        "cohort_exclusion_reason", pd.Series(index=active.index, dtype="object")
-    )
-    exclusion = (
-        reason_series.dropna()
-        .astype(str)
-        .value_counts()
-        .rename_axis("Reason")
-        .reset_index(name="Records")
-    )
     exclusion_labels = {
         "status_conflict": "Status values conflict",
         "missing_status": "Status is missing",
         "terminal_or_exception_status": "Closed, Cancelled or Abandoned (intentional exclusion)",
         "application_date_conflict": "Application dates conflict",
         "missing_application_date": "Application date is missing",
+        "unclassified": "Unclassified exclusion",
     }
-    exclusion["Reason"] = (
-        exclusion["Reason"].map(exclusion_labels).fillna(exclusion["Reason"])
+    exclusion = pd.DataFrame(
+        [
+            {
+                "Reason": label,
+                "Records": quality_counts.get(f"active_exclusion_{reason}", 0),
+            }
+            for reason, label in exclusion_labels.items()
+        ]
     )
-    classified_excluded_n = (
-        int(exclusion["Records"].sum()) if not exclusion.empty else 0
+    exclusion = exclusion.loc[exclusion["Records"] > 0].sort_values(
+        "Records", ascending=False
     )
-    unclassified_excluded_n = excluded_n - classified_excluded_n
-    if unclassified_excluded_n < 0:
-        st.warning(
-            "The exclusion reasons exceed the number of ineligible Active revisions. "
-            "Review the age-eligibility and reason-classification outputs."
-        )
-    elif unclassified_excluded_n > 0:
-        exclusion = pd.concat(
-            [
-                exclusion,
-                pd.DataFrame(
-                    [
-                        {
-                            "Reason": "Unclassified exclusion",
-                            "Records": unclassified_excluded_n,
-                        }
-                    ]
-                ),
-            ],
-            ignore_index=True,
-        )
-    exclusion = exclusion.sort_values("Records", ascending=False)
     if exclusion.empty:
         st.info("No Active revisions are excluded from the age analysis.")
     else:
@@ -1867,8 +1732,7 @@ def quality_page(
     completion_conflicts = quality_counts.get("completed_date_conflict", 0)
     closed_count = quality_counts.get("closed_revision_count", 0)
     closed_both_dates = quality_counts.get("closed_both_dates_available", 0)
-    both_dates_populated = quality_counts.get("both_dates_available", 0)
-    non_closed_both_dates = max(both_dates_populated - closed_both_dates, 0)
+    non_closed_both_dates = quality_counts.get("non_closed_both_dates_available", 0)
 
     coverage_table = pd.DataFrame(
         [
@@ -1920,25 +1784,7 @@ def quality_page(
             "Includes records with missing or conflicting status",
         )
 
-    summary_pairs = int(
-        pd.to_numeric(
-            summary.loc[
-                summary["measure"] == "Application to completion",
-                "eligible_date_pairs",
-            ],
-            errors="coerce",
-        )
-        .fillna(0)
-        .sum()
-    )
-    if summary_pairs != closed_both_dates:
-        st.warning(
-            "The Cleared fact reports "
-            f"{closed_both_dates:,} Closed revisions with both dates, but the "
-            f"lifecycle summary reports {summary_pairs:,} Application-to-completion "
-            "date pairs. Review the fact and summary model refresh before "
-            "interpreting the timeline coverage."
-        )
+    # Fact-to-mart lifecycle reconciliation is enforced by dbt tests.
     st.caption(
         "A populated COMPLETED_DATE is source information, not proof that a permit "
         "was successfully completed. Only records marked Closed enter the lifecycle "
@@ -1975,6 +1821,11 @@ def quality_page(
 def main() -> None:
     try:
         backend = selected_dashboard_backend()
+        duckdb_path = (
+            os.environ.get("DASHBOARD_DUCKDB_PATH", "").strip()
+            if backend == "duckdb"
+            else ""
+        )
         snowflake_config = (
             snowflake_dashboard_settings() if backend == "snowflake" else {}
         )
@@ -1993,11 +1844,13 @@ def main() -> None:
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
 
-    page, loading_slot, last_successful_refresh_slot = report_sidebar(backend)
+    page, loading_slot, last_successful_refresh_slot = report_sidebar(
+        backend, local_duckdb=bool(duckdb_path)
+    )
     force_refresh = bool(st.session_state.pop("refresh_published_data", False))
     last_loaded_at = float(st.session_state.get("_dashboard_loaded_at", 0.0))
     cache_may_have_expired = (time() - last_loaded_at) >= CACHE_TTL_SECONDS
-    backend_key = (backend, config_fingerprint)
+    backend_key = (backend, config_fingerprint, duckdb_path)
     backend_changed = st.session_state.get("_dashboard_backend_key") != backend_key
     show_loading_status = (
         force_refresh
@@ -2022,6 +1875,8 @@ def main() -> None:
                     loading_detail = (
                         "Querying the Snowflake dashboard marts using read-only access."
                     )
+                elif duckdb_path:
+                    loading_detail = "Reading the configured local DuckDB database in read-only mode."
                 elif force_refresh:
                     loading_detail = (
                         "Downloading the latest published database from GitHub. "
@@ -2053,7 +1908,7 @@ def main() -> None:
                         cleared_count,
                         quality_counts,
                         last_successful_refresh_utc,
-                    ) = load_dashboard_data(backend, config_fingerprint)
+                    ) = load_dashboard_data(backend, config_fingerprint, duckdb_path)
                 except Exception:
                     loading_panel.markdown(
                         """
@@ -2078,14 +1933,19 @@ def main() -> None:
                 cleared_count,
                 quality_counts,
                 last_successful_refresh_utc,
-            ) = load_dashboard_data(backend, config_fingerprint)
+            ) = load_dashboard_data(backend, config_fingerprint, duckdb_path)
         st.session_state["_dashboard_loaded"] = True
         st.session_state["_dashboard_backend_key"] = backend_key
         if show_loading_status:
             st.session_state["_dashboard_loaded_at"] = time()
     except Exception as exc:
         st.error("The dashboard could not load the selected backend's permit data.")
-        if backend == "duckdb":
+        if backend == "duckdb" and duckdb_path:
+            st.markdown(
+                "Check `DASHBOARD_DUCKDB_PATH` and confirm the local database exists "
+                "and contains all six required dbt relations."
+            )
+        elif backend == "duckdb":
             st.markdown(
                 "Check your connection and try **Refresh data now**. The app downloads "
                 "the latest published database from the public "
