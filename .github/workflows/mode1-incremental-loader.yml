@@ -524,7 +524,7 @@ jobs:
           TORONTO_SNOWFLAKE_STAGE_GENERATION: ${{ steps.prepare.outputs.candidate_generation_id }}
           TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
           TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
-        run: python scripts/loader_promote_snowflake_raw.py --validate-only
+        run: python -m scripts.loader_promote_snowflake_raw --validate-only
 
       - name: Persist the validated Snowflake candidate before promotion
         id: persist_validated_snowflake_candidate
@@ -555,7 +555,7 @@ jobs:
           TORONTO_SNOWFLAKE_STAGE_GENERATION: ${{ steps.prepare.outputs.candidate_generation_id }}
           TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
           TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
-        run: python scripts/loader_promote_snowflake_raw.py
+        run: python -m scripts.loader_promote_snowflake_raw
 
       - name: Dispatch the Snowflake serving-schema refresh
         id: dispatch_snowflake_serving
