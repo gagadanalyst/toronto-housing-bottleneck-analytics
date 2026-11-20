@@ -759,9 +759,27 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
     workflow = workflow_path.read_text(encoding="utf-8")
     assert "reject_noncanonical_manual_dispatch" in workflow
     assert "github.ref != 'refs/heads/main'" in workflow
-    assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 2
-    assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 3
-    assert "steps.replay.outputs.has_pending_archives != 'true'" not in workflow
+    assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 3
+    assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 5
+    assert "persist_validated_duckdb_candidate" in workflow
+    assert "persist_validated_snowflake_candidate" in workflow
+    assert "CANDIDATE_DATABASE" in workflow
+    assert "persist_validated_duckdb_candidate.outcome == 'success'" in workflow
+    assert "persist_validated_snowflake_candidate.outcome == 'success'" in workflow
+    assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2))"' in workflow
+    assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2 + 1))"' in workflow
+    assert workflow.index(
+        "Dispatch the Snowflake serving-schema refresh"
+    ) < workflow.index("Persist the promoted Snowflake Mode 1 checkpoint")
+    assert (
+        "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
+        in workflow
+    )
+    assert (
+        "if: always() && steps.promote_snowflake_candidate.outcome == 'success' "
+        "&& steps.dispatch_snowflake_serving.outcome == 'success'"
+    ) in workflow
+    assert workflow.count("steps.replay.outputs.has_pending_archives != 'true'") == 2
     assert "rebootstrap_from_mode2:" in workflow
     assert "default: false" in workflow
     assert (
@@ -959,3 +977,154 @@ def test_mode1_snowflake_bootstrap_uses_promoted_raw_and_preserves_ledger_candid
     assert result["mode2_candidate"] == mode2_candidate
     assert result["mode2_promoted_source_schema"] == "TORONTO.RAW"
     assert result["candidate"] == "TORONTO.RAW_STAGE_900_1"
+
+
+def test_mode1_snowflake_promoted_raw_marker_requires_exact_generation():
+    class FakeCursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.query = ""
+
+        def execute(self, query):
+            self.query = query
+
+        def fetchall(self):
+            return self.rows
+
+    cursor = FakeCursor([("700:2", "PROMOTED")])
+    mode1_state._validate_snowflake_promoted_mode1_raw_marker(
+        cursor, expected_generation_id="700:2"
+    )
+    assert "TORONTO.RAW.TORONTO_CANDIDATE_CONTROL" in cursor.query
+
+    with pytest.raises(RuntimeError, match="expected Mode 1 generation"):
+        mode1_state._validate_snowflake_promoted_mode1_raw_marker(
+            FakeCursor([("699:1", "PROMOTED")]), expected_generation_id="700:2"
+        )
+    with pytest.raises(RuntimeError, match="expected promoted Mode 1 marker"):
+        mode1_state._validate_snowflake_promoted_mode1_raw_marker(
+            FakeCursor([("700:2", "READY")]), expected_generation_id="700:2"
+        )
+
+
+def test_mode1_snowflake_clone_uses_promoted_mode1_raw_after_schema_swap(monkeypatch):
+    connection, cursor, temporary = _fake_snowflake_clone_session(
+        [("900:2", "PROMOTED")]
+    )
+    monkeypatch.setattr(
+        mode1_state,
+        "_snowflake_connection",
+        lambda _credentials: (connection, temporary),
+    )
+
+    schema = mode1_state._clone_snowflake_schema(
+        credentials="test-credentials",
+        source_schema="RAW",
+        run_id="901",
+        run_attempt="1",
+        expected_promoted_generation_id="900:2",
+    )
+
+    assert schema == "RAW_STAGE_901_1"
+    marker_index = next(
+        index
+        for index, query in enumerate(cursor.queries)
+        if "FROM TORONTO.RAW.TORONTO_CANDIDATE_CONTROL" in query
+    )
+    clone_index = next(
+        index for index, query in enumerate(cursor.queries) if "CLONE TORONTO." in query
+    )
+    assert marker_index < clone_index
+    assert 'CLONE TORONTO."RAW"' in cursor.queries[clone_index]
+    assert any("UPDATED_AT TIMESTAMP_TZ" in query for query in cursor.queries)
+    assert connection.committed
+    assert connection.closed
+
+
+def test_validated_checkpoint_duckdb_promotion_recovery(tmp_path):
+    import hashlib
+
+    production = tmp_path / "production.duckdb"
+    production.write_bytes(b"promoted-candidate")
+    candidate_sha = hashlib.sha256(production.read_bytes()).hexdigest()
+    manifest = {
+        "production_baseline": {"backend": "duckdb", "sha256": "old"},
+        "candidate_sha256": candidate_sha,
+    }
+
+    assert not mode1_state._validated_checkpoint_is_already_promoted(
+        manifest=manifest,
+        observed_baseline={"backend": "duckdb", "sha256": "old"},
+        backend="duckdb",
+        production_database=production,
+    )
+    assert mode1_state._validated_checkpoint_is_already_promoted(
+        manifest=manifest,
+        observed_baseline={"backend": "duckdb", "sha256": "new"},
+        backend="duckdb",
+        production_database=production,
+    )
+
+    with pytest.raises(RuntimeError, match="matches neither"):
+        mode1_state._validated_checkpoint_is_already_promoted(
+            manifest=manifest,
+            observed_baseline={"backend": "duckdb", "sha256": "unknown"},
+            backend="duckdb",
+            production_database=tmp_path / "different.duckdb",
+        )
+
+
+def test_validated_checkpoint_snowflake_defers_to_raw_generation_marker():
+    manifest = {"production_baseline": {"backend": "snowflake", "old": "signature"}}
+    assert not mode1_state._validated_checkpoint_is_already_promoted(
+        manifest=manifest,
+        observed_baseline={"backend": "snowflake", "new": "signature"},
+        backend="snowflake",
+        production_database=None,
+    )
+
+
+def test_mode1_snowflake_generation_prefers_candidate_identity():
+    manifest = {
+        "candidate_generation_id": "900:2",
+        "last_attempt_run_id": "901",
+        "last_attempt_run_attempt": "1",
+    }
+    assert mode1_state._manifest_snowflake_generation(manifest) == "900:2"
+
+
+def test_snowflake_raw_mode1_marker_state_accepts_ready_and_promoted():
+    class FakeCursor:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, _query):
+            pass
+
+        def fetchall(self):
+            return self.rows
+
+    assert (
+        mode1_state._snowflake_raw_mode1_marker_state(
+            FakeCursor([("900:2", "READY")]), expected_generation_id="900:2"
+        )
+        == "READY"
+    )
+    assert (
+        mode1_state._snowflake_raw_mode1_marker_state(
+            FakeCursor([("900:2", "PROMOTED")]), expected_generation_id="900:2"
+        )
+        == "PROMOTED"
+    )
+    with pytest.raises(RuntimeError):
+        mode1_state._snowflake_raw_mode1_marker_state(
+            FakeCursor([("899:1", "READY")]), expected_generation_id="900:2"
+        )
+
+
+def test_mode1_state_asset_attempt_separates_checkpoints():
+    assert mode1_state._state_asset_attempt("1") == "1"
+    assert mode1_state._state_asset_attempt("1", "2") == "2"
+    assert mode1_state._state_asset_attempt("1", "3") == "3"
+    with pytest.raises(ValueError, match="digits only"):
+        mode1_state._state_asset_attempt("1", "validated")

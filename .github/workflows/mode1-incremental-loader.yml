@@ -33,7 +33,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: toronto-mode1-incremental-loader
+  group: toronto-housing-data-publication
   cancel-in-progress: false
   queue: max
 
@@ -63,11 +63,16 @@ jobs:
     name: Stage Mode 1 DuckDB changes
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    outputs:
+      has_pending_archives: ${{ steps.replay.outputs.has_pending_archives }}
+      dbt_docs_published: ${{ steps.publish_duckdb_assets.outcome == 'success' }}
     permissions:
       contents: write
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      DO_NOT_TRACK: "1"
       TORONTO_MODE1_ENABLED: ${{ vars.TORONTO_MODE1_ENABLED }}
       TORONTO_SNAPSHOT_LOADER_ENABLED: ${{ vars.TORONTO_SNAPSHOT_LOADER_ENABLED }}
 
@@ -89,6 +94,26 @@ jobs:
             exit 1
           fi
 
+      - name: Restore current DuckDB production and capture its baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/warehouse data/staging/duckdb
+          rm -f data/warehouse/toronto.duckdb
+          if ! gh release download warehouse-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern toronto.duckdb \
+            --dir data/warehouse || ! test -s data/warehouse/toronto.duckdb; then
+            rm -f data/warehouse/toronto.duckdb
+            echo "warehouse-latest could not be restored; trying the latest verified immutable DuckDB checkpoint."
+            python -m scripts.restore_duckdb_recovery --output data/warehouse/toronto.duckdb
+          fi
+          test -s data/warehouse/toronto.duckdb
+          python -m scripts.snapshot_replay_baseline \
+            --backend duckdb \
+            --database data/warehouse/toronto.duckdb \
+            --output data/staging/duckdb/production-baseline.json
+
       - name: Restore or bootstrap the accepted DuckDB Mode 1 state
         id: prepare
         env:
@@ -103,6 +128,8 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT"
             --baseline-run-id "${{ inputs.baseline_run_id }}"
             --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+            --production-database data/warehouse/toronto.duckdb
+            --production-baseline data/staging/duckdb/production-baseline.json
           )
           if [ "$REBOOTSTRAP_FROM_MODE2" = "true" ]; then
             prepare_args+=(--rebootstrap-from-mode2)
@@ -111,6 +138,7 @@ jobs:
 
       - name: Replay only unprocessed immutable archives into DuckDB staging
         id: replay
+        if: steps.prepare.outputs.production_already_promoted != 'true'
         run: |
           python -m scripts.replay_snapshots \
             --mode incremental \
@@ -133,8 +161,22 @@ jobs:
             *) echo "Replay succeeded without an explicit has_pending_archives output; refusing state cleanup or bootstrap." >&2; exit 1 ;;
           esac
 
-      - name: Persist the validated DuckDB staging handoff
-        if: always() && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/duckdb/mode1/replay-summary.json') != ''
+      - name: Restore the persisted replay summary for promotion recovery
+        if: always() && steps.prepare.outputs.needs_promotion == 'true' && (steps.replay.outcome == 'skipped' || (steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'))
+        run: cp data/staging/duckdb/mode1/summary.json data/staging/duckdb/mode1/replay-summary.json
+
+      - name: Require explicit DuckDB replay pending-archive output
+        if: steps.replay.outcome == 'success'
+        env:
+          HAS_PENDING_ARCHIVES: ${{ steps.replay.outputs.has_pending_archives }}
+        run: |
+          case "$HAS_PENDING_ARCHIVES" in
+            true|false) ;;
+            *) echo "Replay succeeded without an explicit has_pending_archives output; refusing production promotion." >&2; exit 1 ;;
+          esac
+
+      - name: Persist retryable DuckDB state after a partial source load
+        if: always() && steps.replay.outcome == 'failure' && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/duckdb/mode1/replay-summary.json') != ''
         run: |
           python -m scripts.mode1_state publish \
             --backend duckdb \
@@ -143,6 +185,218 @@ jobs:
             --summary data/staging/duckdb/mode1/replay-summary.json \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Set the Mode 1 DuckDB candidate as the dbt target
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        run: |
+          echo "DBT_DUCKDB_PATH=${{ steps.prepare.outputs.database }}" >> "$GITHUB_ENV"
+          echo "TORONTO_DBT_AS_OF_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+
+      - name: Create isolated dbt environment
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        run: |
+          python -m venv "$RUNNER_TEMP/dbt-venv"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+          "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+
+      - name: Configure dbt profile
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Install dbt package dependencies
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" deps --profiles-dir .
+
+      - name: Check dbt and source freshness
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
+
+      - name: Build dbt serving models on the Mode 1 candidate
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" build \
+            --profiles-dir . \
+            --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
+
+      - name: Generate dbt documentation
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        working-directory: dbt
+        run: |
+          "$RUNNER_TEMP/dbt-venv/bin/dbt" docs generate --profiles-dir . --output-dir docs-site
+
+      - name: Inject Google Analytics into generated dbt docs
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          measurement_id = "G-7F7JW7LG51"
+          script_url = "https://www.googletagmanager.com/gtag/js?id=" + measurement_id
+          index = Path("dbt/docs-site/index.html")
+          html = index.read_text(encoding="utf-8")
+          if script_url not in html:
+              if html.count("</head>") != 1:
+                  raise SystemExit("Expected exactly one </head> in generated dbt docs")
+              tag = (
+                  '    <!-- Google tag (gtag.js) -->\n'
+                  f'    <script async src="{script_url}"></script>\n'
+                  '    <script>\n'
+                  '      window.dataLayer = window.dataLayer || [];\n'
+                  '      function gtag() { window.dataLayer.push(arguments); }\n'
+                  '      gtag("js", new Date());\n'
+                  f'      gtag("config", "{measurement_id}");\n'
+                  '    </script>\n'
+              )
+              html = html.replace("</head>", tag + "</head>", 1)
+              index.write_text(html, encoding="utf-8")
+          html = index.read_text(encoding="utf-8")
+          if script_url not in html or f'gtag("config", "{measurement_id}")' not in html:
+              raise SystemExit("Google Analytics tag injection failed")
+          PY
+
+      - name: Upload dbt documentation for GitHub Pages
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dbt/docs-site
+
+      - name: Record successful DuckDB dashboard refresh metadata
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          from datetime import datetime, timezone
+          import os
+          import duckdb
+          path = os.environ["DBT_DUCKDB_PATH"]
+          with duckdb.connect(path) as connection:
+              connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
+              connection.execute("""CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
+                  refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
+                  last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
+                  source_commit VARCHAR NOT NULL,
+                  workflow_run_id VARCHAR NOT NULL
+              )""")
+              connection.execute("DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1")
+              connection.execute(
+                  "INSERT INTO metadata.dashboard_refresh_metadata "
+                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id) "
+                  "VALUES (?, ?, ?, ?)",
+                  (1, datetime.now(timezone.utc), os.environ["SOURCE_COMMIT"], os.environ["WORKFLOW_RUN_ID"]),
+              )
+
+      - name: Validate the complete DuckDB candidate
+        id: validate_duckdb_candidate
+        if: (steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true') || steps.prepare.outputs.production_already_promoted == 'true'
+        env:
+          CANDIDATE_DATABASE: ${{ steps.prepare.outputs.production_already_promoted == 'true' && 'data/warehouse/toronto.duckdb' || steps.prepare.outputs.database }}
+          TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
+          TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
+        run: |
+          python scripts/promote_duckdb_candidate.py \
+            --candidate "$CANDIDATE_DATABASE" \
+            --validate-only
+
+      - name: Persist the validated DuckDB candidate before promotion
+        id: persist_validated_duckdb_candidate
+        if: steps.validate_duckdb_candidate.outcome == 'success' && steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true'
+        run: |
+          python -m scripts.mode1_state publish \
+            --backend duckdb \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/duckdb/mode1 \
+            --summary data/staging/duckdb/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2))"
+
+      - name: Verify DuckDB production has not changed during staging
+        id: verify_duckdb_baseline
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true'
+        run: |
+          python -m scripts.snapshot_replay_baseline \
+            --backend duckdb \
+            --database data/warehouse/toronto.duckdb \
+            --expected data/staging/duckdb/production-baseline.json
+
+      - name: Promote the validated DuckDB candidate
+        id: promote_duckdb_candidate
+        if: steps.validate_duckdb_candidate.outcome == 'success' && steps.verify_duckdb_baseline.outcome == 'success' && steps.prepare.outputs.production_already_promoted != 'true' && (steps.persist_validated_duckdb_candidate.outcome == 'success' || (steps.prepare.outputs.needs_promotion == 'true' && steps.replay.outputs.has_pending_archives != 'true'))
+        env:
+          TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
+          TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
+        run: |
+          python scripts/promote_duckdb_candidate.py \
+            --candidate "$DBT_DUCKDB_PATH" \
+            --production data/warehouse/toronto.duckdb
+
+      - name: Extract latest approved Parquet assets
+        if: steps.promote_duckdb_candidate.outcome == 'success'
+        run: |
+          python scripts.extract_latest_snapshot_assets.py \
+            --summary data/staging/duckdb/mode1/replay-summary.json \
+            --archive-dir data/recovery/snapshot-replay/archives \
+            --output-dir data-assets \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Package the dbt documentation archive
+        if: steps.promote_duckdb_candidate.outcome == 'success'
+        run: |
+          test -s dbt/docs-site/index.html
+          mkdir -p data-assets/dbt-docs
+          cp -R dbt/docs-site/. data-assets/dbt-docs/
+          printf '%s\n' \
+            "Toronto Housing Analytics — dbt documentation" \
+            "Extract toronto-dbt-docs.zip and run: python3 -m http.server 8000" \
+            > data-assets/dbt-docs/README.txt
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+          source = Path("data-assets/dbt-docs")
+          archive = Path("data-assets/toronto-dbt-docs.zip")
+          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+              for path in sorted(item for item in source.rglob("*") if item.is_file()):
+                  zipped.write(path, path.relative_to(source).as_posix())
+          with ZipFile(archive) as zipped:
+              if zipped.testzip() is not None or "index.html" not in zipped.namelist():
+                  raise SystemExit("dbt documentation ZIP failed verification")
+          PY
+
+      - name: Publish the four verified DuckDB production assets
+        id: publish_duckdb_assets
+        if: steps.promote_duckdb_candidate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
+          WAREHOUSE_LATEST_TARGET_SHA: ${{ github.sha }}
+        run: python scripts/publish_release_assets.py
+
+      - name: Persist the promoted DuckDB Mode 1 checkpoint
+        if: always() && steps.validate_duckdb_candidate.outcome == 'success' && (steps.publish_duckdb_assets.outcome == 'success' || steps.prepare.outputs.production_already_promoted == 'true')
+        run: |
+          python -m scripts.mode1_state publish \
+            --promoted \
+            --backend duckdb \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/duckdb/mode1 \
+            --summary data/staging/duckdb/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2 + 1))"
+
+      - name: Preserve the immutable DuckDB recovery checkpoint
+        if: always() && steps.validate_duckdb_candidate.outcome == 'success' && (steps.publish_duckdb_assets.outcome == 'success' || steps.prepare.outputs.production_already_promoted == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publish_duckdb_recovery.py
 
       - name: Persist initial DuckDB baseline when no archives are pending
         if: always() && steps.prepare.outputs.needs_initial_checkpoint == 'true' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
@@ -154,6 +408,7 @@ jobs:
             --working-dir data/staging/duckdb/mode1 \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
+
 
   snowflake:
     if: >-
@@ -171,7 +426,7 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: write
-      actions: read
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
@@ -200,6 +455,13 @@ jobs:
             exit 1
           fi
 
+      - name: Capture the canonical Snowflake RAW production baseline
+        run: |
+          mkdir -p data/staging/snowflake
+          python -m scripts.snapshot_replay_baseline \
+            --backend snowflake \
+            --output data/staging/snowflake/production-baseline.json
+
       - name: Restore or bootstrap the accepted Snowflake Mode 1 state
         id: prepare
         env:
@@ -214,6 +476,7 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT"
             --baseline-run-id "${{ inputs.baseline_run_id }}"
             --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+            --production-baseline data/staging/snowflake/production-baseline.json
           )
           if [ "$REBOOTSTRAP_FROM_MODE2" = "true" ]; then
             prepare_args+=(--rebootstrap-from-mode2)
@@ -222,6 +485,7 @@ jobs:
 
       - name: Replay only unprocessed immutable archives into Snowflake staging
         id: replay
+        if: steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true'
         run: |
           python -m scripts.replay_snapshots \
             --mode incremental \
@@ -234,6 +498,10 @@ jobs:
             --staging-dir data/staging/snowflake/mode1/snapshot-files \
             --output data/staging/snowflake/mode1/replay-summary.json
 
+      - name: Restore the persisted replay summary for promotion recovery
+        if: always() && steps.prepare.outputs.needs_promotion == 'true' && (steps.replay.outcome == 'skipped' || (steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'))
+        run: cp data/staging/snowflake/mode1/summary.json data/staging/snowflake/mode1/replay-summary.json
+
       - name: Require explicit Snowflake replay pending-archive output
         if: steps.replay.outcome == 'success'
         env:
@@ -241,11 +509,11 @@ jobs:
         run: |
           case "$HAS_PENDING_ARCHIVES" in
             true|false) ;;
-            *) echo "Replay succeeded without an explicit has_pending_archives output; refusing state cleanup or bootstrap." >&2; exit 1 ;;
+            *) echo "Replay succeeded without an explicit has_pending_archives output; refusing state cleanup, bootstrap or production promotion." >&2; exit 1 ;;
           esac
 
-      - name: Persist the validated Snowflake staging handoff
-        if: always() && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/snowflake/mode1/replay-summary.json') != ''
+      - name: Persist retryable Snowflake state after a partial source load
+        if: always() && steps.replay.outcome == 'failure' && steps.replay.outputs.has_pending_archives == 'true' && hashFiles('data/staging/snowflake/mode1/replay-summary.json') != ''
         run: |
           python -m scripts.mode1_state publish \
             --backend snowflake \
@@ -254,6 +522,72 @@ jobs:
             --summary data/staging/snowflake/mode1/replay-summary.json \
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Validate the Snowflake candidate without promotion
+        id: validate_snowflake_candidate
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true'
+        env:
+          TORONTO_SNOWFLAKE_STAGE_SCHEMA: ${{ steps.prepare.outputs.schema }}
+          TORONTO_SNOWFLAKE_STAGE_GENERATION: ${{ steps.prepare.outputs.candidate_generation_id }}
+          TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
+          TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
+        run: python scripts/loader_promote_snowflake_raw.py --validate-only
+
+      - name: Persist the validated Snowflake candidate before promotion
+        id: persist_validated_snowflake_candidate
+        if: steps.validate_snowflake_candidate.outcome == 'success' && steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true'
+        run: |
+          python -m scripts.mode1_state publish \
+            --backend snowflake \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/snowflake/mode1 \
+            --summary data/staging/snowflake/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2))"
+
+      - name: Verify Snowflake production has not changed during staging
+        id: verify_snowflake_baseline
+        if: steps.replay.outcome == 'success' && (steps.replay.outputs.has_pending_archives == 'true' || steps.prepare.outputs.needs_promotion == 'true') && steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true'
+        run: |
+          python -m scripts.snapshot_replay_baseline \
+            --backend snowflake \
+            --expected data/staging/snowflake/production-baseline.json
+
+      - name: Promote the validated Snowflake RAW candidate
+        id: promote_snowflake_candidate
+        if: always() && ((steps.validate_snowflake_candidate.outcome == 'success' && steps.verify_snowflake_baseline.outcome == 'success' && steps.prepare.outputs.production_already_promoted != 'true' && steps.prepare.outputs.snowflake_swap_pending != 'true' && (steps.persist_validated_snowflake_candidate.outcome == 'success' || (steps.prepare.outputs.needs_promotion == 'true' && steps.replay.outputs.has_pending_archives != 'true'))) || steps.prepare.outputs.snowflake_swap_pending == 'true' || steps.prepare.outputs.production_already_promoted == 'true')
+        env:
+          TORONTO_SNOWFLAKE_STAGE_SCHEMA: ${{ steps.prepare.outputs.schema }}
+          TORONTO_SNOWFLAKE_STAGE_GENERATION: ${{ steps.prepare.outputs.candidate_generation_id }}
+          TORONTO_QUARANTINE_BASELINE_COUNTS: ${{ steps.prepare.outputs.quarantine_baseline_counts }}
+          TORONTO_QUARANTINE_BASELINE_SNAPSHOT_IDS: ${{ steps.prepare.outputs.quarantine_baseline_snapshot_ids }}
+        run: python scripts/loader_promote_snowflake_raw.py
+
+      - name: Dispatch the Snowflake serving-schema refresh
+        id: dispatch_snowflake_serving
+        if: always() && steps.promote_snowflake_candidate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run snowflake-serving-schema.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f confirm_serving_schema=true \
+            -f snapshot_loader_run_id="$GITHUB_RUN_ID"
+
+      - name: Persist the promoted Snowflake Mode 1 checkpoint
+        if: always() && steps.promote_snowflake_candidate.outcome == 'success' && steps.dispatch_snowflake_serving.outcome == 'success'
+        run: |
+          python -m scripts.mode1_state publish \
+            --promoted \
+            --backend snowflake \
+            --repository "$GITHUB_REPOSITORY" \
+            --working-dir data/staging/snowflake/mode1 \
+            --summary data/staging/snowflake/mode1/replay-summary.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2 + 1))"
 
       - name: Persist initial Snowflake baseline when no archives are pending
         if: always() && steps.prepare.outputs.needs_initial_checkpoint == 'true' && steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false'
@@ -267,9 +601,26 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Drop the unused Snowflake clone when no archives are pending
-        if: steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false' && steps.prepare.outputs.needs_initial_checkpoint != 'true'
+        if: steps.replay.outcome == 'success' && steps.replay.outputs.has_pending_archives == 'false' && steps.prepare.outputs.needs_initial_checkpoint != 'true' && steps.prepare.outputs.needs_promotion != 'true'
         run: |
           python -m scripts.mode1_state discard \
             --backend snowflake \
             --schema "${{ steps.prepare.outputs.schema }}" \
-            --generation-id "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"
+            --generation-id "${{ steps.prepare.outputs.candidate_generation_id }}"
+
+  deploy-dbt-docs:
+    name: Deploy dbt documentation to GitHub Pages
+    if: needs.duckdb.outputs.dbt_docs_published == 'true' && needs.duckdb.result == 'success'
+    needs: duckdb
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy dbt documentation
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,9 +1,10 @@
-"""Prepare, persist and hand off independent Mode 1 working states.
+"""Prepare, validate and promote independent Mode 1 production candidates.
 
 DuckDB state is stored in immutable GitHub Release ZIP assets. Snowflake's
 working schema remains in Snowflake; its Release asset stores the matching
-SQLite replay ledger and a pointer to that schema. The legacy RAW/production
-warehouses are never used as a baseline.
+SQLite replay ledger and a pointer to that schema. Each incremental replay
+starts from the current published DuckDB warehouse or canonical Snowflake RAW,
+uses an isolated candidate, and promotes only after validation.
 """
 
 from __future__ import annotations
@@ -318,16 +319,259 @@ def _snowflake_connection(credentials: str):
 
 
 def _manifest_snowflake_generation(manifest: dict[str, Any]) -> str:
-    "Return the last run identity stored in a persisted Snowflake candidate."
-    run_id = manifest.get("last_attempt_run_id")
-    run_attempt = manifest.get("last_attempt_run_attempt")
-    if run_id is None or run_attempt is None:
+    """Return the generation identity of the persisted Snowflake candidate."""
+    generation_id = manifest.get("candidate_generation_id")
+    if generation_id is None:
+        run_id = manifest.get("last_attempt_run_id")
+        run_attempt = manifest.get("last_attempt_run_attempt")
+        if run_id is None or run_attempt is None:
+            raise RuntimeError(
+                "Snowflake Mode 1 checkpoint is missing its candidate generation identity."
+            )
+        generation_id = f"{run_id}:{run_attempt}"
+    _generation_parts(str(generation_id))
+    return str(generation_id)
+
+
+def _snowflake_raw_mode1_marker_state(
+    cursor: Any, *, expected_generation_id: str
+) -> str:
+    """Read the exact generation marker after or during a schema swap."""
+    _generation_parts(expected_generation_id)
+    cursor.execute(
+        "SELECT GENERATION_ID, PROMOTION_STATE "
+        "FROM TORONTO.RAW.TORONTO_CANDIDATE_CONTROL"
+    )
+    rows = cursor.fetchall()
+    if len(rows) != 1 or str(rows[0][0]) != expected_generation_id:
         raise RuntimeError(
-            "Snowflake Mode 1 checkpoint is missing its last-attempt identity."
+            "Canonical TORONTO.RAW does not carry the expected Mode 1 generation "
+            f"{expected_generation_id}: {rows!r}."
         )
-    generation_id = f"{run_id}:{run_attempt}"
-    _generation_parts(generation_id)
-    return generation_id
+    state = str(rows[0][1]).upper()
+    if state not in {"READY", "PROMOTED"}:
+        raise RuntimeError(
+            f"Canonical TORONTO.RAW has an unsupported Mode 1 promotion state: {rows!r}."
+        )
+    return state
+
+
+def _validate_snowflake_promoted_mode1_raw_marker(
+    cursor: Any, *, expected_generation_id: str
+) -> None:
+    """Require canonical RAW to carry the exact promoted Mode 1 generation."""
+    state = _snowflake_raw_mode1_marker_state(
+        cursor, expected_generation_id=expected_generation_id
+    )
+    if state != "PROMOTED":
+        raise RuntimeError(
+            "Canonical TORONTO.RAW does not carry the expected promoted "
+            f"Mode 1 marker for {expected_generation_id}: state={state}."
+        )
+
+
+def _canonical_snowflake_mode1_marker_state(
+    credentials: str, expected_generation_id: str
+) -> str:
+    """Read canonical RAW's exact Mode 1 marker under the required owner."""
+    connection, temporary = _snowflake_connection(credentials)
+    try:
+        cursor = connection.cursor()
+        try:
+            from scripts.replay_targets import _validate_snowflake_schema_owner
+
+            cursor.execute(
+                "SELECT SCHEMA_OWNER FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
+                "WHERE SCHEMA_NAME='RAW'"
+            )
+            _validate_snowflake_schema_owner("RAW", cursor.fetchone())
+            return _snowflake_raw_mode1_marker_state(
+                cursor, expected_generation_id=expected_generation_id
+            )
+        finally:
+            cursor.close()
+    finally:
+        connection.close()
+        temporary.cleanup()
+
+
+def _replace_candidate_from_production(production: Path, candidate: Path) -> None:
+    """Atomically refresh a DuckDB working candidate from published production."""
+    production = Path(production).resolve()
+    candidate = Path(candidate).resolve()
+    if production == candidate:
+        raise ValueError("Production and Mode 1 DuckDB candidate paths must differ.")
+    if not production.is_file() or production.stat().st_size <= 0:
+        raise FileNotFoundError(
+            f"Published DuckDB production database is missing or empty: {production}"
+        )
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=candidate.name + ".prepare-",
+        suffix=".tmp",
+        dir=candidate.parent,
+        delete=False,
+    ) as stream:
+        staged = Path(stream.name)
+    try:
+        shutil.copy2(production, staged)
+        if staged.stat().st_size != production.stat().st_size:
+            raise RuntimeError("Production-to-candidate DuckDB copy size mismatch.")
+        if _sha256(staged) != _sha256(production):
+            raise RuntimeError("Production-to-candidate DuckDB copy checksum mismatch.")
+        os.replace(staged, candidate)
+        from scripts.prepare_duckdb_candidate import _ensure_quarantine_table
+
+        _ensure_quarantine_table(candidate)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _candidate_quarantine_baseline(
+    *, backend: str, working_dir: Path, schema: str | None, credentials: str | None
+) -> tuple[dict[str, int], list[str]]:
+    """Read promotion quarantine denominators and completed paired snapshot IDs."""
+    source_tables = {
+        "active_permits": (
+            "RAW_ACTIVE_PERMITS" if backend == "snowflake" else "raw_active_permits"
+        ),
+        "cleared_permits": (
+            "RAW_CLEARED_PERMITS" if backend == "snowflake" else "raw_cleared_permits"
+        ),
+    }
+    counts: dict[str, int] = {}
+    ledger_rows: list[tuple[Any, Any, Any]]
+
+    if backend == "duckdb":
+        import duckdb
+
+        database = Path(working_dir) / "candidate.duckdb"
+        if not database.is_file():
+            raise FileNotFoundError(f"Mode 1 DuckDB candidate is missing: {database}")
+        with duckdb.connect(str(database), read_only=True) as connection:
+            names = {
+                str(row[0]).lower()
+                for row in connection.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='raw'"
+                ).fetchall()
+            }
+            required = set(source_tables.values()) | {"toronto_snapshot_ledger"}
+            if not required.issubset(names):
+                raise RuntimeError(
+                    "DuckDB production-derived candidate is missing RAW tables: "
+                    f"{sorted(required - names)}."
+                )
+            for source_name, table in source_tables.items():
+                counts[source_name] = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM raw.{table} WHERE _dlt_valid_to IS NULL"
+                    ).fetchone()[0]
+                )
+            ledger_rows = connection.execute(
+                "SELECT snapshot_id, source_name, status "
+                "FROM raw.toronto_snapshot_ledger"
+            ).fetchall()
+    elif backend == "snowflake":
+        from scripts.replay_targets import (
+            INCREMENTAL_SNOWFLAKE_SCHEMA_RE,
+            _validate_snowflake_schema_owner,
+        )
+
+        schema = str(schema or "").upper()
+        if not INCREMENTAL_SNOWFLAKE_SCHEMA_RE.fullmatch(schema):
+            raise ValueError(
+                f"Unapproved Mode 1 Snowflake candidate schema: {schema!r}."
+            )
+        if not credentials:
+            raise ValueError(
+                "SNOWFLAKE_DLT_CONNECTION is required for Mode 1 promotion baselines."
+            )
+        connection, temporary = _snowflake_connection(credentials)
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT SCHEMA_OWNER FROM TORONTO.INFORMATION_SCHEMA.SCHEMATA "
+                    "WHERE SCHEMA_NAME=%s",
+                    (schema,),
+                )
+                _validate_snowflake_schema_owner(schema, cursor.fetchone())
+                for source_name, table in source_tables.items():
+                    cursor.execute(
+                        f"SELECT COUNT_IF(_DLT_VALID_TO IS NULL) "
+                        f'FROM TORONTO."{schema}".{table}'
+                    )
+                    counts[source_name] = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    f"SELECT SNAPSHOT_ID, SOURCE_NAME, STATUS "
+                    f'FROM TORONTO."{schema}".TORONTO_SNAPSHOT_LEDGER'
+                )
+                ledger_rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        finally:
+            connection.close()
+            temporary.cleanup()
+    else:
+        raise ValueError(f"Unsupported Mode 1 baseline backend: {backend!r}.")
+
+    if set(counts) != set(source_tables) or any(
+        value <= 0 for value in counts.values()
+    ):
+        raise RuntimeError(f"Invalid quarantine current-row baseline counts: {counts}.")
+
+    by_snapshot: dict[str, dict[str, str]] = {}
+    for snapshot_id, source_name, status in ledger_rows:
+        by_snapshot.setdefault(str(snapshot_id), {})[str(source_name).lower()] = str(
+            status
+        ).lower()
+    expected_sources = {"active_permits", "cleared_permits"}
+    snapshot_ids = sorted(
+        snapshot_id
+        for snapshot_id, statuses in by_snapshot.items()
+        if set(statuses) == expected_sources
+        and all(statuses[source] == "succeeded" for source in expected_sources)
+    )
+    if not snapshot_ids:
+        raise RuntimeError(
+            "Candidate has no completed paired snapshots for quarantine reconciliation."
+        )
+    return counts, snapshot_ids
+
+
+def _validated_checkpoint_is_already_promoted(
+    *,
+    manifest: dict[str, Any],
+    observed_baseline: dict[str, Any],
+    backend: str,
+    production_database: Path | None,
+) -> bool:
+    """Recognize only the recorded baseline or the exact promoted DuckDB file."""
+    expected_baseline = manifest.get("production_baseline")
+    if not isinstance(expected_baseline, dict):
+        raise RuntimeError(
+            "Validated Mode 1 checkpoint is missing its original production baseline."
+        )
+    if observed_baseline == expected_baseline:
+        return False
+    if backend == "snowflake":
+        # Snowflake promotion is identified by the candidate generation marker in
+        # canonical RAW; its aggregate baseline necessarily changes after SWAP.
+        return False
+    if backend == "duckdb" and production_database is not None:
+        candidate_sha256 = manifest.get("candidate_sha256")
+        production = Path(production_database)
+        if (
+            isinstance(candidate_sha256, str)
+            and production.is_file()
+            and _sha256(production) == candidate_sha256
+        ):
+            return True
+    raise RuntimeError(
+        "Production matches neither the original baseline nor the validated "
+        "Mode 1 candidate. Refusing promotion recovery."
+    )
 
 
 def _validate_snowflake_candidate_marker(
@@ -415,6 +659,7 @@ def _clone_snowflake_schema(
     run_attempt: str,
     expected_generation_id: str | None = None,
     expected_mode2_run_id: str | None = None,
+    expected_promoted_generation_id: str | None = None,
 ) -> str:
     "Clone an accepted schema after validating its applicable control marker."
     from scripts.replay_targets import (
@@ -424,14 +669,26 @@ def _clone_snowflake_schema(
     )
 
     source_schema = str(source_schema).upper()
-    if expected_mode2_run_id is not None:
-        if source_schema != "RAW" or expected_generation_id is not None:
-            raise ValueError(
-                "The promoted Mode 2 bootstrap must clone canonical RAW "
-                "without a Mode 1 checkpoint marker."
+    if expected_mode2_run_id is not None or expected_promoted_generation_id is not None:
+        if (
+            source_schema != "RAW"
+            or expected_generation_id is not None
+            or (
+                expected_mode2_run_id is not None
+                and expected_promoted_generation_id is not None
             )
-        if not str(expected_mode2_run_id).isdecimal():
+        ):
+            raise ValueError(
+                "A promoted canonical RAW marker is required when bootstrapping "
+                "a new Mode 1 Snowflake candidate."
+            )
+        if (
+            expected_mode2_run_id is not None
+            and not str(expected_mode2_run_id).isdecimal()
+        ):
             raise ValueError("Expected Mode 2 run ID must be numeric.")
+        if expected_promoted_generation_id is not None:
+            _generation_parts(expected_promoted_generation_id)
     elif not (
         REBUILD_SNOWFLAKE_SCHEMA_RE.fullmatch(source_schema)
         or INCREMENTAL_SNOWFLAKE_SCHEMA_RE.fullmatch(source_schema)
@@ -464,6 +721,11 @@ def _clone_snowflake_schema(
                     cursor,
                     expected_mode2_run_id=expected_mode2_run_id,
                 )
+            if expected_promoted_generation_id is not None:
+                _validate_snowflake_promoted_mode1_raw_marker(
+                    cursor,
+                    expected_generation_id=expected_promoted_generation_id,
+                )
             if expected_generation_id is not None:
                 _validate_snowflake_candidate_marker(
                     cursor,
@@ -491,7 +753,8 @@ def _clone_snowflake_schema(
             cursor.execute(
                 f'''CREATE OR REPLACE TABLE TORONTO."{target_schema}".TORONTO_CANDIDATE_CONTROL (
                     GENERATION_ID VARCHAR NOT NULL,
-                    PROMOTION_STATE VARCHAR NOT NULL
+                    PROMOTION_STATE VARCHAR NOT NULL,
+                    UPDATED_AT TIMESTAMP_TZ
                 )'''
             )
             cursor.execute(
@@ -809,6 +1072,14 @@ def _release_pointer_name(backend: str, run_id: str, run_attempt: str) -> str:
     return f"toronto-mode1-state-{_backend(backend)}-{run_id}-{run_attempt}.json"
 
 
+def _state_asset_attempt(run_attempt: str, asset_run_attempt: str | None = None) -> str:
+    """Give validated and promoted checkpoints distinct immutable asset names."""
+    value = str(asset_run_attempt if asset_run_attempt is not None else run_attempt)
+    if not value.isdecimal():
+        raise ValueError("Mode 1 state asset attempt must contain digits only.")
+    return value
+
+
 def _release_pointer_candidates(
     assets: list[dict[str, Any]], backend: str
 ) -> list[tuple[int, int, str]]:
@@ -1013,11 +1284,36 @@ def _restore_latest_release_state(
                     )
                 if backend == "snowflake":
                     expected_generation_id = _manifest_snowflake_generation(manifest)
-                    _validate_snowflake_checkpoint_schema(
-                        credentials=str(snowflake_credentials),
-                        schema=str(manifest["candidate_schema"]),
-                        expected_generation_id=expected_generation_id,
-                    )
+                    if manifest.get("promotion_status") == "PROMOTED":
+                        state = _canonical_snowflake_mode1_marker_state(
+                            str(snowflake_credentials), expected_generation_id
+                        )
+                        if state != "PROMOTED":
+                            raise RuntimeError(
+                                "Promoted Snowflake Mode 1 checkpoint is not marked PROMOTED."
+                            )
+                    elif manifest.get("handoff_status") == "validated":
+                        try:
+                            _validate_snowflake_checkpoint_schema(
+                                credentials=str(snowflake_credentials),
+                                schema=str(manifest["candidate_schema"]),
+                                expected_generation_id=expected_generation_id,
+                            )
+                        except Exception as stage_error:
+                            # After SWAP, the previous RAW occupies the old stage name.
+                            # Accept only the exact READY/PROMOTED marker in canonical RAW.
+                            try:
+                                _canonical_snowflake_mode1_marker_state(
+                                    str(snowflake_credentials), expected_generation_id
+                                )
+                            except Exception:
+                                raise stage_error from None
+                    else:
+                        _validate_snowflake_checkpoint_schema(
+                            credentials=str(snowflake_credentials),
+                            schema=str(manifest["candidate_schema"]),
+                            expected_generation_id=expected_generation_id,
+                        )
 
                 if working_dir.exists():
                     if any(working_dir.iterdir()):
@@ -1072,9 +1368,23 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
             "Explicit Mode 2 rebootstrap requires baseline_run_id and baseline_attempt."
         )
 
-    # A forced rebootstrap deliberately skips old Release checkpoints. This
-    # prepare step does not delete them; later publication applies the existing
-    # per-backend policy of retaining the newest two complete checkpoints.
+    production_baseline = None
+    production_baseline_path = getattr(args, "production_baseline", None)
+    if production_baseline_path:
+        try:
+            production_baseline = json.loads(
+                Path(production_baseline_path).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read Mode 1 production baseline: {exc}") from exc
+        if (
+            not isinstance(production_baseline, dict)
+            or production_baseline.get("backend") != backend
+        ):
+            raise RuntimeError(
+                "Mode 1 production baseline backend does not match the selected backend."
+            )
+
     manifest = None
     if not rebootstrap_from_mode2:
         manifest = _restore_latest_release_state(
@@ -1083,6 +1393,60 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
             working_dir=working_dir,
             snowflake_credentials=snowflake_credentials,
         )
+
+    retryable_checkpoint = bool(
+        manifest is not None and manifest.get("handoff_status") == "retryable"
+    )
+    validated_checkpoint = bool(
+        manifest is not None
+        and manifest.get("handoff_status") == "validated"
+        and manifest.get("promotion_status") != "PROMOTED"
+    )
+    production_already_promoted = False
+    snowflake_swap_pending = False
+    if retryable_checkpoint and production_baseline is not None:
+        prior_baseline = manifest.get("production_baseline")
+        if prior_baseline is None or prior_baseline != production_baseline:
+            raise RuntimeError(
+                "Production changed after a retryable Mode 1 source load, or its "
+                "original baseline is missing. Refusing to continue the partial candidate."
+            )
+    elif validated_checkpoint:
+        if production_baseline is None:
+            raise RuntimeError(
+                "Validated Mode 1 recovery requires a freshly captured production baseline."
+            )
+        production_already_promoted = _validated_checkpoint_is_already_promoted(
+            manifest=manifest,
+            observed_baseline=production_baseline,
+            backend=backend,
+            production_database=getattr(args, "production_database", None),
+        )
+        if backend == "snowflake":
+            if not snowflake_credentials:
+                raise ValueError(
+                    "SNOWFLAKE_DLT_CONNECTION is required to verify a promoted candidate."
+                )
+            try:
+                marker_state = _canonical_snowflake_mode1_marker_state(
+                    snowflake_credentials, _manifest_snowflake_generation(manifest)
+                )
+            except RuntimeError:
+                marker_state = None
+            if marker_state is not None:
+                production_already_promoted = marker_state == "PROMOTED"
+                snowflake_swap_pending = marker_state == "READY"
+        if (
+            not production_already_promoted
+            and not snowflake_swap_pending
+            and production_baseline != manifest.get("production_baseline")
+        ):
+            raise RuntimeError(
+                "Production matches neither the original baseline nor the validated "
+                "Mode 1 candidate. Refusing promotion recovery."
+            )
+    elif manifest is not None and production_baseline is not None:
+        manifest["production_baseline"] = production_baseline
 
     requested_generation_id = (
         f"{baseline_run_id}:{baseline_attempt}" if baseline_run_id else None
@@ -1102,26 +1466,74 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     needs_initial_checkpoint = manifest is None
+    candidate_generation_id = f"{args.run_id}:{args.run_attempt}"
 
     if manifest is not None:
         if backend == "snowflake":
             credentials = args.snowflake_credentials
-            if not credentials:
-                raise ValueError(
-                    "SNOWFLAKE_DLT_CONNECTION is required for Snowflake Mode 1."
+            if validated_checkpoint:
+                # The validated schema is durable in Snowflake. Keep it intact so
+                # an interrupted promotion can be resumed without replaying it.
+                new_schema = str(manifest["candidate_schema"])
+                candidate_generation_id = _manifest_snowflake_generation(manifest)
+            elif retryable_checkpoint:
+                source_schema = str(manifest["candidate_schema"])
+                new_schema = _clone_snowflake_schema(
+                    credentials=credentials,
+                    source_schema=source_schema,
+                    run_id=args.run_id,
+                    run_attempt=args.run_attempt,
+                    expected_generation_id=_manifest_snowflake_generation(manifest),
                 )
-            expected_generation_id = _manifest_snowflake_generation(manifest)
-            new_schema = _clone_snowflake_schema(
-                credentials=credentials,
-                source_schema=str(manifest["candidate_schema"]),
-                run_id=args.run_id,
-                run_attempt=args.run_attempt,
-                expected_generation_id=expected_generation_id,
-            )
+            elif manifest.get("promotion_status") == "PROMOTED":
+                promoted_generation = _manifest_snowflake_generation(manifest)
+                new_schema = _clone_snowflake_schema(
+                    credentials=credentials,
+                    source_schema="RAW",
+                    run_id=args.run_id,
+                    run_attempt=args.run_attempt,
+                    expected_promoted_generation_id=promoted_generation,
+                )
+            else:
+                # Initial Mode 1 state is a clone of the accepted Mode 2 RAW.
+                mode2_run_id, _mode2_attempt = _generation_parts(
+                    str(manifest["generation_id"])
+                )
+                new_schema = _clone_snowflake_schema(
+                    credentials=credentials,
+                    source_schema="RAW",
+                    run_id=args.run_id,
+                    run_attempt=args.run_attempt,
+                    expected_mode2_run_id=mode2_run_id,
+                )
             manifest["candidate_schema"] = new_schema
             manifest["candidate"] = f"TORONTO.{new_schema}"
+            # Keep the original candidate generation even when the checkpoint is
+            # finalized in a later workflow run.
+            manifest["candidate_generation_id"] = candidate_generation_id
+            if not validated_checkpoint:
+                manifest["promotion_status"] = "READY"
+        elif backend == "duckdb":
+            if (
+                not retryable_checkpoint
+                and not validated_checkpoint
+                and getattr(args, "production_database", None)
+            ):
+                candidate_path = working_dir / "candidate.duckdb"
+                _replace_candidate_from_production(
+                    Path(args.production_database), candidate_path
+                )
+                manifest["candidate_sha256"] = _sha256(candidate_path)
+                manifest["candidate_generation_id"] = candidate_generation_id
+            elif not (working_dir / "candidate.duckdb").is_file():
+                raise FileNotFoundError("Restored Mode 1 DuckDB candidate is missing.")
+            if not validated_checkpoint:
+                manifest["promotion_status"] = "READY"
+
         manifest["prepared_run_id"] = str(args.run_id)
         manifest["prepared_run_attempt"] = str(args.run_attempt)
+        if production_baseline is not None and not validated_checkpoint:
+            manifest["production_baseline"] = production_baseline
         (working_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -1158,7 +1570,8 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
                 candidate_path = mode2_root / "duckdb" / candidate_name
                 if not candidate_path.is_file():
                     raise FileNotFoundError(
-                        f"Mode 2 artifact is missing its candidate database: {candidate_name}"
+                        "Mode 2 artifact is missing its candidate database: "
+                        f"{candidate_name}"
                     )
                 manifest = bootstrap_duckdb_working_state(
                     mode2_ledger_path=ledger_path,
@@ -1166,22 +1579,28 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
                     working_dir=working_dir,
                     generation_id=generation_id,
                 )
-            else:
-                credentials = args.snowflake_credentials
-                if not credentials:
-                    raise ValueError(
-                        "SNOWFLAKE_DLT_CONNECTION is required for Snowflake Mode 1."
+                if getattr(args, "production_database", None):
+                    _replace_candidate_from_production(
+                        Path(args.production_database), working_dir / "candidate.duckdb"
                     )
+                    manifest["candidate_sha256"] = _sha256(
+                        working_dir / "candidate.duckdb"
+                    )
+            else:
                 manifest = bootstrap_snowflake_working_state(
                     mode2_ledger_path=ledger_path,
                     working_dir=working_dir,
                     generation_id=generation_id,
-                    credentials=credentials,
+                    credentials=args.snowflake_credentials,
                     run_id=args.run_id,
                     run_attempt=args.run_attempt,
                 )
             manifest["prepared_run_id"] = str(args.run_id)
             manifest["prepared_run_attempt"] = str(args.run_attempt)
+            manifest["candidate_generation_id"] = candidate_generation_id
+            manifest["promotion_status"] = "READY"
+            if production_baseline is not None:
+                manifest["production_baseline"] = production_baseline
             (working_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
@@ -1200,6 +1619,14 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
         "ledger": str(ledger_path),
         "working_dir": str(working_dir),
         "needs_initial_checkpoint": "true" if needs_initial_checkpoint else "false",
+        "needs_promotion": "true" if validated_checkpoint else "false",
+        "production_already_promoted": "true"
+        if production_already_promoted
+        else "false",
+        "snowflake_swap_pending": "true" if snowflake_swap_pending else "false",
+        "candidate_generation_id": str(
+            manifest.get("candidate_generation_id", candidate_generation_id)
+        ),
     }
     if backend == "duckdb":
         candidate = working_dir / "candidate.duckdb"
@@ -1210,6 +1637,37 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
         schema = str(manifest["candidate_schema"])
         outputs["schema"] = schema
         outputs["candidate"] = f"TORONTO.{schema}"
+
+    if production_baseline is not None:
+        if retryable_checkpoint or validated_checkpoint:
+            counts = manifest.get("quarantine_baseline_counts")
+            snapshot_ids = manifest.get("quarantine_baseline_snapshot_ids")
+            if not isinstance(counts, dict) or not isinstance(snapshot_ids, list):
+                raise RuntimeError(
+                    "Retryable Mode 1 state is missing its original quarantine "
+                    "baseline."
+                )
+        else:
+            counts, snapshot_ids = _candidate_quarantine_baseline(
+                backend=backend,
+                working_dir=working_dir,
+                schema=(
+                    str(manifest.get("candidate_schema", ""))
+                    if backend == "snowflake"
+                    else None
+                ),
+                credentials=snowflake_credentials,
+            )
+            manifest["quarantine_baseline_counts"] = counts
+            manifest["quarantine_baseline_snapshot_ids"] = snapshot_ids
+        outputs["quarantine_baseline_counts"] = json.dumps(counts, sort_keys=True)
+        outputs["quarantine_baseline_snapshot_ids"] = json.dumps(
+            snapshot_ids, separators=(",", ":")
+        )
+        (working_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
     _write_github_outputs(outputs)
     return {**manifest, **outputs}
 
@@ -1398,6 +1856,8 @@ def create_state_bundle(
     run_id: str,
     run_attempt: str,
     bootstrap_only: bool = False,
+    promoted: bool = False,
+    asset_run_attempt: str | None = None,
 ) -> tuple[Path, str, dict[str, Any]]:
     """Create a verified ZIP containing a baseline or incremental working state."""
     backend = _backend(backend)
@@ -1439,6 +1899,18 @@ def create_state_bundle(
                 "last_successful_at_utc": datetime.now(UTC).isoformat(),
             }
         )
+    if promoted:
+        if bootstrap_only or manifest.get("handoff_status") != "validated":
+            raise RuntimeError(
+                "Only a fully validated incremental handoff can be marked PROMOTED."
+            )
+        if backend == "snowflake" and manifest.get("candidate_schema") is None:
+            raise RuntimeError(
+                "Promoted Snowflake checkpoint is missing its candidate schema."
+            )
+        manifest["promotion_status"] = "PROMOTED"
+    elif not bootstrap_only:
+        manifest["promotion_status"] = "READY"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -1450,7 +1922,8 @@ def create_state_bundle(
     else:
         shutil.copy2(summary_path, summary_target)
 
-    asset_name = f"toronto-mode1-state-{backend}-{run_id}-{run_attempt}.zip"
+    asset_attempt = _state_asset_attempt(run_attempt, asset_run_attempt)
+    asset_name = f"toronto-mode1-state-{backend}-{run_id}-{asset_attempt}.zip"
     bundle = working_dir / asset_name
     with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.write(manifest_path, "manifest.json")
@@ -1477,6 +1950,8 @@ def publish_state(args: argparse.Namespace) -> dict[str, Any]:
         run_id=args.run_id,
         run_attempt=args.run_attempt,
         bootstrap_only=bootstrap_only,
+        promoted=bool(getattr(args, "promoted", False)),
+        asset_run_attempt=getattr(args, "asset_run_attempt", None),
     )
 
     view = _run(
@@ -1528,7 +2003,10 @@ def publish_state(args: argparse.Namespace) -> dict[str, Any]:
         "sha256": checksum,
         "published_at_utc": datetime.now(UTC).isoformat(),
     }
-    pointer_name = _release_pointer_name(backend, args.run_id, args.run_attempt)
+    asset_attempt = _state_asset_attempt(
+        args.run_attempt, getattr(args, "asset_run_attempt", None)
+    )
+    pointer_name = _release_pointer_name(backend, args.run_id, asset_attempt)
     pointer_path = working_dir / pointer_name
     pointer_path.write_text(
         json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1583,6 +2061,8 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--snowflake-credentials", default=os.getenv("SNOWFLAKE_DLT_CONNECTION")
     )
+    prepare.add_argument("--production-database", type=Path)
+    prepare.add_argument("--production-baseline", type=Path)
 
     publish = commands.add_parser(
         "publish", help="Publish a validated backend state handoff."
@@ -1597,8 +2077,17 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--working-dir", type=Path, required=True)
     publish.add_argument("--summary", type=Path)
     publish.add_argument("--bootstrap-only", action="store_true")
+    publish.add_argument(
+        "--promoted",
+        action="store_true",
+        help="Mark the checkpoint as promoted after the backend production promoter succeeds.",
+    )
     publish.add_argument("--run-id", required=True)
     publish.add_argument("--run-attempt", required=True)
+    publish.add_argument(
+        "--asset-run-attempt",
+        help="Optional numeric suffix for multiple immutable checkpoints in one workflow run.",
+    )
 
     discard = commands.add_parser(
         "discard", help="Drop an unused run-scoped Snowflake candidate schema."
