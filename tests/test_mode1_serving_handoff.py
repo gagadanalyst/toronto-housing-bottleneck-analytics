@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,3 +27,31 @@ def test_serving_workflow_verifies_the_current_mode1_job():
     assert "Stage Mode 1 Snowflake changes" in workflow
     assert "raw_refresh_run_id" not in workflow
     assert "Snowflake Canonical RAW Refresh" not in workflow
+
+
+def test_snowflake_raw_promoter_uses_module_execution():
+    workflow = (ROOT / ".github/workflows/mode1-incremental-loader.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "run: python -m scripts.loader_promote_snowflake_raw --validate-only"
+        in workflow
+    )
+    assert "run: python -m scripts.loader_promote_snowflake_raw\n" in workflow
+    assert "python scripts/loader_promote_snowflake_raw.py" not in workflow
+
+
+def test_snowflake_raw_promoter_is_importable_as_a_module():
+    subprocess.run(
+        [sys.executable, "-c", "import scripts.loader_promote_snowflake_raw"],
+        cwd=ROOT,
+        check=True,
+    )
+
+
+def test_dbt_source_database_follows_the_selected_backend():
+    sources = (ROOT / "dbt/models/sources.yml").read_text(encoding="utf-8")
+
+    assert 'database: "{{ target.database }}"' in sources
+    assert "database: toronto" not in sources

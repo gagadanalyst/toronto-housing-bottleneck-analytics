@@ -210,7 +210,7 @@ def test_mode1_workflow_fingerprints_production_before_candidate_copy_and_promot
         "--expected data/staging/snowflake/production-baseline.json"
     )
     snow_promote = snowflake_job.index(
-        "run: python scripts/loader_promote_snowflake_raw.py",
+        "run: python -m scripts.loader_promote_snowflake_raw",
         snow_verify,
     )
     assert snow_capture < snow_prepare < snow_replay < snow_verify < snow_promote
