@@ -8,11 +8,6 @@ on:
         required: true
         default: false
         type: boolean
-      raw_refresh_run_id:
-        description: "Successful canonical RAW refresh run ID (provided automatically; optional for deliberate manual rebuilds)"
-        required: false
-        default: ""
-        type: string
       snapshot_loader_run_id:
         description: "Successful Mode 1 Snapshot Loader run ID that promoted canonical RAW"
         required: false
@@ -66,67 +61,15 @@ jobs:
             exit 1
           fi
 
-      - name: Verify upstream canonical RAW refresh succeeded
-        if: inputs.raw_refresh_run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RAW_REFRESH_RUN_ID: ${{ inputs.raw_refresh_run_id }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import re
-          import subprocess
-
-          run_id = os.environ["RAW_REFRESH_RUN_ID"]
-          if not re.fullmatch(r"[0-9]+", run_id):
-              raise ValueError("RAW refresh run ID must contain digits only.")
-
-          result = subprocess.run(
-              [
-                  "gh", "run", "view", run_id,
-                  "--repo", os.environ["GITHUB_REPOSITORY"],
-                  "--json", "name,status,conclusion,headBranch,jobs",
-              ],
-              check=True,
-              capture_output=True,
-              text=True,
-          )
-          run = json.loads(result.stdout)
-          if (
-              run.get("name") != "Snowflake Canonical RAW Refresh"
-              or run.get("status") != "completed"
-              or run.get("conclusion") != "success"
-              or run.get("headBranch") != "main"
-          ):
-              raise ValueError("Upstream RAW workflow was not a successful main-branch run.")
-
-          refresh_job = next(
-              (
-                  job for job in run.get("jobs", [])
-                  if job.get("name") == "Refresh and verify canonical Snowflake RAW"
-              ),
-              None,
-          )
-          if not refresh_job or refresh_job.get("conclusion") != "success":
-              raise ValueError(
-                  "Canonical RAW refresh job did not succeed; "
-                  "refusing to build TORONTO.ANALYTICS."
-              )
-
-          print(f"Verified successful canonical RAW refresh run {run_id}.")
-          PY
-
       - name: Ensure only one upstream production promotion is supplied
         env:
-          RAW_REFRESH_RUN_ID: ${{ inputs.raw_refresh_run_id }}
           SNAPSHOT_LOADER_RUN_ID: ${{ inputs.snapshot_loader_run_id }}
           SNAPSHOT_REBUILD_PROMOTION_RUN_ID: ${{ inputs.snapshot_rebuild_promotion_run_id }}
         run: |
           python - <<'PY'
           import os
           values = [os.environ.get(name, "") for name in (
-              "RAW_REFRESH_RUN_ID", "SNAPSHOT_LOADER_RUN_ID", "SNAPSHOT_REBUILD_PROMOTION_RUN_ID"
+              "SNAPSHOT_LOADER_RUN_ID", "SNAPSHOT_REBUILD_PROMOTION_RUN_ID"
           )]
           if sum(bool(value) for value in values) > 1:
               raise SystemExit("Supply at most one upstream RAW promotion run ID.")
@@ -152,16 +95,16 @@ jobs:
               check=True, capture_output=True, text=True,
           )
           run = json.loads(result.stdout)
-          if (run.get("name") != "Snapshot Loader (Incremental and Rebuild)"
+          if (run.get("name") != "Mode 1 Incremental Loader (Validated Staging)"
               or run.get("status") != "completed"
               or run.get("conclusion") != "success"
               or run.get("headBranch") != "main"):
-              raise ValueError("Snapshot Loader run was not a successful main-branch run.")
+              raise ValueError("Mode 1 loader run was not a successful main-branch run.")
           job = next((item for item in run.get("jobs", [])
-                      if item.get("name") == "Load Snowflake (incremental)"), None)
+                      if item.get("name") == "Stage Mode 1 Snowflake changes"), None)
           if not job or job.get("conclusion") != "success":
-              raise ValueError("Staged Snowflake Mode 1 RAW promotion did not succeed.")
-          print(f"Verified successful staged Snapshot Loader run {run_id}.")
+              raise ValueError("Mode 1 Snowflake RAW promotion did not succeed.")
+          print(f"Verified successful Mode 1 loader run {run_id}.")
           PY
 
       - name: Verify successful full-history Snapshot Loader rebuild promotion

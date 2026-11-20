@@ -115,7 +115,7 @@ jobs:
                   "The selected source workflow attempt does not match its evidence artifact."
               )
           if (
-              run.get("name") != "Snapshot Loader (Incremental and Rebuild)"
+              run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
               or run.get("status") != "completed"
               or run.get("conclusion") != "success"
               or run.get("headBranch") != "main"

@@ -172,43 +172,48 @@ def test_snowflake_signature_rejects_incomplete_dlt_pipeline_state(monkeypatch):
 
 
 def test_mode1_workflow_fingerprints_production_before_candidate_copy_and_promotion():
-    workflow = (
-        Path(__file__).resolve().parents[1]
-        / ".github"
-        / "workflows"
-        / "snapshot-replay.yml"
-    ).read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/mode1-incremental-loader.yml").read_text(
+        encoding="utf-8"
+    )
 
-    assert "options: [rebuild, incremental]\n        default: rebuild" in workflow
-    assert workflow.count("--baseline-snapshot-id") == 2
-    assert workflow.count("--baseline-snapshot-count") == 2
+    duckdb_job = workflow.split("  duckdb:", 1)[1].split("  snowflake:", 1)[0]
+    snowflake_job = workflow.split("  snowflake:", 1)[1].split("  deploy-dbt-docs:", 1)[
+        0
+    ]
 
-    duck_capture = workflow.index(
+    assert "name: Mode 1 Incremental Loader (Validated Staging)" in workflow
+    assert "python -m scripts.mode1_state prepare" in workflow
+    assert "TORONTO_SNAPSHOT_LOADER_ENABLED" in workflow
+    assert "dry_run:" not in workflow
+    assert "DRY_RUN" not in workflow
+
+    duck_capture = duckdb_job.index(
         "--output data/staging/duckdb/production-baseline.json"
     )
-    duck_copy = workflow.index("python scripts/prepare_duckdb_candidate.py")
-    duck_replay = workflow.index("id: replay", duck_copy)
-    duck_verify = workflow.index(
+    duck_prepare = duckdb_job.index("python -m scripts.mode1_state prepare")
+    duck_replay = duckdb_job.index("--mode incremental")
+    duck_verify = duckdb_job.index(
         "--expected data/staging/duckdb/production-baseline.json"
     )
-    duck_promote = workflow.index(
+    duck_promote = duckdb_job.index(
         "python scripts/promote_duckdb_candidate.py", duck_verify
     )
-    assert duck_capture < duck_copy < duck_replay < duck_verify < duck_promote
-    assert "id: prepare_duckdb_candidate" in workflow
+    assert duck_capture < duck_prepare < duck_replay < duck_verify < duck_promote
 
-    snow_capture = workflow.index(
+    snow_capture = snowflake_job.index(
         "--output data/staging/snowflake/production-baseline.json"
     )
-    snow_clone = workflow.index("python scripts/loader_prepare_snowflake_raw.py")
-    snow_replay = workflow.index('--mode "$REPLAY_MODE"', snow_clone)
-    snow_verify = workflow.index(
+    snow_prepare = snowflake_job.index("python -m scripts.mode1_state prepare")
+    snow_replay = snowflake_job.index("--mode incremental")
+    snow_verify = snowflake_job.index(
         "--expected data/staging/snowflake/production-baseline.json"
     )
-    snow_promote = workflow.index(
-        "python scripts/loader_promote_snowflake_raw.py", snow_verify
+    snow_promote = snowflake_job.index(
+        "run: python scripts/loader_promote_snowflake_raw.py",
+        snow_verify,
     )
-    assert snow_capture < snow_clone < snow_replay < snow_verify < snow_promote
+    assert snow_capture < snow_prepare < snow_replay < snow_verify < snow_promote
 
 
 def test_snowflake_baseline_capture_rejects_disabled_gate(monkeypatch):
@@ -220,46 +225,3 @@ def test_snowflake_baseline_capture_rejects_disabled_gate(monkeypatch):
             database=None,
             credentials="unused",
         )
-
-
-def test_mode1_dry_run_never_promotes_or_publishes():
-    workflow = (
-        Path(__file__).resolve().parents[1]
-        / ".github"
-        / "workflows"
-        / "snapshot-replay.yml"
-    ).read_text(encoding="utf-8")
-
-    assert "dry_run:" in workflow
-    assert workflow.count("DRY_RUN: ${{ inputs.dry_run == true }}") == 2
-
-    def step(name):
-        start = workflow.index(f"      - name: {name}")
-        end = workflow.find("\n      - name: ", start + 1)
-        return workflow[start:] if end == -1 else workflow[start:end]
-
-    assert "--dry-run" in step("Prepare the Mode 1 Snowflake candidate clone")
-    assert "--validate-only" in step(
-        "Validate isolated Snowflake candidate without promotion"
-    )
-
-    duckdb_validation = step("Validate complete dbt candidate before promotion")
-    assert 'candidate="${DBT_DUCKDB_PATH:-${REPLAY_DATABASE:-}}"' in duckdb_validation
-
-    assert "env.DRY_RUN != 'true'" in step(
-        "Promote the fully validated DuckDB and dbt candidate"
-    )
-    assert "env.DRY_RUN != 'true'" in step(
-        "Promote the validated Mode 1 Snowflake candidate"
-    )
-    assert "env.DRY_RUN != 'true'" in step(
-        "Publish durable DuckDB, Parquet and dbt assets"
-    )
-    assert "env.DRY_RUN != 'true'" in step("Upload GitHub Pages artifact")
-
-    cleanup = step("Clean up Mode 1 Snowflake dry-run candidate")
-    assert "always()" in cleanup
-    assert "steps.prepare_snowflake_candidate.outcome == 'success'" in cleanup
-    assert "--drop-candidate" in cleanup
-
-    assert "inputs.dry_run != true" in workflow[workflow.index("  deploy-dbt-docs:") :]

@@ -951,7 +951,25 @@ def test_snowflake_replay_target_rejects_disabled_gate(monkeypatch):
             )
 
 
-def test_snapshot_loader_duckdb_path_is_independent_of_snowflake_gate():
+def test_mode2_backend_selection_and_snowflake_gate_are_independent():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/snapshot-replay.yml").read_text(
+        encoding="utf-8"
+    )
+
+    duckdb_job = workflow.split("  duckdb:", 1)[1].split("  snowflake:", 1)[0]
+    snowflake_job = workflow.split("  snowflake:", 1)[1].split("  compare:", 1)[0]
+    compare_job = workflow.split("  compare:", 1)[1].split("  compare-existing:", 1)[0]
+
+    assert "SNOWFLAKE_OPERATIONS_ENABLED" not in duckdb_job
+    assert "vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake_job
+    assert "vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in compare_job
+    assert "name: Load DuckDB (rebuild)" in duckdb_job
+    assert "name: Load Snowflake (rebuild)" in snowflake_job
+    assert "--mode rebuild" in duckdb_job
+    assert "--mode rebuild" in snowflake_job
+    assert "inputs.mode" not in workflow
+    assert "deploy-dbt-docs" not in workflow
     workflow = (
         Path(__file__).resolve().parents[1]
         / ".github"
