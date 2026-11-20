@@ -50,6 +50,16 @@ def test_snowflake_raw_promoter_is_importable_as_a_module():
     )
 
 
+def test_mode1_workflow_uses_the_duckdb_publication_asset_extractor():
+    workflow = (ROOT / ".github/workflows/mode1-incremental-loader.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "python -m scripts.extract_latest_snapshot_assets" in workflow
+    assert "python scripts.extract_latest_snapshot_assets.py" not in workflow
+    assert (ROOT / "scripts/extract_latest_snapshot_assets.py").is_file()
+
+
 def test_dbt_source_database_follows_the_selected_backend():
     sources = (ROOT / "dbt/models/sources.yml").read_text(encoding="utf-8")
 

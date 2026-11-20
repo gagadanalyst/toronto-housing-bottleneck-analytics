@@ -667,6 +667,7 @@ def _clone_snowflake_schema(
         REBUILD_SNOWFLAKE_SCHEMA_RE,
         _validate_snowflake_schema_owner,
     )
+    from scripts.snowflake_candidate_utils import rebase_pipeline_state
 
     source_schema = str(source_schema).upper()
     if expected_mode2_run_id is not None or expected_promoted_generation_id is not None:
@@ -762,7 +763,14 @@ def _clone_snowflake_schema(
                     (GENERATION_ID, PROMOTION_STATE) VALUES (%s, %s)''',
                 (f"{run_id}:{run_attempt}", "READY"),
             )
+            rebased_states = rebase_pipeline_state(
+                cursor, target_schema, source_schema, target_schema
+            )
             connection.commit()
+            print(
+                f"Rebased {rebased_states} cloned Snowflake DLT state row(s) "
+                f"from {source_schema} to {target_schema}."
+            )
         finally:
             cursor.close()
     finally:
