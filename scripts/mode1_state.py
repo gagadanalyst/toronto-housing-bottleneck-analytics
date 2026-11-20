@@ -1023,12 +1023,43 @@ def prepare_state(args: argparse.Namespace) -> dict[str, Any]:
     )
     if backend == "snowflake" and not snowflake_credentials:
         raise ValueError("SNOWFLAKE_DLT_CONNECTION is required for Snowflake Mode 1.")
-    manifest = _restore_latest_release_state(
-        repository=args.repository,
-        backend=backend,
-        working_dir=working_dir,
-        snowflake_credentials=snowflake_credentials,
+    rebootstrap_from_mode2 = bool(getattr(args, "rebootstrap_from_mode2", False))
+    baseline_run_id = str(args.baseline_run_id or "").strip()
+    baseline_attempt = str(args.baseline_attempt or "1").strip()
+    if rebootstrap_from_mode2 and not baseline_run_id:
+        raise ValueError(
+            "Explicit Mode 2 rebootstrap requires baseline_run_id and baseline_attempt."
+        )
+
+    # A forced rebootstrap deliberately skips old Release checkpoints. This
+    # prepare step does not delete them; later publication applies the existing
+    # per-backend policy of retaining the newest two complete checkpoints.
+    manifest = None
+    if not rebootstrap_from_mode2:
+        manifest = _restore_latest_release_state(
+            repository=args.repository,
+            backend=backend,
+            working_dir=working_dir,
+            snowflake_credentials=snowflake_credentials,
+        )
+
+    requested_generation_id = (
+        f"{baseline_run_id}:{baseline_attempt}" if baseline_run_id else None
     )
+    if (
+        manifest is not None
+        and requested_generation_id is not None
+        and str(manifest.get("generation_id", "")) != requested_generation_id
+    ):
+        existing_generation_id = str(manifest.get("generation_id", "unknown"))
+        raise RuntimeError(
+            "Persisted Mode 1 state uses Mode 2 generation "
+            f"{existing_generation_id}, but this dispatch requested "
+            f"{requested_generation_id}. Refusing to reuse a stale baseline. "
+            "Set rebootstrap_from_mode2=true to explicitly bootstrap from the "
+            "requested accepted Mode 2 generation."
+        )
+
     needs_initial_checkpoint = manifest is None
 
     if manifest is not None:
@@ -1500,6 +1531,14 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-attempt", required=True)
     prepare.add_argument("--baseline-run-id", default="")
     prepare.add_argument("--baseline-attempt", default="1")
+    prepare.add_argument(
+        "--rebootstrap-from-mode2",
+        action="store_true",
+        help=(
+            "Ignore an existing Mode 1 Release checkpoint and explicitly "
+            "bootstrap from the supplied accepted full-history Mode 2 run."
+        ),
+    )
     prepare.add_argument(
         "--snowflake-credentials", default=os.getenv("SNOWFLAKE_DLT_CONNECTION")
     )
