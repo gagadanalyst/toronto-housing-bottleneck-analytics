@@ -904,6 +904,16 @@ def test_mode1_snowflake_clone_uses_promoted_raw_after_marker_validation(
         "_snowflake_connection",
         lambda _credentials: (connection, temporary),
     )
+    from scripts import snowflake_candidate_utils
+
+    rebase_calls = []
+    monkeypatch.setattr(
+        snowflake_candidate_utils,
+        "rebase_pipeline_state",
+        lambda _cursor, schema, source_dataset, target_dataset: (
+            rebase_calls.append((schema, source_dataset, target_dataset)) or 2
+        ),
+    )
 
     schema = mode1_state._clone_snowflake_schema(
         credentials="test-credentials",
@@ -924,6 +934,7 @@ def test_mode1_snowflake_clone_uses_promoted_raw_after_marker_validation(
     )
     assert marker_index < clone_index
     assert 'CLONE TORONTO."RAW"' in cursor.queries[clone_index]
+    assert rebase_calls == [("RAW_STAGE_900_1", "RAW", "RAW_STAGE_900_1")]
     assert connection.committed
     assert connection.closed
 
@@ -1008,6 +1019,11 @@ def test_mode1_snowflake_promoted_raw_marker_requires_exact_generation():
 
 
 def test_mode1_snowflake_clone_uses_promoted_mode1_raw_after_schema_swap(monkeypatch):
+    from scripts import snowflake_candidate_utils
+
+    monkeypatch.setattr(
+        snowflake_candidate_utils, "rebase_pipeline_state", lambda *args: 2
+    )
     connection, cursor, temporary = _fake_snowflake_clone_session(
         [("900:2", "PROMOTED")]
     )

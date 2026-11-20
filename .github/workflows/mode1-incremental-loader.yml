@@ -334,7 +334,7 @@ jobs:
       - name: Extract latest approved Parquet assets
         if: steps.promote_duckdb_candidate.outcome == 'success'
         run: |
-          python scripts.extract_latest_snapshot_assets.py \
+          python -m scripts.extract_latest_snapshot_assets \
             --summary data/staging/duckdb/mode1/replay-summary.json \
             --archive-dir data/recovery/snapshot-replay/archives \
             --output-dir data-assets \
