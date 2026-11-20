@@ -268,7 +268,7 @@ jobs:
             exit 1
           fi
 
-          python scripts/validate_full_rebuild_promotion.py "${args[@]}"
+          python -m scripts.validate_full_rebuild_promotion "${args[@]}"
 
       - name: Publish read-only promotion evidence for the backend jobs
         id: evidence
@@ -483,7 +483,7 @@ jobs:
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
       - name: Validate and stage the full-history DuckDB candidate for publication
         run: |
-          python scripts/promote_duckdb_snapshot_rebuild.py \
+          python -m scripts.promote_duckdb_snapshot_rebuild \
             --source-candidate "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
             --candidate "$DBT_DUCKDB_PATH" \
             --production data/warehouse/toronto.duckdb \
@@ -574,7 +574,7 @@ jobs:
 
           print(f"Revalidated and materialized all {len(archives)} authorized archives.")
           PY
-          python scripts/extract_latest_snapshot_assets.py \
+          python -m scripts.extract_latest_snapshot_assets \
             --summary data/recovery/snapshot-replay/duckdb-summary.json \
             --archive-dir data/recovery/snapshot-replay/archives \
             --output-dir data-assets
@@ -641,7 +641,7 @@ jobs:
             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
       - name: Promote the fully validated Snowflake RAW history
         run: |
-          python scripts/promote_snowflake_snapshot_rebuild.py \
+          python -m scripts.promote_snowflake_snapshot_rebuild \
             --source-schema "${{ needs.verify.outputs.snowflake_schema }}" \
             --source-run-id "${{ inputs.source_run_id }}" \
             --expected-snapshots "${{ needs.verify.outputs.snapshot_count }}" \
