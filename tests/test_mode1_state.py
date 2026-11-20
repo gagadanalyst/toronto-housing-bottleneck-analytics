@@ -785,3 +785,177 @@ def test_mode2_metadata_rejects_mismatched_source_format_version(tmp_path, backe
 
     with pytest.raises(RuntimeError, match="duplicated or inconsistent"):
         mode1_state._mode2_generation(ledger_path, backend, "12345:1")
+
+
+def _fake_snowflake_clone_session(marker_rows):
+    class FakeCursor:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, _params=None):
+            self.queries.append(query)
+
+        def fetchone(self):
+            query = self.queries[-1]
+            if "SELECT SCHEMA_NAME" in query:
+                return None
+            return ("TORONTO_INGEST_ROLE",)
+
+        def fetchall(self):
+            return marker_rows
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def __init__(self):
+            self.fake_cursor = FakeCursor()
+            self.committed = False
+            self.closed = False
+
+        def cursor(self):
+            return self.fake_cursor
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            self.closed = True
+
+    class FakeTemporary:
+        def cleanup(self):
+            pass
+
+    connection = FakeConnection()
+    return connection, connection.fake_cursor, FakeTemporary()
+
+
+def test_snowflake_promoted_raw_marker_accepts_exact_generation():
+    class FakeCursor:
+        def execute(self, query):
+            self.query = query
+
+        def fetchall(self):
+            return [("rebuild:12345", "PROMOTED")]
+
+    cursor = FakeCursor()
+    mode1_state._validate_snowflake_promoted_raw_marker(
+        cursor, expected_mode2_run_id="12345"
+    )
+    assert "TORONTO.RAW.TORONTO_CANDIDATE_CONTROL" in cursor.query
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [("rebuild:99999", "PROMOTED")],
+        [("rebuild:12345", "READY")],
+        [
+            ("rebuild:12345", "PROMOTED"),
+            ("rebuild:12345", "PROMOTED"),
+        ],
+        [
+            ("rebuild:12345", "PROMOTED"),
+            ("rebuild:99999", "PROMOTED"),
+        ],
+    ],
+)
+def test_snowflake_promoted_raw_marker_rejects_non_exact_state(rows):
+    class FakeCursor:
+        def execute(self, _query):
+            pass
+
+        def fetchall(self):
+            return rows
+
+    with pytest.raises(RuntimeError, match="expected promoted Mode 2 marker"):
+        mode1_state._validate_snowflake_promoted_raw_marker(
+            FakeCursor(), expected_mode2_run_id="12345"
+        )
+
+
+def test_mode1_snowflake_clone_uses_promoted_raw_after_marker_validation(
+    monkeypatch,
+):
+    connection, cursor, temporary = _fake_snowflake_clone_session(
+        [("rebuild:12345", "PROMOTED")]
+    )
+    monkeypatch.setattr(
+        mode1_state,
+        "_snowflake_connection",
+        lambda _credentials: (connection, temporary),
+    )
+
+    schema = mode1_state._clone_snowflake_schema(
+        credentials="test-credentials",
+        source_schema="RAW",
+        run_id="900",
+        run_attempt="1",
+        expected_mode2_run_id="12345",
+    )
+
+    assert schema == "RAW_STAGE_900_1"
+    marker_index = next(
+        i
+        for i, query in enumerate(cursor.queries)
+        if "FROM TORONTO.RAW.TORONTO_CANDIDATE_CONTROL" in query
+    )
+    clone_index = next(
+        i for i, query in enumerate(cursor.queries) if "CLONE TORONTO." in query
+    )
+    assert marker_index < clone_index
+    assert 'CLONE TORONTO."RAW"' in cursor.queries[clone_index]
+    assert connection.committed
+    assert connection.closed
+
+
+def test_mode1_snowflake_clone_rejects_unpromoted_raw_before_ddl(monkeypatch):
+    connection, cursor, temporary = _fake_snowflake_clone_session(
+        [("rebuild:99999", "PROMOTED")]
+    )
+    monkeypatch.setattr(
+        mode1_state,
+        "_snowflake_connection",
+        lambda _credentials: (connection, temporary),
+    )
+
+    with pytest.raises(RuntimeError, match="expected promoted Mode 2 marker"):
+        mode1_state._clone_snowflake_schema(
+            credentials="test-credentials",
+            source_schema="RAW",
+            run_id="901",
+            run_attempt="1",
+            expected_mode2_run_id="12345",
+        )
+
+    assert not any("CREATE SCHEMA" in query for query in cursor.queries)
+
+
+def test_mode1_snowflake_bootstrap_uses_promoted_raw_and_preserves_ledger_candidate(
+    tmp_path, monkeypatch
+):
+    ledger_path, _, mode2_candidate = _mode2_fixture(tmp_path, backend="snowflake")
+    calls = []
+
+    def fake_clone(**kwargs):
+        calls.append(kwargs)
+        return "RAW_STAGE_900_1"
+
+    monkeypatch.setattr(mode1_state, "_clone_snowflake_schema", fake_clone)
+
+    result = mode1_state.bootstrap_snowflake_working_state(
+        mode2_ledger_path=ledger_path,
+        working_dir=tmp_path / "snowflake-working",
+        generation_id="12345:1",
+        credentials="test-credentials",
+        run_id="900",
+        run_attempt="1",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["source_schema"] == "RAW"
+    assert calls[0]["expected_mode2_run_id"] == "12345"
+    assert result["mode2_candidate"] == mode2_candidate
+    assert result["mode2_promoted_source_schema"] == "TORONTO.RAW"
+    assert result["candidate"] == "TORONTO.RAW_STAGE_900_1"
