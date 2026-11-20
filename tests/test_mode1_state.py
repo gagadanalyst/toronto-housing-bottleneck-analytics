@@ -478,8 +478,11 @@ def test_prepare_state_marks_first_bootstrap_for_checkpoint(tmp_path, monkeypatc
         archive.add(ledger_path, arcname="duckdb-ledger.sqlite")
         archive.add(candidate_file, arcname="duckdb/toronto-replay-12345.duckdb")
 
+    def unexpected_state_restore(**_kwargs):
+        pytest.fail("Explicit Mode 2 rebootstrap must bypass existing Release state.")
+
     monkeypatch.setattr(
-        mode1_state, "_restore_latest_release_state", lambda **_kwargs: None
+        mode1_state, "_restore_latest_release_state", unexpected_state_restore
     )
     monkeypatch.setattr(
         mode1_state,
@@ -498,6 +501,7 @@ def test_prepare_state_marks_first_bootstrap_for_checkpoint(tmp_path, monkeypatc
             run_attempt="1",
             baseline_run_id="12345",
             baseline_attempt="1",
+            rebootstrap_from_mode2=True,
             snowflake_credentials="",
         )
     )
@@ -507,6 +511,62 @@ def test_prepare_state_marks_first_bootstrap_for_checkpoint(tmp_path, monkeypatc
     assert (
         tmp_path / "working" / "candidate.duckdb"
     ).read_bytes() == candidate_file.read_bytes()
+
+
+def test_prepare_state_requires_mode2_run_for_explicit_rebootstrap(
+    tmp_path, monkeypatch
+):
+    from argparse import Namespace
+
+    def unexpected_state_restore(**_kwargs):
+        pytest.fail("A missing Mode 2 run ID must be rejected before Release restore.")
+
+    monkeypatch.setattr(
+        mode1_state, "_restore_latest_release_state", unexpected_state_restore
+    )
+    args = Namespace(
+        backend="duckdb",
+        repository="owner/repo",
+        working_dir=tmp_path / "working",
+        run_id="901",
+        run_attempt="1",
+        baseline_run_id="",
+        baseline_attempt="1",
+        rebootstrap_from_mode2=True,
+        snowflake_credentials="",
+    )
+
+    with pytest.raises(ValueError, match="requires baseline_run_id"):
+        mode1_state.prepare_state(args)
+
+
+def test_prepare_state_rejects_stale_release_baseline_without_explicit_rebootstrap(
+    tmp_path, monkeypatch
+):
+    from argparse import Namespace
+
+    monkeypatch.setattr(
+        mode1_state,
+        "_restore_latest_release_state",
+        lambda **_kwargs: {
+            "backend": "duckdb",
+            "generation_id": "44502575929:1",
+        },
+    )
+    args = Namespace(
+        backend="duckdb",
+        repository="owner/repo",
+        working_dir=tmp_path / "working",
+        run_id="902",
+        run_attempt="1",
+        baseline_run_id="44650647432",
+        baseline_attempt="1",
+        rebootstrap_from_mode2=False,
+        snowflake_credentials="",
+    )
+
+    with pytest.raises(RuntimeError, match="rebootstrap_from_mode2=true"):
+        mode1_state.prepare_state(args)
 
 
 def test_snowflake_candidate_marker_requires_exact_ready_generation():
@@ -702,6 +762,13 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
     assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 2
     assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 3
     assert "steps.replay.outputs.has_pending_archives != 'true'" not in workflow
+    assert "rebootstrap_from_mode2:" in workflow
+    assert "default: false" in workflow
+    assert (
+        workflow.count("REBOOTSTRAP_FROM_MODE2: ${{ inputs.rebootstrap_from_mode2 }}")
+        == 2
+    )
+    assert workflow.count("prepare_args+=(--rebootstrap-from-mode2)") == 2
 
 
 @pytest.mark.parametrize("backend", ("duckdb", "snowflake"))

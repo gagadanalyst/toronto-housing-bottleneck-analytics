@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: "1"
+      rebootstrap_from_mode2:
+        description: Explicitly ignore old Mode 1 state and bootstrap from the selected accepted Mode 2 generation
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -86,15 +91,23 @@ jobs:
 
       - name: Restore or bootstrap the accepted DuckDB Mode 1 state
         id: prepare
+        env:
+          REBOOTSTRAP_FROM_MODE2: ${{ inputs.rebootstrap_from_mode2 }}
         run: |
-          python -m scripts.mode1_state prepare \
-            --backend duckdb \
-            --repository "$GITHUB_REPOSITORY" \
-            --working-dir data/staging/duckdb/mode1 \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --baseline-run-id "${{ inputs.baseline_run_id }}" \
+          prepare_args=(
+            python -m scripts.mode1_state prepare
+            --backend duckdb
+            --repository "$GITHUB_REPOSITORY"
+            --working-dir data/staging/duckdb/mode1
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --baseline-run-id "${{ inputs.baseline_run_id }}"
             --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+          )
+          if [ "$REBOOTSTRAP_FROM_MODE2" = "true" ]; then
+            prepare_args+=(--rebootstrap-from-mode2)
+          fi
+          "${prepare_args[@]}"
 
       - name: Replay only unprocessed immutable archives into DuckDB staging
         id: replay
@@ -189,15 +202,23 @@ jobs:
 
       - name: Restore or bootstrap the accepted Snowflake Mode 1 state
         id: prepare
+        env:
+          REBOOTSTRAP_FROM_MODE2: ${{ inputs.rebootstrap_from_mode2 }}
         run: |
-          python -m scripts.mode1_state prepare \
-            --backend snowflake \
-            --repository "$GITHUB_REPOSITORY" \
-            --working-dir data/staging/snowflake/mode1 \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --baseline-run-id "${{ inputs.baseline_run_id }}" \
+          prepare_args=(
+            python -m scripts.mode1_state prepare
+            --backend snowflake
+            --repository "$GITHUB_REPOSITORY"
+            --working-dir data/staging/snowflake/mode1
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --baseline-run-id "${{ inputs.baseline_run_id }}"
             --baseline-attempt "${{ inputs.baseline_attempt || '1' }}"
+          )
+          if [ "$REBOOTSTRAP_FROM_MODE2" = "true" ]; then
+            prepare_args+=(--rebootstrap-from-mode2)
+          fi
+          "${prepare_args[@]}"
 
       - name: Replay only unprocessed immutable archives into Snowflake staging
         id: replay
