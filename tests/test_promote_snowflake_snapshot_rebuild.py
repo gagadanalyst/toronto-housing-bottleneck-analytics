@@ -44,7 +44,6 @@ def _summary(tmp_path):
                 "quarantined_bad_row_count": 0,
                 "quarantined_business_key_count": 0,
                 "quarantine_sha256": None,
-
             }
             for source in ("active_permits", "cleared_permits")
         ],

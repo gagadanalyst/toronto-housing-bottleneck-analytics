@@ -1,4 +1,5 @@
 """Read dbt's shared dashboard-facing analytics contract with read-only access."""
+
 from __future__ import annotations
 
 import re
@@ -93,9 +94,13 @@ def load_snowflake_dashboard_data(
 ]:
     """Read dbt marts only; all shared analytical calculations live in dbt."""
     required_settings = ("account", "user", "private_key")
-    missing = [name for name in required_settings if not str(config.get(name, "")).strip()]
+    missing = [
+        name for name in required_settings if not str(config.get(name, "")).strip()
+    ]
     if missing:
-        raise ValueError("Snowflake dashboard configuration is missing: " + ", ".join(missing))
+        raise ValueError(
+            "Snowflake dashboard configuration is missing: " + ", ".join(missing)
+        )
 
     database_sql = _identifier(str(config.get("database", "TORONTO")), "database")
     schema_sql = _identifier(str(config.get("schema", "ANALYTICS")), "schema")
@@ -108,13 +113,17 @@ def load_snowflake_dashboard_data(
         from cryptography.hazmat.primitives import serialization
         from snowflake import connector
     except ImportError as exc:
-        raise RuntimeError("Snowflake mode requires snowflake-connector-python.") from exc
+        raise RuntimeError(
+            "Snowflake mode requires snowflake-connector-python."
+        ) from exc
 
     key_text = str(config["private_key"]).replace("\\n", "\n").strip()
     password_text = config.get("private_key_password")
     password = str(password_text).encode() if password_text else None
     try:
-        private_key = serialization.load_pem_private_key(key_text.encode(), password=password)
+        private_key = serialization.load_pem_private_key(
+            key_text.encode(), password=password
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "The Snowflake dashboard private key could not be parsed. "
@@ -167,17 +176,23 @@ def load_snowflake_dashboard_data(
                 "WHERE REFRESH_ID = 1",
             )
             if not refresh.empty:
-                last_successful_refresh_utc = refresh.iloc[0]["last_successful_refresh_utc"]
+                last_successful_refresh_utc = refresh.iloc[0][
+                    "last_successful_refresh_utc"
+                ]
 
-        active = _fetch_dataframe(cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_PERMIT_AGE")
+        active = _fetch_dataframe(
+            cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_PERMIT_AGE"
+        )
         summary = _fetch_dataframe(
-            cursor, f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE"
+            cursor,
+            f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
         )
         active_backlog = _fetch_dataframe(
             cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_BACKLOG_SUMMARY"
         )
         matched_lifecycle = _fetch_dataframe(
-            cursor, f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE"
+            cursor,
+            f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
         )
         pooled_lifecycle = _fetch_dataframe(
             cursor, f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_POOLED"

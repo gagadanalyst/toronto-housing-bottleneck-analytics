@@ -371,9 +371,7 @@ def test_snowflake_replay_order_binds_source_name():
         def _session(self):
             return nullcontext(Connection())
 
-    replay_warehouse_ledger.assert_replay_order(
-        Target(), archive, "active_permits"
-    )
+    replay_warehouse_ledger.assert_replay_order(Target(), archive, "active_permits")
 
     assert len(calls) == 1
     query, parameters = calls[0]

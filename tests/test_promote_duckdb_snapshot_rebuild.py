@@ -42,7 +42,6 @@ def _report(tmp_path: Path, run_id: str = "123") -> Path:
                 "quarantined_bad_row_count": 0,
                 "quarantined_business_key_count": 0,
                 "quarantine_sha256": None,
-
             }
             for source in ("active_permits", "cleared_permits")
         ],

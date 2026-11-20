@@ -9,7 +9,9 @@ def test_pooled_lifecycle_mart_uses_one_chronological_closed_cohort() -> None:
     model_path = Path("dbt/models/marts/mart_cleared_lifecycle_pooled.sql")
     sql = model_path.read_text(encoding="utf-8")
     sql = sql.replace("{{ config(materialized='table') }}", "")
-    sql = sql.replace("{{ ref('fct_cleared_permit_revision') }}", "fct_cleared_permit_revision")
+    sql = sql.replace(
+        "{{ ref('fct_cleared_permit_revision') }}", "fct_cleared_permit_revision"
+    )
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("""
@@ -30,9 +32,17 @@ def test_pooled_lifecycle_mart_uses_one_chronological_closed_cohort() -> None:
                 ('Closed', DATE '2024-05-01', DATE '2024-04-01', DATE '2024-06-01', -30, 31, 61)
         """)
         result = connection.execute(sql).fetchdf()
-        result = result.set_index("measure").loc[
-            ["Application to issue", "Issue to completion", "Application to completion"]
-        ].reset_index()
+        result = (
+            result.set_index("measure")
+            .loc[
+                [
+                    "Application to issue",
+                    "Issue to completion",
+                    "Application to completion",
+                ]
+            ]
+            .reset_index()
+        )
         assert result["matched_cohort_count"].tolist() == [3, 3, 3]
         assert result["median_days"].tolist() == [20.0, 180.0, 200.0]
         assert result["p90_days"].tolist() == [28.0, 252.0, 280.0]

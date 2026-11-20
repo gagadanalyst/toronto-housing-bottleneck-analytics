@@ -493,7 +493,9 @@ def load_dashboard_data(
             }
             missing = sorted(required - available)
             if missing:
-                missing_names = ", ".join(f"{schema}.{table}" for schema, table in missing)
+                missing_names = ", ".join(
+                    f"{schema}.{table}" for schema, table in missing
+                )
                 raise RuntimeError(
                     "The downloaded release does not contain required dbt relations: "
                     f"{missing_names}. The release may not yet contain the new dbt serving contract."
@@ -671,7 +673,9 @@ def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, 
                 "using the configured Snowflake role."
             )
         elif local_duckdb:
-            st.caption("Reads the configured local DuckDB database using read-only access.")
+            st.caption(
+                "Reads the configured local DuckDB database using read-only access."
+            )
         else:
             st.markdown(
                 f"[Latest published DuckDB database on GitHub ↗]({RELEASE_PAGE_URL})"
@@ -737,10 +741,18 @@ def overview(
     )
 
     required_columns = {
-        "summary_level", "application_year", "permit_type",
-        "current_active_revision_count", "age_eligible_count", "age_ineligible_count",
-        "over_365_days_count", "over_730_days_count", "over_1095_days_count",
-        "median_age_days", "p90_age_days", "eligible_backlog_share_pct",
+        "summary_level",
+        "application_year",
+        "permit_type",
+        "current_active_revision_count",
+        "age_eligible_count",
+        "age_ineligible_count",
+        "over_365_days_count",
+        "over_730_days_count",
+        "over_1095_days_count",
+        "median_age_days",
+        "p90_age_days",
+        "eligible_backlog_share_pct",
     }
     missing_columns = required_columns - set(active_backlog.columns)
     if missing_columns:
@@ -750,12 +762,20 @@ def overview(
         )
     overall_rows = active_backlog.loc[active_backlog["summary_level"] == "overall"]
     if len(overall_rows) != 1:
-        raise RuntimeError("The Active backlog summary mart must contain exactly one overall row.")
+        raise RuntimeError(
+            "The Active backlog summary mart must contain exactly one overall row."
+        )
     overall = overall_rows.iloc[0]
-    cohort = active_backlog.loc[active_backlog["summary_level"] == "application_year"].copy()
-    by_type = active_backlog.loc[active_backlog["summary_level"] == "permit_type"].copy()
+    cohort = active_backlog.loc[
+        active_backlog["summary_level"] == "application_year"
+    ].copy()
+    by_type = active_backlog.loc[
+        active_backlog["summary_level"] == "permit_type"
+    ].copy()
     if cohort.empty or by_type.empty:
-        raise RuntimeError("The Active backlog summary mart is missing year or permit-type groups.")
+        raise RuntimeError(
+            "The Active backlog summary mart is missing year or permit-type groups."
+        )
 
     cohort["application_year"] = number(cohort["application_year"])
     cohort["application_year_label"] = cohort["application_year"].map(
@@ -763,8 +783,12 @@ def overview(
     )
     cohort = cohort.sort_values("application_year", na_position="last")
     for column in (
-        "current_active_revision_count", "age_eligible_count", "age_ineligible_count",
-        "over_365_days_count", "over_730_days_count", "over_1095_days_count",
+        "current_active_revision_count",
+        "age_eligible_count",
+        "age_ineligible_count",
+        "over_365_days_count",
+        "over_730_days_count",
+        "over_1095_days_count",
     ):
         cohort[column] = number(cohort[column]).fillna(0)
 
@@ -783,9 +807,14 @@ def overview(
 
     asof_values = (
         pd.to_datetime(active["as_of_date"], errors="coerce").dropna()
-        if "as_of_date" in active else pd.Series(dtype="datetime64[ns]")
+        if "as_of_date" in active
+        else pd.Series(dtype="datetime64[ns]")
     )
-    asof = asof_values.iloc[0].strftime("%d %b %Y") if not asof_values.empty else "Not available"
+    asof = (
+        asof_values.iloc[0].strftime("%d %b %Y")
+        if not asof_values.empty
+        else "Not available"
+    )
     backend_label = (
         "Snowflake warehouse"
         if backend == "snowflake"
@@ -809,19 +838,31 @@ def overview(
     st.write("")
     cols = st.columns(4, gap="medium")
     with cols[0]:
-        metric_card("Current Active records", fmt_int(total_active), "Currently marked Active")
+        metric_card(
+            "Current Active records", fmt_int(total_active), "Currently marked Active"
+        )
     with cols[1]:
         metric_card(
-            "Age-eligible records", fmt_int(eligible_count),
-            f"{eligible_count / total_active:.1%} of Active records" if total_active else "No records",
+            "Age-eligible records",
+            fmt_int(eligible_count),
+            f"{eligible_count / total_active:.1%} of Active records"
+            if total_active
+            else "No records",
         )
     with cols[2]:
         metric_card(
-            "Open more than one year", fmt_int(over_365),
-            f"{over_365 / eligible_count:.1%} of age-eligible records" if eligible_count else "No eligible records",
+            "Open more than one year",
+            fmt_int(over_365),
+            f"{over_365 / eligible_count:.1%} of age-eligible records"
+            if eligible_count
+            else "No eligible records",
         )
     with cols[3]:
-        metric_card("Median Active age", fmt_days(median_active_age), f"P90: {fmt_days(p90_active_age)} · elapsed time so far")
+        metric_card(
+            "Median Active age",
+            fmt_days(median_active_age),
+            f"P90: {fmt_days(p90_active_age)} · elapsed time so far",
+        )
 
     st.divider()
     st.subheader("1. Where is today's Active backlog concentrated?")
@@ -831,29 +872,56 @@ def overview(
         unsafe_allow_html=True,
     )
     cohort_fig = go.Figure()
-    cohort_fig.add_trace(go.Bar(name="Age-eligible", x=cohort["application_year_label"], y=cohort["age_eligible_count"], marker_color=TEAL))
-    cohort_fig.add_trace(go.Bar(name="Age-ineligible", x=cohort["application_year_label"], y=cohort["age_ineligible_count"], marker_color=MUTED))
-    cohort_fig.update_layout(barmode="stack", title="Current Active records by application-year cohort")
+    cohort_fig.add_trace(
+        go.Bar(
+            name="Age-eligible",
+            x=cohort["application_year_label"],
+            y=cohort["age_eligible_count"],
+            marker_color=TEAL,
+        )
+    )
+    cohort_fig.add_trace(
+        go.Bar(
+            name="Age-ineligible",
+            x=cohort["application_year_label"],
+            y=cohort["age_ineligible_count"],
+            marker_color=MUTED,
+        )
+    )
+    cohort_fig.update_layout(
+        barmode="stack", title="Current Active records by application-year cohort"
+    )
     cohort_fig.update_xaxes(title="Application year")
     cohort_fig.update_yaxes(title="Current Active records")
     st.plotly_chart(chart_layout(cohort_fig, 360), width="stretch")
 
     cohort_table = cohort[
-        ["application_year_label", "current_active_revision_count", "age_eligible_count",
-         "age_ineligible_count", "eligible_backlog_share_pct", "over_365_days_count",
-         "over_730_days_count", "over_1095_days_count", "median_age_days", "p90_age_days"]
-    ].rename(columns={
-        "application_year_label": "Application year",
-        "current_active_revision_count": "Current Active",
-        "age_eligible_count": "Age eligible",
-        "age_ineligible_count": "Age ineligible",
-        "eligible_backlog_share_pct": "Share of eligible backlog (%)",
-        "over_365_days_count": ">365 days",
-        "over_730_days_count": ">730 days",
-        "over_1095_days_count": ">1,095 days",
-        "median_age_days": "Median age (days)",
-        "p90_age_days": "P90 age (days)",
-    })
+        [
+            "application_year_label",
+            "current_active_revision_count",
+            "age_eligible_count",
+            "age_ineligible_count",
+            "eligible_backlog_share_pct",
+            "over_365_days_count",
+            "over_730_days_count",
+            "over_1095_days_count",
+            "median_age_days",
+            "p90_age_days",
+        ]
+    ].rename(
+        columns={
+            "application_year_label": "Application year",
+            "current_active_revision_count": "Current Active",
+            "age_eligible_count": "Age eligible",
+            "age_ineligible_count": "Age ineligible",
+            "eligible_backlog_share_pct": "Share of eligible backlog (%)",
+            "over_365_days_count": ">365 days",
+            "over_730_days_count": ">730 days",
+            "over_1095_days_count": ">1,095 days",
+            "median_age_days": "Median age (days)",
+            "p90_age_days": "P90 age (days)",
+        }
+    )
     st.dataframe(cohort_table, hide_index=True, width="stretch")
     st.markdown(
         f"**{recent_share:.1%}** of the age-eligible backlog belongs to 2024 and later application cohorts. "
@@ -872,12 +940,17 @@ def overview(
         unsafe_allow_html=True,
     )
     by_type = by_type.sort_values(
-        ["over_365_days_count", "current_active_revision_count"], ascending=[False, False]
+        ["over_365_days_count", "current_active_revision_count"],
+        ascending=[False, False],
     )
     top_types = by_type.head(10).sort_values("over_365_days_count", ascending=True)
     type_fig = px.bar(
-        top_types, x="over_365_days_count", y="permit_type", orientation="h",
-        color_discrete_sequence=[TEAL], title="Top permit types by Active records open over one year",
+        top_types,
+        x="over_365_days_count",
+        y="permit_type",
+        orientation="h",
+        color_discrete_sequence=[TEAL],
+        title="Top permit types by Active records open over one year",
     )
     type_fig.update_xaxes(title="Age-eligible Active records open >365 days")
     type_fig.update_yaxes(title="")
@@ -887,18 +960,28 @@ def overview(
         "of all age-eligible Active records open more than 365 days."
     )
     type_table = by_type.head(12)[
-        ["permit_type", "current_active_revision_count", "age_eligible_count", "over_365_days_count",
-         "over_730_days_count", "over_1095_days_count", "median_age_days", "p90_age_days"]
-    ].rename(columns={
-        "permit_type": "Permit type",
-        "current_active_revision_count": "Current Active",
-        "age_eligible_count": "Age eligible",
-        "over_365_days_count": ">365 days",
-        "over_730_days_count": ">730 days",
-        "over_1095_days_count": ">1,095 days",
-        "median_age_days": "Median age (days)",
-        "p90_age_days": "P90 age (days)",
-    })
+        [
+            "permit_type",
+            "current_active_revision_count",
+            "age_eligible_count",
+            "over_365_days_count",
+            "over_730_days_count",
+            "over_1095_days_count",
+            "median_age_days",
+            "p90_age_days",
+        ]
+    ].rename(
+        columns={
+            "permit_type": "Permit type",
+            "current_active_revision_count": "Current Active",
+            "age_eligible_count": "Age eligible",
+            "over_365_days_count": ">365 days",
+            "over_730_days_count": ">730 days",
+            "over_1095_days_count": ">1,095 days",
+            "median_age_days": "Median age (days)",
+            "p90_age_days": "P90 age (days)",
+        }
+    )
     st.dataframe(type_table, hide_index=True, width="stretch")
 
     st.divider()
@@ -908,24 +991,50 @@ def overview(
         "with application, issue, and completion dates all present and chronologically ordered.</div>",
         unsafe_allow_html=True,
     )
-    measure_order = ["Application to issue", "Issue to completion", "Application to completion"]
+    measure_order = [
+        "Application to issue",
+        "Issue to completion",
+        "Application to completion",
+    ]
     pooled = pooled_lifecycle.copy()
     for column in ("matched_cohort_count", "median_days", "p90_days"):
         pooled[column] = number(pooled[column])
     pooled = pooled.set_index("measure").reindex(measure_order).reset_index()
     if pooled[["matched_cohort_count", "median_days", "p90_days"]].isna().any().any():
-        raise RuntimeError("The pooled matched lifecycle summary is missing one or more intervals.")
+        raise RuntimeError(
+            "The pooled matched lifecycle summary is missing one or more intervals."
+        )
     matched_count = int(pooled["matched_cohort_count"].min())
     lifecycle_cols = st.columns(3, gap="medium")
     for column, row in zip(lifecycle_cols, pooled.to_dict("records"), strict=True):
         with column:
-            metric_card(row["measure"], fmt_days(row["median_days"]), f"P90: {fmt_days(row['p90_days'])} · n={int(row['matched_cohort_count']):,}")
+            metric_card(
+                row["measure"],
+                fmt_days(row["median_days"]),
+                f"P90: {fmt_days(row['p90_days'])} · n={int(row['matched_cohort_count']):,}",
+            )
 
     st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
     lifecycle_fig = go.Figure()
-    lifecycle_fig.add_trace(go.Bar(name="Median", x=pooled["measure"], y=pooled["median_days"], marker_color=TEAL))
-    lifecycle_fig.add_trace(go.Bar(name="90th percentile", x=pooled["measure"], y=pooled["p90_days"], marker_color=GOLD))
-    lifecycle_fig.update_layout(barmode="group", title="Elapsed calendar days in the matched Closed cohort")
+    lifecycle_fig.add_trace(
+        go.Bar(
+            name="Median",
+            x=pooled["measure"],
+            y=pooled["median_days"],
+            marker_color=TEAL,
+        )
+    )
+    lifecycle_fig.add_trace(
+        go.Bar(
+            name="90th percentile",
+            x=pooled["measure"],
+            y=pooled["p90_days"],
+            marker_color=GOLD,
+        )
+    )
+    lifecycle_fig.update_layout(
+        barmode="group", title="Elapsed calendar days in the matched Closed cohort"
+    )
     lifecycle_fig.update_xaxes(title="Lifecycle interval")
     lifecycle_fig.update_yaxes(title="Calendar days")
     st.plotly_chart(chart_layout(lifecycle_fig, 360), width="stretch")
@@ -934,35 +1043,53 @@ def overview(
         "these are pooled permit-level medians and P90s, not medians of year/type group summaries."
     )
 
-    with st.expander("Explore matched lifecycle cohorts by permit type and application year"):
-        matched_lifecycle["application_year"] = number(matched_lifecycle["application_year"])
-        matched_lifecycle["matched_cohort_count"] = number(matched_lifecycle["matched_cohort_count"]).fillna(0)
+    with st.expander(
+        "Explore matched lifecycle cohorts by permit type and application year"
+    ):
+        matched_lifecycle["application_year"] = number(
+            matched_lifecycle["application_year"]
+        )
+        matched_lifecycle["matched_cohort_count"] = number(
+            matched_lifecycle["matched_cohort_count"]
+        ).fillna(0)
         matched_lifecycle["median_days"] = number(matched_lifecycle["median_days"])
         matched_lifecycle["p90_days"] = number(matched_lifecycle["p90_days"])
-        permit_types = sorted(matched_lifecycle["permit_type"].dropna().astype(str).unique())
+        permit_types = sorted(
+            matched_lifecycle["permit_type"].dropna().astype(str).unique()
+        )
         if permit_types:
             choose_type, choose_measure = st.columns(2, gap="medium")
-            selected_type = choose_type.selectbox("Permit type", permit_types, key="story_matched_permit_type")
-            selected_measure = choose_measure.selectbox("Lifecycle interval", measure_order, key="story_matched_lifecycle_measure")
+            selected_type = choose_type.selectbox(
+                "Permit type", permit_types, key="story_matched_permit_type"
+            )
+            selected_measure = choose_measure.selectbox(
+                "Lifecycle interval",
+                measure_order,
+                key="story_matched_lifecycle_measure",
+            )
             selected_cohorts = matched_lifecycle.loc[
                 (matched_lifecycle["permit_type"].astype(str) == selected_type)
                 & (matched_lifecycle["measure"] == selected_measure)
             ].sort_values("application_year")
             selected_cohorts = selected_cohorts[
                 ["application_year", "matched_cohort_count", "median_days", "p90_days"]
-            ].rename(columns={
-                "application_year": "Application year",
-                "matched_cohort_count": "Matched records",
-                "median_days": "Median days",
-                "p90_days": "P90 days",
-            })
+            ].rename(
+                columns={
+                    "application_year": "Application year",
+                    "matched_cohort_count": "Matched records",
+                    "median_days": "Median days",
+                    "p90_days": "P90 days",
+                }
+            )
             st.dataframe(selected_cohorts, hide_index=True, width="stretch")
             st.caption(
                 "Each row is one application-year × permit-type matched cohort. "
                 "These group-level values should not be averaged to produce an overall permit-level median."
             )
         else:
-            st.info("No matched Closed lifecycle cohorts are available for permit-type exploration.")
+            st.info(
+                "No matched Closed lifecycle cohorts are available for permit-type exploration."
+            )
 
     st.markdown(
         '<div class="callout"><b>Scope and interpretation:</b> Active ages are elapsed time so far for records still marked Active; '
@@ -1605,7 +1732,6 @@ def quality_page(
     completion_conflicts = quality_counts.get("completed_date_conflict", 0)
     closed_count = quality_counts.get("closed_revision_count", 0)
     closed_both_dates = quality_counts.get("closed_both_dates_available", 0)
-    both_dates_populated = quality_counts.get("both_dates_available", 0)
     non_closed_both_dates = quality_counts.get("non_closed_both_dates_available", 0)
 
     coverage_table = pd.DataFrame(
@@ -1750,9 +1876,7 @@ def main() -> None:
                         "Querying the Snowflake dashboard marts using read-only access."
                     )
                 elif duckdb_path:
-                    loading_detail = (
-                        "Reading the configured local DuckDB database in read-only mode."
-                    )
+                    loading_detail = "Reading the configured local DuckDB database in read-only mode."
                 elif force_refresh:
                     loading_detail = (
                         "Downloading the latest published database from GitHub. "
