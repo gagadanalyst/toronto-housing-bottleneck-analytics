@@ -52,6 +52,11 @@ def _target(path: Path) -> _DuckDBLedgerTarget:
 def test_native_ledger_registers_both_sources_and_tracks_completion(tmp_path):
     target = _target(tmp_path / "candidate.duckdb")
     archive = _archive("snapshot-a", 1, run_id=1001)
+    source_completion = archive.extracted_at + timedelta(minutes=3)
+    for source_name in ("active_permits", "cleared_permits"):
+        archive.sources[source_name].manifest["extraction_completed_at_utc"] = (
+            source_completion.isoformat()
+        )
 
     target_archive = replay_warehouse_ledger.register_archive
     target_archive(target, archive)
@@ -69,6 +74,20 @@ def test_native_ledger_registers_both_sources_and_tracks_completion(tmp_path):
         == "pending"
     )
     assert replay_warehouse_ledger.completed_snapshot_ids(target) == set()
+
+    import duckdb
+
+    with duckdb.connect(str(target.database), read_only=True) as connection:
+        rows = connection.execute(
+            "SELECT source_name, extraction_completed_at_utc "
+            "FROM raw.toronto_snapshot_ledger WHERE snapshot_id = ?",
+            [archive.snapshot_id],
+        ).fetchall()
+    assert len(rows) == 2
+
+    assert {row[1].astimezone(UTC) for row in rows} == {
+        source_completion.astimezone(UTC)
+    }
 
     for source_name in ("active_permits", "cleared_permits"):
         replay_warehouse_ledger.set_snapshot_status(

@@ -47,10 +47,19 @@ class FakeConnection:
 
 class FakeCursor:
     def __init__(
-        self, relations: set[str], refresh_timestamp: datetime | None = None
+        self,
+        relations: set[str],
+        refresh_timestamp: datetime | None = None,
+        source_extraction_timestamp: datetime | None = None,
+        metadata_columns: set[str] | None = None,
     ) -> None:
         self.relations = relations
         self.refresh_timestamp = refresh_timestamp
+        self.source_extraction_timestamp = source_extraction_timestamp
+        self.metadata_columns = metadata_columns or {
+            "LAST_SUCCESSFUL_REFRESH_UTC",
+            "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC",
+        }
         self.description: list[tuple[str]] | None = None
         self.rows: list[tuple[Any, ...]] = []
         self.closed = False
@@ -59,14 +68,19 @@ class FakeCursor:
     def execute(self, query: str, params: object = None) -> None:
         self.queries.append(query)
         upper = query.upper()
-        if "INFORMATION_SCHEMA.TABLES" in upper:
+        if "INFORMATION_SCHEMA.COLUMNS" in upper:
+            self.rows = [(name,) for name in sorted(self.metadata_columns)]
+        elif "INFORMATION_SCHEMA.TABLES" in upper:
             self.rows = [(name,) for name in sorted(self.relations)]
         elif "DASHBOARD_REFRESH_METADATA" in upper:
-            self.description = [("LAST_SUCCESSFUL_REFRESH_UTC",)]
+            selected = ["LAST_SUCCESSFUL_REFRESH_UTC"]
+            values = [self.refresh_timestamp]
+            if "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC" in self.metadata_columns:
+                selected.append("LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC")
+                values.append(self.source_extraction_timestamp)
+            self.description = [(name,) for name in selected]
             self.rows = (
-                [(self.refresh_timestamp,)]
-                if self.refresh_timestamp is not None
-                else []
+                [tuple(values)] if any(value is not None for value in values) else []
             )
         elif "MART_ACTIVE_PERMIT_AGE" in upper:
             self.description = [("PERMIT_NUM",), ("IS_AGE_ELIGIBLE",), ("AS_OF_DATE",)]
@@ -189,9 +203,11 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
+    source_extraction_timestamp = datetime(2026, 10, 28, 19, 58, tzinfo=UTC)
     cursor = FakeCursor(
         set(backend.REQUIRED_RELATIONS) | {"DASHBOARD_REFRESH_METADATA"},
         refresh_timestamp,
+        source_extraction_timestamp,
     )
     connection = FakeConnection(cursor)
     connection_args = install_snowflake_stubs(monkeypatch, connection)
@@ -204,6 +220,7 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
         cleared_count,
         quality,
         actual_refresh,
+        actual_source_extraction,
     ) = backend.load_snowflake_dashboard_data(CONFIG)
     assert active.loc[0, "permit_num"] == "00123"
     assert summary.loc[0, "permit_type"] == "Residential"
@@ -212,6 +229,7 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
     assert pooled.loc[0, "median_days"] == 28.0
     assert cleared_count == 200
     assert actual_refresh == refresh_timestamp
+    assert actual_source_extraction == source_extraction_timestamp
     assert set(backend.REQUIRED_RELATIONS) == {
         "MART_ACTIVE_PERMIT_AGE",
         "MART_ACTIVE_BACKLOG_SUMMARY",
@@ -248,4 +266,23 @@ def test_refresh_timestamp_is_optional_before_first_refresh(
     install_snowflake_stubs(monkeypatch, connection)
     result = backend.load_snowflake_dashboard_data(CONFIG)
     assert result[7] is None
+    assert result[8] is None
+    assert connection.fake_cursor.closed and connection.closed
+
+
+def test_old_snowflake_metadata_schema_keeps_refresh_and_omits_source_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refresh_timestamp = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
+    cursor = FakeCursor(
+        set(backend.REQUIRED_RELATIONS) | {"DASHBOARD_REFRESH_METADATA"},
+        refresh_timestamp,
+        metadata_columns={"LAST_SUCCESSFUL_REFRESH_UTC"},
+    )
+    connection = FakeConnection(cursor)
+    install_snowflake_stubs(monkeypatch, connection)
+
+    result = backend.load_snowflake_dashboard_data(CONFIG)
+    assert result[7] == refresh_timestamp
+    assert result[8] is None
     assert connection.fake_cursor.closed and connection.closed

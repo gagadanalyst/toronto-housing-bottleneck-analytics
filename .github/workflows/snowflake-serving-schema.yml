@@ -330,9 +330,14 @@ jobs:
                   f"""CREATE TABLE IF NOT EXISTS TORONTO.\"{schema}\".DASHBOARD_REFRESH_METADATA (
                       REFRESH_ID NUMBER(1,0) NOT NULL,
                       LAST_SUCCESSFUL_REFRESH_UTC TIMESTAMP_TZ NOT NULL,
+                      LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC TIMESTAMP_TZ,
                       SOURCE_COMMIT VARCHAR NOT NULL,
                       WORKFLOW_RUN_ID VARCHAR NOT NULL
                   )"""
+              )
+              cursor.execute(
+                  f"""ALTER TABLE TORONTO.\"{schema}\".DASHBOARD_REFRESH_METADATA
+                      ADD COLUMN IF NOT EXISTS LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC TIMESTAMP_TZ"""
               )
               print("Dashboard refresh metadata table is ready.")
           finally:
@@ -467,34 +472,76 @@ jobs:
           cursor = connection.cursor()
           try:
               cursor.execute(
+                  "SELECT COLUMN_NAME FROM TORONTO.INFORMATION_SCHEMA.COLUMNS "
+                  "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                  ("RAW", "TORONTO_SNAPSHOT_LEDGER"),
+              )
+              raw_ledger_columns = {str(row[0]).upper() for row in cursor.fetchall()}
+              source_timestamp_column = (
+                  "COALESCE(EXTRACTION_COMPLETED_AT_UTC, EXTRACTION_STARTED_AT_UTC)"
+                  if "EXTRACTION_COMPLETED_AT_UTC" in raw_ledger_columns
+                  else "EXTRACTION_STARTED_AT_UTC"
+              )
+              if "EXTRACTION_STARTED_AT_UTC" not in raw_ledger_columns:
+                  source_extraction_timestamp = None
+              else:
+                  cursor.execute(
+                      f"""SELECT MAX({source_timestamp_column})
+                      FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER AS ledger
+                      WHERE LOWER(ledger.STATUS) = 'succeeded'
+                        AND ledger.SNAPSHOT_ID IN (
+                            SELECT SNAPSHOT_ID
+                            FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER
+                            WHERE LOWER(SOURCE_NAME) IN ('active_permits', 'cleared_permits')
+                            GROUP BY SNAPSHOT_ID
+                            HAVING COUNT(DISTINCT LOWER(SOURCE_NAME)) = 2
+                               AND COUNT(*) = 2
+                               AND COUNT_IF(LOWER(STATUS) = 'succeeded') = 2
+                        )"""
+                  )
+                  extraction_row = cursor.fetchone()
+                  source_extraction_timestamp = extraction_row[0] if extraction_row else None
+
+              cursor.execute(
                   f"""MERGE INTO TORONTO.\"{schema}\".DASHBOARD_REFRESH_METADATA AS target
                   USING (
                       SELECT 1 AS REFRESH_ID,
                              CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()) AS LAST_SUCCESSFUL_REFRESH_UTC,
+                             %s AS LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC,
                              %s AS SOURCE_COMMIT,
                              %s AS WORKFLOW_RUN_ID
                   ) AS source
                   ON target.REFRESH_ID = source.REFRESH_ID
                   WHEN MATCHED THEN UPDATE SET
                       LAST_SUCCESSFUL_REFRESH_UTC = source.LAST_SUCCESSFUL_REFRESH_UTC,
+                      LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC = source.LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC,
                       SOURCE_COMMIT = source.SOURCE_COMMIT,
                       WORKFLOW_RUN_ID = source.WORKFLOW_RUN_ID
                   WHEN NOT MATCHED THEN INSERT (
-                      REFRESH_ID, LAST_SUCCESSFUL_REFRESH_UTC, SOURCE_COMMIT, WORKFLOW_RUN_ID
+                      REFRESH_ID, LAST_SUCCESSFUL_REFRESH_UTC,
+                      LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC, SOURCE_COMMIT, WORKFLOW_RUN_ID
                   ) VALUES (
                       source.REFRESH_ID, source.LAST_SUCCESSFUL_REFRESH_UTC,
+                      source.LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC,
                       source.SOURCE_COMMIT, source.WORKFLOW_RUN_ID
                   )""",
-                  (os.environ["SOURCE_COMMIT"], os.environ["SOURCE_RUN_ID"]),
+                  (
+                      source_extraction_timestamp,
+                      os.environ["SOURCE_COMMIT"],
+                      os.environ["SOURCE_RUN_ID"],
+                  ),
               )
               cursor.execute(
-                  f'SELECT LAST_SUCCESSFUL_REFRESH_UTC FROM TORONTO."{schema}".DASHBOARD_REFRESH_METADATA WHERE REFRESH_ID = 1'
+                  f'SELECT LAST_SUCCESSFUL_REFRESH_UTC, LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC FROM TORONTO."{schema}".DASHBOARD_REFRESH_METADATA WHERE REFRESH_ID = 1'
               )
               row = cursor.fetchone()
               if not row or row[0] is None:
                   raise RuntimeError("Snowflake refresh timestamp could not be verified.")
               connection.commit()
-              print(f"Recorded successful Snowflake refresh at {row[0]}.")
+              print(
+                  f"Recorded successful Snowflake refresh at {row[0]}; "
+                  f"latest loaded source extraction={row[1]}."
+              )
           except Exception:
               connection.rollback()
               raise

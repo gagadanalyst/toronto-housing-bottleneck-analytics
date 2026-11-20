@@ -91,6 +91,7 @@ def load_snowflake_dashboard_data(
     int,
     dict[str, int],
     Any | None,
+    Any | None,
 ]:
     """Read dbt marts only; all shared analytical calculations live in dbt."""
     required_settings = ("account", "user", "private_key")
@@ -169,16 +170,30 @@ def load_snowflake_dashboard_data(
             )
 
         last_successful_refresh_utc = None
+        last_successful_source_extraction_utc = None
         if "DASHBOARD_REFRESH_METADATA" in available:
+            cursor.execute(
+                f"SELECT COLUMN_NAME FROM {database_sql}.INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                (schema_sql.strip('"'), "DASHBOARD_REFRESH_METADATA"),
+            )
+            metadata_columns = {str(row[0]).upper() for row in cursor.fetchall()}
+            refresh_columns = ["LAST_SUCCESSFUL_REFRESH_UTC"]
+            if "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC" in metadata_columns:
+                refresh_columns.append("LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC")
             refresh = _fetch_dataframe(
                 cursor,
-                f"SELECT LAST_SUCCESSFUL_REFRESH_UTC FROM {qualified_schema}.DASHBOARD_REFRESH_METADATA "
+                f"SELECT {', '.join(refresh_columns)} FROM {qualified_schema}.DASHBOARD_REFRESH_METADATA "
                 "WHERE REFRESH_ID = 1",
             )
             if not refresh.empty:
                 last_successful_refresh_utc = refresh.iloc[0][
                     "last_successful_refresh_utc"
                 ]
+                if "last_successful_source_extraction_utc" in refresh.columns:
+                    last_successful_source_extraction_utc = refresh.iloc[0][
+                        "last_successful_source_extraction_utc"
+                    ]
 
         active = _fetch_dataframe(
             cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_PERMIT_AGE"
@@ -233,6 +248,7 @@ def load_snowflake_dashboard_data(
             cleared_revision_count,
             quality_counts,
             last_successful_refresh_utc,
+            last_successful_source_extraction_utc,
         )
     finally:
         if cursor is not None:

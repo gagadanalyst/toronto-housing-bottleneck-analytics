@@ -21,6 +21,23 @@ def _boundary(archive: SnapshotArchive, source_name: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _completion_boundary(archive: SnapshotArchive, source_name: str) -> datetime:
+    """Return source extraction completion, falling back for legacy archives."""
+    source = archive.sources[source_name]
+    value = source.manifest.get("extraction_completed_at_utc")
+    if value is None:
+        value = source.manifest.get("extracted_at_utc", source.extracted_at)
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(
+            "Source extraction completion timestamp must include a timezone."
+        )
+    return parsed.astimezone(UTC)
+
+
 def _values(archive: SnapshotArchive, source_name: str) -> tuple[Any, ...]:
     return (
         archive.run_id,
@@ -31,6 +48,7 @@ def _values(archive: SnapshotArchive, source_name: str) -> tuple[Any, ...]:
         archive.asset_name,
         archive.format_version,
         archive.archive_sha256,
+        _completion_boundary(archive, source_name),
     )
 
 
@@ -48,6 +66,7 @@ def ensure_ledger(target: Any) -> None:
                     source_run_id VARCHAR NOT NULL,
                     source_run_attempt INTEGER NOT NULL,
                     extraction_started_at_utc TIMESTAMPTZ NOT NULL,
+                    extraction_completed_at_utc TIMESTAMPTZ,
                     source_name VARCHAR NOT NULL,
                     status VARCHAR NOT NULL,
                     source_commit VARCHAR NOT NULL,
@@ -66,6 +85,7 @@ def ensure_ledger(target: Any) -> None:
                 )'''
             )
             for column, data_type in (
+                ("extraction_completed_at_utc", "TIMESTAMPTZ"),
                 ("format_version", "INTEGER"),
                 ("archive_sha256", "VARCHAR"),
                 ("quarantined_row_count", "BIGINT DEFAULT 0"),
@@ -88,6 +108,7 @@ def ensure_ledger(target: Any) -> None:
                     SOURCE_RUN_ID VARCHAR NOT NULL,
                     SOURCE_RUN_ATTEMPT NUMBER(10,0) NOT NULL,
                     EXTRACTION_STARTED_AT_UTC TIMESTAMP_TZ NOT NULL,
+                    EXTRACTION_COMPLETED_AT_UTC TIMESTAMP_TZ,
                     SOURCE_NAME VARCHAR NOT NULL,
                     STATUS VARCHAR NOT NULL,
                     SOURCE_COMMIT VARCHAR NOT NULL,
@@ -103,6 +124,10 @@ def ensure_ledger(target: Any) -> None:
                     FORMAT_VERSION NUMBER(10,0),
                     ARCHIVE_SHA256 VARCHAR(64)
                 )'''
+            )
+            cursor.execute(
+                f'''ALTER TABLE TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
+                    ADD COLUMN IF NOT EXISTS EXTRACTION_COMPLETED_AT_UTC TIMESTAMP_TZ'''
             )
             cursor.execute(
                 f'''ALTER TABLE TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
@@ -360,6 +385,7 @@ def _assert_identity(old: tuple[Any, ...], values: tuple[Any, ...], label: str) 
     if old_time.tzinfo is None:
         raise ValueError(f"{label} ledger timestamp has no timezone.")
     old_time = old_time.astimezone(UTC)
+    completion_matches = len(old) < 10 or old[9] in (None, values[8])
     checks = (
         str(old[0]) == str(values[0]),
         int(old[1]) == int(values[1]),
@@ -369,6 +395,7 @@ def _assert_identity(old: tuple[Any, ...], values: tuple[Any, ...], label: str) 
         old[5] in (None, values[5]),
         old[7] in (None, values[6]),
         old[8] in (None, values[7]),
+        completion_matches,
     )
     if not all(checks):
         raise ValueError(
@@ -387,7 +414,8 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                 old = connection.execute(
                     f'''SELECT source_run_id, source_run_attempt,
                                extraction_started_at_utc, source_commit, release_tag,
-                               asset_name, status, format_version, archive_sha256
+                               asset_name, status, format_version, archive_sha256,
+                               extraction_completed_at_utc
                         FROM "{target.dataset}".toronto_snapshot_ledger
                         WHERE snapshot_id = ? AND source_name = ?''',
                     [archive.snapshot_id, source_name],
@@ -404,13 +432,17 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                                 release_tag=COALESCE(release_tag, ?),
                                 asset_name=COALESCE(asset_name, ?),
                                 format_version=COALESCE(format_version, ?),
-                                archive_sha256=COALESCE(archive_sha256, ?)
+                                archive_sha256=COALESCE(archive_sha256, ?),
+                                extraction_completed_at_utc=COALESCE(
+                                    extraction_completed_at_utc, ?
+                                )
                             WHERE snapshot_id=? AND source_name=?''',
                         [
                             archive.release_tag,
                             archive.asset_name,
                             archive.format_version,
                             archive.archive_sha256,
+                            values[8],
                             archive.snapshot_id,
                             source_name,
                         ],
@@ -419,14 +451,16 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                 connection.execute(
                     f'''INSERT INTO "{target.dataset}".toronto_snapshot_ledger
                         (snapshot_id, source_run_id, source_run_attempt,
-                         extraction_started_at_utc, source_name, status, source_commit,
-                         release_tag, asset_name, format_version, archive_sha256)
-                        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)''',
+                         extraction_started_at_utc, extraction_completed_at_utc,
+                         source_name, status, source_commit, release_tag, asset_name,
+                         format_version, archive_sha256)
+                        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)''',
                     [
                         archive.snapshot_id,
                         archive.run_id,
                         archive.run_attempt,
                         values[2],
+                        values[8],
                         source_name,
                         archive.source_commit,
                         archive.release_tag,
@@ -445,7 +479,8 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                 cursor.execute(
                     f'''SELECT SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
                                EXTRACTION_STARTED_AT_UTC, SOURCE_COMMIT, RELEASE_TAG,
-                               ASSET_NAME, STATUS, FORMAT_VERSION, ARCHIVE_SHA256
+                               ASSET_NAME, STATUS, FORMAT_VERSION, ARCHIVE_SHA256,
+                               EXTRACTION_COMPLETED_AT_UTC
                         FROM TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
                         WHERE SNAPSHOT_ID=%s AND SOURCE_NAME=%s''',
                     (archive.snapshot_id, source_name),
@@ -463,13 +498,17 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                                 RELEASE_TAG=COALESCE(RELEASE_TAG, %s),
                                 ASSET_NAME=COALESCE(ASSET_NAME, %s),
                                 FORMAT_VERSION=COALESCE(FORMAT_VERSION, %s),
-                                ARCHIVE_SHA256=COALESCE(ARCHIVE_SHA256, %s)
+                                ARCHIVE_SHA256=COALESCE(ARCHIVE_SHA256, %s),
+                                EXTRACTION_COMPLETED_AT_UTC=COALESCE(
+                                    EXTRACTION_COMPLETED_AT_UTC, %s
+                                )
                             WHERE SNAPSHOT_ID=%s AND SOURCE_NAME=%s''',
                         (
                             archive.release_tag,
                             archive.asset_name,
                             archive.format_version,
                             archive.archive_sha256,
+                            values[8],
                             archive.snapshot_id,
                             source_name,
                         ),
@@ -478,14 +517,16 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                 cursor.execute(
                     f'''INSERT INTO TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
                         (SNAPSHOT_ID, SOURCE_RUN_ID, SOURCE_RUN_ATTEMPT,
-                         EXTRACTION_STARTED_AT_UTC, SOURCE_NAME, STATUS, SOURCE_COMMIT,
-                         RELEASE_TAG, ASSET_NAME, FORMAT_VERSION, ARCHIVE_SHA256)
-                        VALUES (%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s)''',
+                         EXTRACTION_STARTED_AT_UTC, EXTRACTION_COMPLETED_AT_UTC,
+                         SOURCE_NAME, STATUS, SOURCE_COMMIT, RELEASE_TAG, ASSET_NAME,
+                         FORMAT_VERSION, ARCHIVE_SHA256)
+                        VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s,%s)''',
                     (
                         archive.snapshot_id,
                         archive.run_id,
                         archive.run_attempt,
                         values[2],
+                        values[8],
                         source_name,
                         archive.source_commit,
                         archive.release_tag,
