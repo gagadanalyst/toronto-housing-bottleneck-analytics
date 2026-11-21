@@ -43,7 +43,9 @@ def _run_gh(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _rolling_asset_available(repository: str, release_tag: str, database_asset: str) -> bool:
+def _rolling_asset_available(
+    repository: str, release_tag: str, database_asset: str
+) -> bool:
     result = subprocess.run(
         [
             "gh",
@@ -93,7 +95,9 @@ def _rolling_asset_available(repository: str, release_tag: str, database_asset: 
     )
 
 
-def _download_rolling_asset(repository: str, destination: Path, release_tag: str, database_asset: str) -> None:
+def _download_rolling_asset(
+    repository: str, destination: Path, release_tag: str, database_asset: str
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     _run_gh(
@@ -213,7 +217,9 @@ def restore_production_database(
             _validate_database(candidate)
             _atomic_copy(candidate, output)
 
-            print(f"Restored authoritative DuckDB production database from {release_tag}/{database_asset}.")
+            print(
+                f"Restored authoritative DuckDB production database from {release_tag}/{database_asset}."
+            )
             return release_tag
 
         if release_tag != "warehouse-latest":
@@ -258,8 +264,10 @@ def main() -> int:
         parser.error("--repository or GITHUB_REPOSITORY is required.")
 
     restore_production_database(
-        args.repository, args.output,
-        release_tag=args.release_tag, database_asset=args.database_asset,
+        args.repository,
+        args.output,
+        release_tag=args.release_tag,
+        database_asset=args.database_asset,
     )
     return 0
 

@@ -32,7 +32,9 @@ def test_warehouse_latest_is_the_authoritative_restore_source(tmp_path, monkeypa
     def download(_repository, destination, _release_tag, _database_asset):
         shutil.copy2(source, destination)
 
-    monkeypatch.setattr(restore, "_rolling_asset_available", lambda _repository, _tag, _asset: True)
+    monkeypatch.setattr(
+        restore, "_rolling_asset_available", lambda _repository, _tag, _asset: True
+    )
     monkeypatch.setattr(restore, "_download_rolling_asset", download)
     monkeypatch.setattr(
         restore,
@@ -48,7 +50,9 @@ def test_warehouse_latest_is_the_authoritative_restore_source(tmp_path, monkeypa
 
 
 def test_missing_rolling_asset_uses_the_immutable_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(restore, "_rolling_asset_available", lambda _repository, _tag, _asset: False)
+    monkeypatch.setattr(
+        restore, "_rolling_asset_available", lambda _repository, _tag, _asset: False
+    )
 
     def checkpoint(_repository, destination):
         _database(destination)
@@ -66,7 +70,9 @@ def test_missing_rolling_asset_uses_the_immutable_checkpoint(tmp_path, monkeypat
 def test_invalid_present_rolling_asset_fails_closed_without_fallback(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(restore, "_rolling_asset_available", lambda _repository, _tag, _asset: True)
+    monkeypatch.setattr(
+        restore, "_rolling_asset_available", lambda _repository, _tag, _asset: True
+    )
 
     def invalid_download(_repository, destination, _release_tag, _database_asset):
         destination.write_bytes(b"not a DuckDB database")
@@ -134,12 +140,14 @@ def test_loading_restore_refuses_warehouse_checkpoint_fallback(tmp_path, monkeyp
     monkeypatch.setattr(restore, "_rolling_asset_available", lambda *_args: False)
     called = []
     monkeypatch.setattr(
-        restore, "_restore_immutable_checkpoint",
+        restore,
+        "_restore_immutable_checkpoint",
         lambda *_args: called.append(True),
     )
     with pytest.raises(FileNotFoundError, match="loading-latest"):
         restore.restore_production_database(
-            "owner/repo", tmp_path / "loading.duckdb",
+            "owner/repo",
+            tmp_path / "loading.duckdb",
             release_tag="loading-latest",
             database_asset="toronto-loading.duckdb",
         )

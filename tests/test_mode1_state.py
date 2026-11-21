@@ -773,7 +773,10 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
         "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
         in workflow
     )
-    assert "if: always() && steps.promote_snowflake_candidate.outcome == 'success'" in workflow
+    assert (
+        "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
+        in workflow
+    )
     assert workflow.count("steps.replay.outputs.has_pending_archives != 'true'") == 2
     assert "rebootstrap_from_mode2:" in workflow
     assert "default: false" in workflow

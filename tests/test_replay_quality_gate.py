@@ -156,23 +156,37 @@ def test_v2_manual_and_scheduled_extraction_have_separate_gates():
         encoding="utf-8"
     )
 
-    assert workflow.count("vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'") == 6
+    assert "EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}" in workflow
+    assert (
+        "EXTRACTION_SCHEDULE_ENABLED: ${{ vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED }}"
+        in workflow
+    )
+    assert 'if [ "$PIPELINE_SCHEDULE" = "true" ]; then' in workflow
+    assert 'if [ "$EXTRACTION_SCHEDULE_ENABLED" != "true" ]; then' in workflow
+    assert (
+        "inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'"
+        in workflow
+    )
+    assert (
+        "inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true'"
+        in workflow
+    )
     assert workflow.count("vars.TORONTO_EXTRACTION_ENABLED == 'true'") == 5
     assert "EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}" in workflow
 
 
-def test_v2_push_and_pull_request_are_ci_only():
+def test_v2_pr_validation_has_no_production_push_trigger():
     workflow = (ROOT / ".github/workflows/v2-snapshot-archive.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "  push:" in workflow
     assert "  pull_request:" in workflow
-    assert (
-        "if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-        in workflow
-    )
-    assert "github.event_name != 'pull_request' && steps.change_check" not in workflow
+    assert "  workflow_dispatch:" in workflow
+    assert "\n  push:\n" not in workflow
+    assert "github.event_name == 'workflow_dispatch'" in workflow
+    assert "inputs.confirm_publish == true" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "steps.change_check.outcome == 'success'" in workflow
 
 
 def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():

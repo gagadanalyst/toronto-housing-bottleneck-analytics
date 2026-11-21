@@ -444,7 +444,10 @@ def promote(
     expected_source = Path(report["candidate"]).resolve()
     if source_candidate.resolve() != expected_source:
         raise ValueError("source candidate path does not match the replay evidence.")
-    if candidate.resolve() != Path("data/warehouse/loading-candidate/toronto.duckdb").resolve():
+    if (
+        candidate.resolve()
+        != Path("data/warehouse/loading-candidate/toronto.duckdb").resolve()
+    ):
         raise ValueError(
             "Loading candidate must be the isolated data/warehouse/loading-candidate/toronto.duckdb copy."
         )
