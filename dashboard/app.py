@@ -1954,6 +1954,7 @@ def metricflow_page() -> None:
             active_type[metric] = number(active_type[metric])
             active_type = active_type.sort_values(metric, ascending=True)
             fig = px.bar(active_type, x=metric, y=dimension, orientation="h")
+            fig.update_traces(marker_color=TEAL)
             st.plotly_chart(
                 chart_layout(fig, max(340, 34 * len(active_type) + 100)),
                 width="stretch",
@@ -1970,6 +1971,7 @@ def metricflow_page() -> None:
             active_year[metric] = number(active_year[metric])
             active_year = active_year.sort_values(year_dimension)
             fig = px.bar(active_year, x=year_dimension, y=metric)
+            fig.update_traces(marker_color=TEAL)
             st.plotly_chart(chart_layout(fig), width="stretch")
         else:
             st.caption(
@@ -2016,6 +2018,8 @@ def metricflow_page() -> None:
         ),
     ]
     for start in range(0, len(cleared_metrics), 4):
+        if start:
+            st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
         columns = st.columns(min(4, len(cleared_metrics) - start))
         for column, (label, value, foot) in zip(
             columns, cleared_metrics[start : start + 4], strict=True
@@ -2036,6 +2040,7 @@ def metricflow_page() -> None:
             cleared_type[metric] = number(cleared_type[metric])
             cleared_type = cleared_type.sort_values(metric, ascending=True)
             fig = px.bar(cleared_type, x=metric, y=dimension, orientation="h")
+            fig.update_traces(marker_color=TEAL)
             st.plotly_chart(
                 chart_layout(fig, max(340, 34 * len(cleared_type) + 100)),
                 width="stretch",
@@ -2052,6 +2057,7 @@ def metricflow_page() -> None:
             cleared_year[metric] = number(cleared_year[metric])
             cleared_year = cleared_year.sort_values(year_dimension)
             fig = px.line(cleared_year, x=year_dimension, y=metric, markers=True)
+            fig.update_traces(line=dict(color=TEAL), marker=dict(color=TEAL))
             st.plotly_chart(chart_layout(fig), width="stretch")
         else:
             st.caption("No application-year lifecycle breakdown is available.")
