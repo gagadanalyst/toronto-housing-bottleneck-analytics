@@ -90,7 +90,7 @@ def test_promote_binds_candidate_to_run_evidence(tmp_path):
     with pytest.raises(ValueError, match="source candidate path"):
         promote.promote(
             source_candidate=tmp_path / "wrong.duckdb",
-            candidate=Path("data/warehouse/dbt-ci/toronto.duckdb"),
+            candidate=Path("data/warehouse/loading-candidate/toronto.duckdb"),
             production=Path("data/warehouse/toronto.duckdb"),
             summary_path=summary,
             run_id="123",

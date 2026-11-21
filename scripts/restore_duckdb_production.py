@@ -1,8 +1,8 @@
-"""Restore the authoritative DuckDB production database.
+"""Restore an authoritative DuckDB baseline from a selected GitHub Release.
 
-Restore warehouse-latest first. Use the latest verified immutable recovery
-checkpoint only when the rolling Release or its DuckDB asset is unavailable.
-A present but invalid rolling asset is a hard failure, not a fallback signal.
+The default dashboard warehouse retains its verified immutable-recovery fallback.
+The separate loading-latest baseline is fail-closed and never substitutes a
+possibly different dashboard-serving database when its own asset is unavailable.
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ def _run_gh(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _rolling_asset_available(repository: str) -> bool:
+def _rolling_asset_available(repository: str, release_tag: str, database_asset: str) -> bool:
     result = subprocess.run(
         [
             "gh",
             "release",
             "view",
-            "warehouse-latest",
+            release_tag,
             "--repo",
             repository,
             "--json",
@@ -88,27 +88,27 @@ def _rolling_asset_available(repository: str) -> bool:
         )
 
     return any(
-        isinstance(asset, dict) and asset.get("name") == "toronto.duckdb"
+        isinstance(asset, dict) and asset.get("name") == database_asset
         for asset in assets
     )
 
 
-def _download_rolling_asset(repository: str, destination: Path) -> None:
+def _download_rolling_asset(repository: str, destination: Path, release_tag: str, database_asset: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     _run_gh(
         "release",
         "download",
-        "warehouse-latest",
+        release_tag,
         "--repo",
         repository,
         "--pattern",
-        "toronto.duckdb",
+        database_asset,
         "--dir",
         str(destination.parent),
     )
 
-    downloaded = destination.parent / "toronto.duckdb"
+    downloaded = destination.parent / database_asset
     if not downloaded.is_file() or downloaded.stat().st_size <= 0:
         raise RuntimeError(
             "warehouse-latest reported a DuckDB asset, but the download "
@@ -193,6 +193,9 @@ def _atomic_copy(source: Path, destination: Path) -> None:
 def restore_production_database(
     repository: str,
     output: Path,
+    *,
+    release_tag: str = "warehouse-latest",
+    database_asset: str = "toronto.duckdb",
 ) -> str:
     output = output.resolve()
 
@@ -200,20 +203,23 @@ def restore_production_database(
         prefix="toronto-duckdb-production-restore-"
     ) as temporary:
         root = Path(temporary)
-        candidate = root / "toronto.duckdb"
+        candidate = root / database_asset
 
-        if _rolling_asset_available(repository):
-            _download_rolling_asset(repository, candidate)
+        if _rolling_asset_available(repository, release_tag, database_asset):
+            _download_rolling_asset(repository, candidate, release_tag, database_asset)
 
             # A present but invalid rolling asset must fail closed. Do not
             # hide it by silently loading a potentially older checkpoint.
             _validate_database(candidate)
             _atomic_copy(candidate, output)
 
-            print(
-                "Restored authoritative DuckDB production database from warehouse-latest."
+            print(f"Restored authoritative DuckDB production database from {release_tag}/{database_asset}.")
+            return release_tag
+
+        if release_tag != "warehouse-latest":
+            raise FileNotFoundError(
+                f"{release_tag} has no {database_asset}; refusing to substitute another baseline."
             )
-            return "warehouse-latest"
 
         restored = _restore_immutable_checkpoint(repository, candidate)
 
@@ -244,12 +250,17 @@ def main() -> int:
         "--repository",
         default=os.environ.get("GITHUB_REPOSITORY"),
     )
+    parser.add_argument("--release-tag", default="warehouse-latest")
+    parser.add_argument("--database-asset", default="toronto.duckdb")
     args = parser.parse_args()
 
     if not args.repository:
         parser.error("--repository or GITHUB_REPOSITORY is required.")
 
-    restore_production_database(args.repository, args.output)
+    restore_production_database(
+        args.repository, args.output,
+        release_tag=args.release_tag, database_asset=args.database_asset,
+    )
     return 0
 
 

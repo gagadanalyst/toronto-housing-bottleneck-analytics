@@ -182,11 +182,13 @@ def test_mode1_workflow_fingerprints_production_before_candidate_copy_and_promot
         0
     ]
 
-    assert "name: Mode 1 Incremental Loader (Validated Staging)" in workflow
+    assert "name: Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)" in workflow
     assert "python -m scripts.mode1_state prepare" in workflow
     assert "TORONTO_SNAPSHOT_LOADER_ENABLED" in workflow
     assert "dry_run:" not in workflow
     assert "DRY_RUN" not in workflow
+    assert "dbt build" not in workflow
+    assert "loading-latest" in workflow
 
     duck_capture = duckdb_job.index(
         "--output data/staging/duckdb/production-baseline.json"

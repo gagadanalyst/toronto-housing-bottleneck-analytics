@@ -6,13 +6,13 @@ on:
       - main
   workflow_run:
     workflows:
-      - Mode 1 Incremental Loader (Validated Staging)
+      - Transformation / dbt Serving Refresh
     types:
       - completed
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Successful Mode 1 workflow run ID containing a successful DuckDB job
+        description: Successful Transformation workflow run ID containing a published DuckDB warehouse
         required: true
         type: string
 
@@ -76,7 +76,7 @@ jobs:
       SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.source_run_id }}
 
     steps:
-      - name: Verify the successful Mode 1 DuckDB run
+      - name: Verify the successful Transformation DuckDB publication
         id: source
         run: |
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -99,12 +99,12 @@ jobs:
               ["gh", "api", f"repos/{repository}/actions/runs/{run_id}"], text=True
           ))
           if (
-              run.get("path") != ".github/workflows/mode1-incremental-loader.yml"
-              or run.get("name") != "Mode 1 Incremental Loader (Validated Staging)"
+              run.get("path") != ".github/workflows/transformation-dbt-serving.yml"
+              or run.get("name") != "Transformation / dbt Serving Refresh"
               or run.get("head_branch") != "main"
               or run.get("status") != "completed"
           ):
-              raise SystemExit("The selected run is not a completed Mode 1 run on main.")
+              raise SystemExit("The selected run is not a completed Transformation run on main.")
 
           attempt = int(run.get("run_attempt", 1))
           jobs = json.loads(subprocess.check_output(
@@ -116,16 +116,16 @@ jobs:
           duckdb = next(
               (
                   job for job in jobs.get("jobs", [])
-                  if job.get("name") == "Stage Mode 1 DuckDB changes"
+                  if job.get("name") == "Build and publish DuckDB serving warehouse"
               ),
               None,
           )
           if not duckdb or duckdb.get("conclusion") != "success":
               if os.environ.get("GITHUB_EVENT_NAME") == "workflow_run":
                   print("should_run=false")
-                  print("Mode 1 completed without a successful DuckDB job; skipping MetricFlow.", file=sys.stderr)
+                  print("Transformation completed without a published DuckDB warehouse; skipping MetricFlow.", file=sys.stderr)
                   raise SystemExit(0)
-              raise SystemExit("The selected Mode 1 run has no successful DuckDB job.")
+              raise SystemExit("The selected Transformation run has no successful DuckDB job.")
 
           publication_succeeded = any(
               step.get("name") == "Publish the four verified DuckDB production assets"
@@ -137,12 +137,12 @@ jobs:
                   print("should_run=false")
                   print("DuckDB had no new production publication; the existing metrics remain current.", file=sys.stderr)
                   raise SystemExit(0)
-              raise SystemExit("The selected Mode 1 run did not publish a new DuckDB warehouse.")
+              raise SystemExit("The selected Transformation run did not publish a new DuckDB warehouse.")
 
           print("should_run=true")
           print(f"source_run_head_sha={run['head_sha']}")
           print(
-              f"Verified Mode 1 run {run_id}, attempt {attempt}, "
+              f"Verified Transformation run {run_id}, attempt {attempt}, "
               f"DuckDB job {duckdb['id']}.",
               file=sys.stderr,
           )
@@ -184,12 +184,12 @@ jobs:
         if: steps.source.outputs.should_run == 'true'
         env:
           DBT_DUCKDB_PATH: ${{ runner.temp }}/toronto.duckdb
-          SOURCE_MODE1_RUN_ID: ${{ env.SOURCE_RUN_ID }}
+          SOURCE_TRANSFORMATION_RUN_ID: ${{ env.SOURCE_RUN_ID }}
           SOURCE_MODE1_COMMIT: ${{ steps.source.outputs.source_run_head_sha }}
         run: |
           python metricflow/run_metrics.py \
             --database "$DBT_DUCKDB_PATH" \
-            --trigger-run-id "$SOURCE_MODE1_RUN_ID" \
+            --trigger-run-id "$SOURCE_TRANSFORMATION_RUN_ID" \
             --source-commit "$SOURCE_MODE1_COMMIT" \
             --output "$RUNNER_TEMP/metricflow-results"
 
