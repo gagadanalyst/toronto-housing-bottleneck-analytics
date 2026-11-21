@@ -132,6 +132,16 @@ baselines. It requires explicit
 independently; the Snowflake promotion leg is included only when
 `SNOWFLAKE_OPERATIONS_ENABLED=true`. After a successful Snowflake full-history promotion, the promotion workflow dispatches Loading with `rebootstrap_from_mode2=true` and the exact Mode 2 replay run ID and attempt. Loading reboots its persistent state from that accepted generation. Transformation follows a successful, validated Loading handoff and dispatches Snowflake serving with the resulting successful Loading run identity (`snapshot_loader_run_id`).
 
+When both backend rebuilds succeed but the original Mode 2 comparison job fails,
+promotion can use a separate successful saved-evidence validation run. Pass the
+original rebuild run ID and attempt through `source_run_id` and
+`source_run_attempt`, and the successful revalidation run through
+`validation_run_id` and `validation_run_attempt`. The DuckDB and Snowflake
+candidate artifacts are still restored from the original rebuild run; only the
+joint-validation artifact comes from the separate validation run. This avoids
+repeating historical replay and does not bypass the production-baseline,
+archive-provenance, archive-set, SCD2-integrity or explicit-approval checks.
+
 ### Snowflake serving handoff
 
 `.github/workflows/snowflake-serving-schema.yml` is an explicit serving build.

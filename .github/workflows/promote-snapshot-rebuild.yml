@@ -11,6 +11,16 @@ on:
         description: Successful Snapshot Loader workflow attempt
         required: true
         type: string
+      validation_run_id:
+        description: Successful saved-evidence validation run ID (required when the source comparison job failed)
+        required: false
+        type: string
+        default: ""
+      validation_run_attempt:
+        description: Attempt number for the saved-evidence validation run
+        required: false
+        type: string
+        default: "1"
       confirm_full_history_promotion:
         description: Explicitly approve replacing canonical DuckDB history; Snowflake RAW is included only when enabled
         required: true
@@ -41,6 +51,8 @@ jobs:
       CONFIRM_FULL_HISTORY: ${{ inputs.confirm_full_history_promotion }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+      VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+      VALIDATION_RUN_ATTEMPT: ${{ inputs.validation_run_attempt }}
     outputs:
       snapshot_count: ${{ steps.evidence.outputs.snapshot_count }}
       snowflake_schema: ${{ steps.evidence.outputs.snowflake_schema }}
@@ -92,6 +104,8 @@ jobs:
           run_id = os.environ["SOURCE_RUN_ID"]
           attempt = os.environ["SOURCE_RUN_ATTEMPT"]
           snowflake_enabled = os.environ["SNOWFLAKE_ENABLED"] == "true"
+          validation_run_id = os.environ["VALIDATION_RUN_ID"]
+          validation_attempt = os.environ["VALIDATION_RUN_ATTEMPT"]
 
           if os.environ["CONFIRM_FULL_HISTORY"] != "true":
               raise SystemExit(
@@ -120,12 +134,11 @@ jobs:
           if (
               run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
               or run.get("status") != "completed"
-              or run.get("conclusion") != "success"
               or run.get("headBranch") != "main"
               or run.get("event") != "workflow_dispatch"
           ):
               raise SystemExit(
-                  "Source run is not a successful main-branch manual Snapshot Loader run."
+                  "Source run is not a completed main-branch manual Snapshot Loader run."
               )
 
           jobs = {
@@ -133,32 +146,117 @@ jobs:
               for job in run.get("jobs", [])
           }
 
-          if jobs.get("Load DuckDB (rebuild)") != "success":
+          required_source_jobs = {
+              "Seed or verify the canonical DuckDB Loading baseline": "success",
+              "Load DuckDB (rebuild)": "success",
+          }
+          if snowflake_enabled:
+              required_source_jobs["Load Snowflake (rebuild)"] = "success"
+
+          failures = {
+              name: jobs.get(name)
+              for name, expected in required_source_jobs.items()
+              if jobs.get(name) != expected
+          }
+          if failures:
               raise SystemExit(
-                  "The source workflow did not successfully complete its DuckDB rebuild."
+                  f"Source backend rebuild requirements failed: {failures}"
               )
 
           if snowflake_enabled:
-              required = {
-                  "Load Snowflake (rebuild)": "success",
-                  "Validate and compare rebuilt SCD2 histories": "success",
-              }
-              failures = {
-                  name: jobs.get(name)
-                  for name, expected in required.items()
-                  if jobs.get(name) != expected
-              }
-              if failures:
-                  raise SystemExit(
-                      "Both rebuild backends and parity must pass while "
-                      f"Snowflake operations are enabled: {failures}"
+              comparison_name = "Validate and compare rebuilt SCD2 histories"
+              comparison_conclusion = jobs.get(comparison_name)
+
+              if run.get("conclusion") == "success":
+                  if comparison_conclusion != "success":
+                      raise SystemExit(
+                          "A successful source run must have a successful "
+                          "cross-backend comparison job."
+                      )
+                  if validation_run_id:
+                      raise SystemExit(
+                          "Do not supply validation_run_id when the original "
+                          "source run already passed its comparison."
+                      )
+                  print("Source evidence policy: both backends and parity passed.")
+
+              elif (
+                  run.get("conclusion") == "failure"
+                  and comparison_conclusion == "failure"
+              ):
+                  if (
+                      not re.fullmatch(r"[0-9]+", validation_run_id)
+                      or int(validation_run_id) <= 0
+                      or not re.fullmatch(r"[0-9]+", validation_attempt)
+                      or int(validation_attempt) <= 0
+                      or validation_run_id == run_id
+                  ):
+                      raise SystemExit(
+                          "A failed source comparison requires a separate "
+                          "positive validation_run_id and validation_run_attempt."
+                      )
+
+                  validation_result = subprocess.run(
+                      [
+                          "gh", "run", "view", validation_run_id,
+                          "--attempt", validation_attempt,
+                          "--repo", os.environ["GITHUB_REPOSITORY"],
+                          "--json", "attempt,name,status,conclusion,headBranch,event,jobs",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
                   )
-              print("Source evidence policy: both DuckDB and Snowflake.")
+                  validation_run = json.loads(validation_result.stdout)
+
+                  if (
+                      int(validation_run.get("attempt", 0)) != int(validation_attempt)
+                      or validation_run.get("name")
+                      != "Snapshot Loader (Full-History Rebuild and Parity)"
+                      or validation_run.get("status") != "completed"
+                      or validation_run.get("conclusion") != "success"
+                      or validation_run.get("headBranch") != "main"
+                      or validation_run.get("event") != "workflow_dispatch"
+                  ):
+                      raise SystemExit(
+                          "The saved-evidence validation run must be a successful "
+                          "manual Snapshot Loader run on main."
+                      )
+
+                  validation_jobs = {
+                      job.get("name"): job.get("conclusion")
+                      for job in validation_run.get("jobs", [])
+                  }
+                  if (
+                      validation_jobs.get("Revalidate saved Mode 2 evidence")
+                      != "success"
+                  ):
+                      raise SystemExit(
+                          "The saved-evidence revalidation job did not succeed."
+                      )
+
+                  print(
+                      "Original backend rebuilds passed; separate saved-evidence "
+                      "validation also passed."
+                  )
+
+              else:
+                  raise SystemExit(
+                      "With Snowflake enabled, the source run must either pass "
+                      "comparison or fail only at comparison with a separately "
+                      "successful saved-evidence validation run."
+                  )
+
           else:
-              print(
-                  "Source evidence policy: DuckDB only. "
-                  "Snowflake replay and cross-backend parity are not required."
-              )
+              if run.get("conclusion") != "success":
+                  raise SystemExit(
+                      "DuckDB-only promotion requires a fully successful source run."
+                  )
+              if validation_run_id:
+                  raise SystemExit(
+                      "validation_run_id is not used for DuckDB-only promotion."
+                  )
+              print("Source evidence policy: DuckDB only; full run passed.")
 
           print(
               f"Verified full-history Mode 2 source workflow {run_id}, "
@@ -197,7 +295,16 @@ jobs:
 
           gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-snowflake-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$snowflake_dir"
 
-          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$joint_dir"
+          if [ -n "$VALIDATION_RUN_ID" ]; then
+            artifact_run_id="$VALIDATION_RUN_ID"
+            artifact_name="snapshot-loader-joint-validation-existing-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+          else
+            artifact_run_id="$SOURCE_RUN_ID"
+            artifact_name="snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+          fi
+
+          gh run download "$artifact_run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" --dir "$joint_dir"
 
           mapfile -t state_archives < <(find "$snowflake_dir" -type f -name state.tar.gz -print)
           if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
