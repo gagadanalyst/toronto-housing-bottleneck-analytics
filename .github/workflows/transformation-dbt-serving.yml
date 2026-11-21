@@ -17,6 +17,7 @@ on:
       - scripts/prepare_snowflake_serving_candidate.py
       - scripts/promote_snowflake_serving_candidate.py
       - scripts/restore_duckdb_production.py
+      - scripts/workflow_push_routing.py
   workflow_dispatch:
     inputs:
       backends:
@@ -51,55 +52,29 @@ jobs:
     outputs:
       should_transform: ${{ steps.route.outputs.should_transform }}
     steps:
+      - name: Check out full history for push routing
+        if: github.event_name == 'push'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - id: route
         env:
           EVENT_NAME: ${{ github.event_name }}
-          WORKFLOW_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          event = os.environ["EVENT_NAME"]
-          should = True
-          if event == "workflow_run":
-              should = os.environ.get("WORKFLOW_BRANCH") == "main"
-          elif event == "push":
-              commits = json.loads(os.environ.get("COMMITS_JSON") or "[]") or []
-              changed = {
-                  p
-                  for commit in commits
-                  for key in ("added", "modified", "removed")
-                  for p in commit.get(key, [])
-              }
-              upstream_prefixes = (
-                  "extraction/",
-                  ".github/workflows/v2-snapshot-archive.yml",
-                  ".github/workflows/mode1-incremental-loader.yml",
-                  ".github/workflows/promote-snapshot-rebuild.yml",
-                  ".github/workflows/snapshot-replay.yml",
-                  "pyproject.toml",
-                  "src/toronto_housing_ingestion/",
-                  "scripts/mode1_state.py",
-                  "scripts/replay_",
-                  "scripts/loader_promote_snowflake_raw.py",
-                  "scripts/prepare_duckdb_candidate.py",
-                  "scripts/promote_duckdb_candidate.py",
-                  "scripts/snowflake_candidate_utils.py",
-                  "scripts/promote_duckdb_snapshot_rebuild.py",
-                  "scripts/promote_snowflake_snapshot_rebuild.py",
-                  "scripts/validate_full_rebuild_promotion.py",
-                  "scripts/snapshot_replay_baseline.py",
-                  "scripts/restore_duckdb_production.py",
-                  "scripts/publish_loading_assets.py",
-                  "scripts/seed_loading_release.py",
-                  "scripts/extract_latest_snapshot_assets.py",
-              )
-              should = not any(
-                  path.startswith(prefix) for path in changed for prefix in upstream_prefixes
-              )
-          print(f"should_transform={str(should).lower()}")
-          PY
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            should_run=false
+            if [ "$SOURCE_BRANCH" = "main" ]; then
+              should_run=true
+            fi
+            echo "should_transform=$should_run" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ]; then
+          python scripts/workflow_push_routing.py --mode transformation --repo "$GITHUB_WORKSPACE" --before "$BEFORE_SHA" --after "$AFTER_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_transform=true" >> "$GITHUB_OUTPUT"
+          fi
 
   duckdb:
     needs: route

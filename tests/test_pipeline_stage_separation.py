@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scripts.workflow_push_routing import (
+    TRANSFORMATION_UPSTREAM_PATHS,
+    should_run_push,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -133,9 +138,7 @@ def test_snowflake_serving_no_longer_accepts_direct_mode2_promotion():
 def test_transformation_routes_loading_changes_before_serving():
     workflow = (ROOT / ".github/workflows/transformation-dbt-serving.yml").read_text()
 
-    router = workflow.split("upstream_prefixes = (", 1)[1].split(
-        "should = not any(", 1
-    )[0]
+    assert "scripts/workflow_push_routing.py" in workflow
 
     loading_paths = (
         "scripts/prepare_duckdb_candidate.py",
@@ -144,7 +147,10 @@ def test_transformation_routes_loading_changes_before_serving():
         "scripts/loader_promote_snowflake_raw.py",
     )
     for path in loading_paths:
-        assert f'"{path}",' in router, f"Missing upstream exclusion: {path}"
+        assert path in TRANSFORMATION_UPSTREAM_PATHS, (
+            f"Missing upstream exclusion: {path}"
+        )
+        assert not should_run_push("transformation", (path,))
 
     push_paths = workflow.split("    paths:\n", 1)[1].split("  workflow_dispatch:", 1)[
         0

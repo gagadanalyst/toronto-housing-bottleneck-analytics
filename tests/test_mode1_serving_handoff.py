@@ -4,6 +4,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.workflow_push_routing import (
+    LOADING_RUNTIME_PATHS,
+    TRANSFORMATION_UPSTREAM_PATHS,
+    should_run_push,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -66,8 +72,12 @@ def test_shared_restore_script_change_routes_through_loading_first():
     transformation = (
         ROOT / ".github/workflows/transformation-dbt-serving.yml"
     ).read_text()
+    restore_script = "scripts/restore_duckdb_production.py"
 
-    assert "      - scripts/restore_duckdb_production.py" in loading
-
-    route = transformation.split("upstream_prefixes = (", 1)[1].split(")", 1)[0]
-    assert '"scripts/restore_duckdb_production.py",' in route
+    assert f"      - {restore_script}" in loading
+    assert "scripts/workflow_push_routing.py" in loading
+    assert "scripts/workflow_push_routing.py" in transformation
+    assert restore_script in LOADING_RUNTIME_PATHS
+    assert restore_script in TRANSFORMATION_UPSTREAM_PATHS
+    assert should_run_push("loading", (restore_script,))
+    assert not should_run_push("transformation", (restore_script,))
