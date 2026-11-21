@@ -114,11 +114,11 @@ models:
         agg: median
         expr: age_since_application_days
       - name: p90_active_permit_age_days
-        description: 90th percentile elapsed calendar-day age of eligible current Active permits.
+        description: Approximate continuous 90th percentile of elapsed calendar-day age for eligible current Active permits.
         type: simple
         agg: percentile
         expr: age_since_application_days
-        percentile: 90
+        percentile: 0.9
         percentile_type: continuous
     columns:
       - name: permit_num
@@ -217,11 +217,11 @@ models:
         agg: median
         expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_issue_days ELSE NULL END"
       - name: p90_application_to_issue_days
-        description: 90th percentile non-negative elapsed calendar days from application to issue among records marked Closed.
+        description: Approximate continuous 90th percentile of non-negative elapsed calendar days from application to issue among records marked Closed.
         type: simple
         agg: percentile
         expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_issue_days ELSE NULL END"
-        percentile: 90
+        percentile: 0.9
         percentile_type: continuous
       - name: median_application_to_completion_days
         description: Median non-negative elapsed calendar days from application to completion among records marked Closed.
@@ -229,11 +229,11 @@ models:
         agg: median
         expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_completion_days ELSE NULL END"
       - name: p90_application_to_completion_days
-        description: 90th percentile non-negative elapsed calendar days from application to completion among records marked Closed.
+        description: Approximate continuous 90th percentile of non-negative elapsed calendar days from application to completion among records marked Closed.
         type: simple
         agg: percentile
         expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_completion_days ELSE NULL END"
-        percentile: 90
+        percentile: 0.9
         percentile_type: continuous
       - name: median_issue_to_completion_days
         description: Median non-negative elapsed calendar days from issue to completion among records marked Closed.
@@ -241,11 +241,11 @@ models:
         agg: median
         expr: "CASE WHEN LOWER(status) = 'closed' THEN issue_to_completion_days ELSE NULL END"
       - name: p90_issue_to_completion_days
-        description: 90th percentile non-negative elapsed calendar days from issue to completion among records marked Closed.
+        description: Approximate continuous 90th percentile of non-negative elapsed calendar days from issue to completion among records marked Closed.
         type: simple
         agg: percentile
         expr: "CASE WHEN LOWER(status) = 'closed' THEN issue_to_completion_days ELSE NULL END"
-        percentile: 90
+        percentile: 0.9
         percentile_type: continuous
     columns:
       - name: permit_num

@@ -1934,7 +1934,7 @@ def metricflow_page() -> None:
             "Eligible current permits only",
         ),
         (
-            "90th-percentile age",
+            "Approx. 90th-percentile age",
             fmt_days(active.get("p90_active_permit_age_days")),
             "Eligible current permits only",
         ),
@@ -1990,7 +1990,7 @@ def metricflow_page() -> None:
             "Closed records with a valid interval",
         ),
         (
-            "90th-percentile application to issue",
+            "Approx. 90th-percentile application to issue",
             fmt_days(cleared.get("p90_application_to_issue_days")),
             "Closed records with a valid interval",
         ),
@@ -2000,7 +2000,7 @@ def metricflow_page() -> None:
             "Closed records with a valid interval",
         ),
         (
-            "90th-percentile application to completion",
+            "Approx. 90th-percentile application to completion",
             fmt_days(cleared.get("p90_application_to_completion_days")),
             "Closed records with a valid interval",
         ),
@@ -2010,7 +2010,7 @@ def metricflow_page() -> None:
             "Closed records with a valid interval",
         ),
         (
-            "90th-percentile issue to completion",
+            "Approx. 90th-percentile issue to completion",
             fmt_days(cleared.get("p90_issue_to_completion_days")),
             "Closed records with a valid interval",
         ),

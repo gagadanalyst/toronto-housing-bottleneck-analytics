@@ -42,6 +42,10 @@ The runner checks warehouse refresh metadata, rebuilds only the disposable
 the selected metric queries before writing
 `toronto-metricflow-results.json`.
 
+DuckDB executes the continuous P90 metrics through its approximate quantile
+function. Their metric descriptions and dashboard labels identify them as
+approximate; median metrics remain separate.
+
 The MetricFlow environment is intentionally separate from `dbt/requirements.txt`
 and `dashboard/requirements.txt`. `dbt-metricflow[dbt-duckdb]` installs its own
 compatible self-hosted dbt Core/adapter runtime (1.12-compatible); the current

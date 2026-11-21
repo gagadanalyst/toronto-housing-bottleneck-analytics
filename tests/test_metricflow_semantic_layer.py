@@ -37,13 +37,16 @@ def test_existing_marts_define_the_metricflow_semantic_models():
     assert active["semantic_model"]["enabled"] is True
     assert active["primary_entity"] == "active_permit_revision"
     assert active["agg_time_dimension"] == "application_date"
-    active_metrics = {metric["name"] for metric in active["metrics"]}
+    active_metrics = {metric["name"]: metric for metric in active["metrics"]}
     assert {
         "active_permit_revision_count",
         "eligible_active_permit_revision_count",
         "median_active_permit_age_days",
         "p90_active_permit_age_days",
     }.issubset(active_metrics)
+    active_p90 = active_metrics["p90_active_permit_age_days"]
+    assert active_p90["percentile"] == 0.9
+    assert active_p90["percentile_type"] == "continuous"
 
     cleared = models["fct_cleared_permit_revision"]
     assert cleared["semantic_model"]["enabled"] is True
@@ -65,6 +68,10 @@ def test_existing_marts_define_the_metricflow_semantic_models():
         )
         assert metric["expr"] == expected_expr
         assert "filter" not in metric
+        if metric_name.startswith("p90_"):
+            assert metric["percentile"] == 0.9
+            assert metric["percentile_type"] == "continuous"
+            assert metric["description"].startswith("Approximate continuous")
 
 
 def test_existing_date_dimension_is_registered_as_a_daily_time_spine():
