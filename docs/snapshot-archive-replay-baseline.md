@@ -276,10 +276,17 @@ Run a manual Mode 2 reconstruction:
 gh workflow run snapshot-replay.yml --ref main -f backends=both
 ```
 
-After reviewing the successful Mode 2 run and attempt, explicitly authorize its production promotion:
+After reviewing the successful Mode 2 backend rebuilds, explicitly authorize production promotion.
+
+When the original Mode 2 comparison job failed despite successful backend rebuilds, first run saved-evidence validation using the original Mode 2 run ID and attempt. Supply that successful validation run ID and attempt during promotion. The promotion workflow verifies both runs and retrieves the joint-validation artifact associated with the exact source run and attempt.
 
 ```bash
-gh workflow run promote-snapshot-rebuild.yml --ref main -f source_run_id=MODE2_RUN_ID -f source_run_attempt=MODE2_RUN_ATTEMPT -f confirm_full_history_promotion=true
+gh workflow run promote-snapshot-rebuild.yml --ref main \
+  -f source_run_id=MODE2_RUN_ID \
+  -f source_run_attempt=MODE2_RUN_ATTEMPT \
+  -f validation_run_id=VALIDATION_RUN_ID \
+  -f validation_run_attempt=VALIDATION_RUN_ATTEMPT \
+  -f confirm_full_history_promotion=true
 ```
 
 Retry serving after a successful Mode 1 RAW promotion:
