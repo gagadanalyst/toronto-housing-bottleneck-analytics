@@ -18,9 +18,7 @@ on:
       - extraction/**
       - scripts/snapshot_inventory.py
 
-permissions:
-  actions: write
-  contents: read
+permissions: {}
 
 concurrency:
   group: toronto-complete-pipeline-dispatch
@@ -44,7 +42,7 @@ jobs:
     steps:
       - name: Check the stage automation gates and dispatch the first required stage
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.TORONTO_PIPELINE_DISPATCH_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}
           EXTRACTION_SCHEDULE_ENABLED: ${{ vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED }}

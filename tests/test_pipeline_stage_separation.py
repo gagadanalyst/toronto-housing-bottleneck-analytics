@@ -156,3 +156,11 @@ def test_transformation_routes_loading_changes_before_serving():
         0
     ]
     assert "- scripts/promote_snowflake_serving_candidate.py" in push_paths
+
+
+def test_complete_pipeline_uses_repository_scoped_dispatch_token():
+    workflow = (ROOT / ".github/workflows/complete-pipeline.yml").read_text()
+
+    assert "GH_TOKEN: ${{ secrets.TORONTO_PIPELINE_DISPATCH_TOKEN }}" in workflow
+    assert "GH_TOKEN: ${{ github.token }}" not in workflow
+    assert "permissions: {}" in workflow
