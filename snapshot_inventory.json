@@ -799,6 +799,24 @@
       "sequence": 56,
       "snapshot_id": "c555a0a2ac48471abe2f8365c36e0ee4",
       "source_commit": "440b35043eef83bb62aa736dd165c3776e6683e8"
+    },
+    {
+      "archive_sha256": "9f3a34825eac0324456306694b756c4104e7dabca017efb63db87b21e37edd50",
+      "archive_size_bytes": 63603567,
+      "asset_name": "toronto-raw-snapshot-v2-bundle-6dab375309c34c9a9411b706dae74dfe.zip",
+      "extracted_at_utc": "2026-11-21T12:48:39.193556Z",
+      "format_version": 2,
+      "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+      "replay_contract": {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "sha256": "c59ffad51558f3311b3c4b0dd40ad311b0e0b52affdc997579e31753ed8035af"
+      },
+      "run_attempt": 1,
+      "run_id": "44905695071",
+      "sequence": 57,
+      "snapshot_id": "6dab375309c34c9a9411b706dae74dfe",
+      "source_commit": "acf85c93908c3d4aa8de0666bf70299a1dff968b"
     }
   ],
   "inventory_version": 1,
