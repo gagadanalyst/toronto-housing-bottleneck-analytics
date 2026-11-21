@@ -59,10 +59,10 @@ DBT_SCHEMA = "analytics"
 CACHE_TTL_SECONDS = 24 * 60 * 60
 NAV = [
     "The story",
-    "Metrics & semantic layer",
     "Active permits",
     "Closed-permit timelines",
     "Data quality & definitions",
+    "Metrics & semantic layer",
 ]
 
 
@@ -457,6 +457,7 @@ def load_dashboard_data(
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    pd.DataFrame,
     int,
     dict[str, int],
     Any | None,
@@ -495,6 +496,7 @@ def load_dashboard_data(
             required = {
                 (DBT_SCHEMA, "mart_active_permit_age"),
                 (DBT_SCHEMA, "mart_active_backlog_summary"),
+                (DBT_SCHEMA, "mart_active_backlog_by_year_type"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_by_year_type"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_matched_by_year_type"),
                 (DBT_SCHEMA, "mart_cleared_lifecycle_pooled"),
@@ -518,6 +520,9 @@ def load_dashboard_data(
             ).fetchdf()
             active_backlog = connection.execute(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_active_backlog_summary"
+            ).fetchdf()
+            active_backlog_by_year_type = connection.execute(
+                f"SELECT * FROM {DBT_SCHEMA}.mart_active_backlog_by_year_type"
             ).fetchdf()
             matched_lifecycle = connection.execute(
                 f"SELECT * FROM {DBT_SCHEMA}.mart_cleared_lifecycle_matched_by_year_type"
@@ -547,6 +552,7 @@ def load_dashboard_data(
         ("mart_active_permit_age", active),
         ("mart_cleared_lifecycle_by_year_type", summary),
         ("mart_active_backlog_summary", active_backlog),
+        ("mart_active_backlog_by_year_type", active_backlog_by_year_type),
         ("mart_cleared_lifecycle_matched_by_year_type", matched_lifecycle),
         ("mart_cleared_lifecycle_pooled", pooled_lifecycle),
         ("mart_data_quality_summary", quality_frame),
@@ -569,6 +575,7 @@ def load_dashboard_data(
         active,
         summary,
         active_backlog,
+        active_backlog_by_year_type,
         matched_lifecycle,
         pooled_lifecycle,
         cleared_revision_count,
@@ -748,6 +755,7 @@ def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, 
 def overview(
     active: pd.DataFrame,
     active_backlog: pd.DataFrame,
+    active_backlog_by_year_type: pd.DataFrame,
     matched_lifecycle: pd.DataFrame,
     pooled_lifecycle: pd.DataFrame,
     backend: str,
@@ -755,7 +763,7 @@ def overview(
     hero(
         "TORONTO OPEN DATA · BUILDING PERMITS",
         "Toronto's Building Permit Backlog",
-        "Where current Active permit records are concentrated, how long they have remained open, and how elapsed time is distributed across matched Closed-permit lifecycles.",
+        "Where the current Active backlog is concentrated, how old it is, and how long selected Closed-permit lifecycles take.",
     )
 
     required_columns = {
@@ -882,8 +890,14 @@ def overview(
             f"P90: {fmt_days(p90_active_age)} · elapsed time so far",
         )
 
+    st.markdown(
+        f"**What stands out:** the five largest permit types account for {top_five_share:.1%} "
+        f"of the eligible backlog older than one year; {recent_share:.1%} of the eligible "
+        "backlog comes from 2024+ application cohorts."
+    )
+
     st.divider()
-    st.subheader("1. Where is today's Active backlog concentrated?")
+    st.subheader("Where is today's Active backlog concentrated?")
     st.markdown(
         '<div class="section-note">Current Active records are grouped by the year of application. '
         "Age-ineligible records remain in the total count but are excluded from age statistics.</div>",
@@ -940,18 +954,17 @@ def overview(
             "p90_age_days": "P90 age (days)",
         }
     )
-    st.dataframe(cohort_table, hide_index=True, width="stretch")
-    st.markdown(
-        f"**{recent_share:.1%}** of the age-eligible backlog belongs to 2024 and later application cohorts. "
-        + (f"The {latest_year} cohort is partial." if latest_year else "")
-    )
+    with st.expander("View application-year details"):
+        st.dataframe(cohort_table, hide_index=True, width="stretch")
+    if latest_year:
+        st.caption(f"The {latest_year} application-year cohort is partial.")
     st.caption(
         f"Age-ineligible Active records: {ineligible_count:,}. Threshold counts use age-eligible records only: "
         f"{over_365:,} over 365 days, {over_730:,} over 730 days, and {over_1095:,} over 1,095 days."
     )
 
     st.divider()
-    st.subheader("2. Which permit types account for the older backlog?")
+    st.subheader("Which permit types account for the older backlog?")
     st.markdown(
         '<div class="section-note">Ranked by the number of age-eligible Active records open for more than 365 days. '
         "Median and P90 ages are calculated from individual Active records, not averages of permit-type summaries.</div>",
@@ -973,10 +986,7 @@ def overview(
     type_fig.update_xaxes(title="Age-eligible Active records open >365 days")
     type_fig.update_yaxes(title="")
     st.plotly_chart(chart_layout(type_fig, 420), width="stretch")
-    st.markdown(
-        f"The five permit types with the largest over-one-year counts account for **{top_five_share:.1%}** "
-        "of all age-eligible Active records open more than 365 days."
-    )
+
     type_table = by_type.head(12)[
         [
             "permit_type",
@@ -1000,10 +1010,88 @@ def overview(
             "p90_age_days": "P90 age (days)",
         }
     )
-    st.dataframe(type_table, hide_index=True, width="stretch")
+    with st.expander("View permit-type details"):
+        st.dataframe(type_table, hide_index=True, width="stretch")
+
+    with st.expander("Explore older backlog by application year and permit type"):
+        year_type = active_backlog_by_year_type.copy()
+        required_year_type = {
+            "application_year",
+            "permit_type",
+            "over_365_days_count",
+            "over_730_days_count",
+            "over_1095_days_count",
+            "median_age_days",
+            "p90_age_days",
+        }
+        missing_year_type = required_year_type - set(year_type.columns)
+        if missing_year_type:
+            raise RuntimeError(
+                "The Active year/type mart is missing columns: "
+                + ", ".join(sorted(missing_year_type))
+            )
+        year_type["application_year"] = number(year_type["application_year"])
+        year_type = year_type.dropna(subset=["application_year", "permit_type"])
+        measure_options = {
+            "Open more than 1 year": ("over_365_days_count", "Active revisions"),
+            "Open more than 2 years": ("over_730_days_count", "Active revisions"),
+            "Open more than 3 years": ("over_1095_days_count", "Active revisions"),
+            "Median age": ("median_age_days", "Calendar days"),
+            "90th-percentile age": ("p90_age_days", "Calendar days"),
+        }
+        selected_measure = st.selectbox(
+            "Measure",
+            list(measure_options),
+            key="story_active_year_type_measure",
+        )
+        measure_column, measure_unit = measure_options[selected_measure]
+        ranked_types = (
+            year_type.groupby("permit_type")["over_365_days_count"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(12)
+        )
+        heatmap_rows = year_type[year_type["permit_type"].isin(ranked_types.index)]
+        pivot = heatmap_rows.pivot_table(
+            index="permit_type",
+            columns="application_year",
+            values=measure_column,
+            aggfunc="first",
+        )
+        pivot = pivot.reindex(index=ranked_types.index).sort_index(axis=1)
+        if pivot.empty:
+            st.info("No application-year and permit-type groups are available.")
+        else:
+            heatmap = go.Figure(
+                go.Heatmap(
+                    z=pivot.to_numpy(dtype=float),
+                    x=[str(int(year)) for year in pivot.columns],
+                    y=pivot.index.astype(str).tolist(),
+                    colorscale=[[0, SCALE_LOW], [1, TEAL]],
+                    colorbar={"title": measure_unit},
+                    hovertemplate=(
+                        "Permit type: %{y}<br>Application year: %{x}<br>"
+                        + f"{selected_measure}: %{{z:,.1f}}<extra></extra>"
+                    ),
+                )
+            )
+            heatmap.update_layout(
+                title=f"{selected_measure} by application-year cohort and permit type",
+                xaxis_title="Application year",
+                yaxis_title="Permit type",
+            )
+            st.plotly_chart(
+                chart_layout(heatmap, max(360, 30 * len(pivot.index) + 120)),
+                width="stretch",
+            )
+            st.caption(
+                "Shows the 12 permit types with the largest over-one-year backlog. "
+                "Revisions without a usable application year remain in overall totals "
+                "but cannot be placed in this cohort view."
+            )
 
     st.divider()
-    st.subheader("3. How long do Closed permits spend at each lifecycle stage?")
+    st.subheader("How long do Closed permits spend at each lifecycle stage?")
     st.markdown(
         '<div class="section-note">These three intervals use the same matched cohort of records marked Closed '
         "with application, issue, and completion dates all present and chronologically ordered.</div>",
@@ -1241,39 +1329,39 @@ def active_page(active: pd.DataFrame) -> None:
         fig.update_xaxes(title="Middle age (days)")
         fig.update_yaxes(title="")
         st.plotly_chart(chart_layout(fig, 390), width="stretch")
-    st.subheader("Active permit records included in this view")
-    show_cols = [
-        c
-        for c in [
-            "permit_num",
-            "revision_num",
-            "permit_type",
-            "status_normalized",
-            "application_date",
-            "issued_date",
-            "age_since_application_days",
+    with st.expander("Inspect individual Active permit records"):
+        show_cols = [
+            c
+            for c in [
+                "permit_num",
+                "revision_num",
+                "permit_type",
+                "status_normalized",
+                "application_date",
+                "issued_date",
+                "age_since_application_days",
+            ]
+            if c in view.columns
         ]
-        if c in view.columns
-    ]
-    display_records = (
-        view[show_cols]
-        .sort_values("age_since_application_days", ascending=False)
-        .rename(
-            columns={
-                "permit_num": "Permit number",
-                "revision_num": "Revision",
-                "permit_type": "Permit type",
-                "status_normalized": "Status",
-                "application_date": "Application date",
-                "issued_date": "Issue date",
-                "age_since_application_days": "Days open",
-            }
+        display_records = (
+            view[show_cols]
+            .sort_values("age_since_application_days", ascending=False)
+            .rename(
+                columns={
+                    "permit_num": "Permit number",
+                    "revision_num": "Revision",
+                    "permit_type": "Permit type",
+                    "status_normalized": "Status",
+                    "application_date": "Application date",
+                    "issued_date": "Issue date",
+                    "age_since_application_days": "Days open",
+                }
+            )
         )
-    )
-    st.dataframe(display_records, width="stretch", hide_index=True)
-    st.caption(
-        "These records are still marked Active in the published data. Their current age should not be read as the time it will take to finish."
-    )
+        st.dataframe(display_records, width="stretch", hide_index=True)
+        st.caption(
+            "These records are still marked Active in the published data. Their current age should not be read as the time it will take to finish."
+        )
 
 
 def lifecycle_page(summary: pd.DataFrame) -> None:
@@ -1367,7 +1455,7 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
                 x=trend["application_year"],
                 y=trend["median_days"],
                 mode="lines+markers",
-                name="Median of group medians",
+                name="Median of year/type group medians",
                 line=dict(color=TEAL, width=3),
             )
         )
@@ -1376,11 +1464,11 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
                 x=trend["application_year"],
                 y=trend["p90_days"],
                 mode="lines+markers",
-                name="Median of group 90th percentiles",
+                name="Median of year/type group P90s",
                 line=dict(color=RED, width=3),
             )
         )
-        fig.update_layout(title="How times have changed by application year")
+        fig.update_layout(title="Closed-permit durations by application-year cohort")
         fig.update_xaxes(title="Application year", dtick=1)
         fig.update_yaxes(title="Days")
         st.plotly_chart(chart_layout(fig, 390), width="stretch")
@@ -1404,25 +1492,25 @@ def lifecycle_page(summary: pd.DataFrame) -> None:
         bar.update_xaxes(title="Typical time (days)")
         bar.update_yaxes(title="")
         st.plotly_chart(chart_layout(bar, 390), width="stretch")
-    st.subheader("Detailed results by year and permit type")
-    table = view.sort_values(["application_year", "permit_type"]).rename(
-        columns={
-            "application_year": "Application year",
-            "permit_type": "Permit type",
-            "measure": "Date range",
-            "eligible_date_pairs": "Records with both dates",
-            "negative_interval_count": "Records with dates out of order",
-            "publishable_duration_count": "Usable time values",
-            "negative_interval_rate_pct": "Out-of-order dates (%)",
-            "median_days": "Typical time (days)",
-            "p90_days": "90th percentile (days)",
-            "max_days": "Longest time (days)",
-        }
-    )
-    st.dataframe(table, width="stretch", hide_index=True)
-    st.caption(
-        "The charts summarize groups of permits by year and type. They do not calculate one median or 90th percentile across all permits combined."
-    )
+    with st.expander("View detailed results by year and permit type"):
+        table = view.sort_values(["application_year", "permit_type"]).rename(
+            columns={
+                "application_year": "Application year",
+                "permit_type": "Permit type",
+                "measure": "Date range",
+                "eligible_date_pairs": "Records with both dates",
+                "negative_interval_count": "Records with dates out of order",
+                "publishable_duration_count": "Usable time values",
+                "negative_interval_rate_pct": "Out-of-order dates (%)",
+                "median_days": "Typical time (days)",
+                "p90_days": "90th percentile (days)",
+                "max_days": "Longest time (days)",
+            }
+        )
+        st.dataframe(table, width="stretch", hide_index=True)
+        st.caption(
+            "The charts summarize groups of permits by year and type. They do not calculate one median or 90th percentile across all permits combined."
+        )
 
 
 def quality_page(
@@ -1558,7 +1646,8 @@ def quality_page(
         chart_layout(fig, max(310, 48 * len(active_findings) + 85)),
         width="stretch",
     )
-    st.dataframe(active_findings, width="stretch", hide_index=True)
+    with st.expander("View Active check details"):
+        st.dataframe(active_findings, width="stretch", hide_index=True)
 
     st.subheader("Why Active revisions are excluded from the age view")
     st.caption(
@@ -1607,7 +1696,8 @@ def quality_page(
             chart_layout(fig, max(260, min(420, 110 + 55 * len(exclusion)))),
             width="stretch",
         )
-        st.dataframe(exclusion, width="stretch", hide_index=True)
+        with st.expander("View Active exclusion details"):
+            st.dataframe(exclusion, width="stretch", hide_index=True)
     st.caption(
         "Closed, Cancelled and Abandoned statuses are excluded by design because "
         "they are not part of the open Active-age cohort. That exclusion does not, "
@@ -1731,7 +1821,8 @@ def quality_page(
         chart_layout(fig, max(380, 42 * len(cleared_findings) + 100)),
         width="stretch",
     )
-    st.dataframe(cleared_findings, width="stretch", hide_index=True)
+    with st.expander("View Cleared check details"):
+        st.dataframe(cleared_findings, width="stretch", hide_index=True)
 
     st.subheader("Cleared date completeness")
     st.caption(
@@ -1749,8 +1840,6 @@ def quality_page(
     completion_missing = quality_counts.get("completion_date_no_usable", 0)
     completion_conflicts = quality_counts.get("completed_date_conflict", 0)
     closed_count = quality_counts.get("closed_revision_count", 0)
-    closed_both_dates = quality_counts.get("closed_both_dates_available", 0)
-    non_closed_both_dates = quality_counts.get("non_closed_both_dates_available", 0)
 
     coverage_table = pd.DataFrame(
         [
@@ -1788,52 +1877,86 @@ def quality_page(
             "revision count. Review the fact-level date and conflict flags."
         )
 
-    lifecycle_cols = st.columns(2)
-    with lifecycle_cols[0]:
+    matched_closed = quality_counts.get("closed_matched_three_date_count", 0)
+    excluded_conflicts = quality_counts.get("closed_excluded_conflicting_date_count", 0)
+    excluded_missing = quality_counts.get("closed_excluded_missing_date_count", 0)
+    excluded_order = quality_counts.get("closed_excluded_out_of_order_date_count", 0)
+    excluded_closed = excluded_conflicts + excluded_missing + excluded_order
+
+    st.subheader("Which Closed records support lifecycle analysis?")
+    funnel_cols = st.columns(3, gap="medium")
+    with funnel_cols[0]:
         metric_card(
-            "Closed revisions with application and completion dates",
-            fmt_int(closed_both_dates),
-            f"Of {closed_count:,} records marked Closed",
+            "Current Cleared revisions",
+            fmt_int(cleared_revision_count),
+            f"{cleared_revision_count - closed_count:,} not marked Closed",
         )
-    with lifecycle_cols[1]:
+    with funnel_cols[1]:
         metric_card(
-            "Revisions not marked Closed with both dates",
-            fmt_int(non_closed_both_dates),
-            "Includes records with missing or conflicting status",
+            "Marked Closed", fmt_int(closed_count), "Selected by the recorded status"
+        )
+    with funnel_cols[2]:
+        metric_card(
+            "Matched lifecycle cohort",
+            fmt_int(matched_closed),
+            "All three dates present and ordered",
+        )
+    if closed_count != matched_closed + excluded_closed:
+        st.warning(
+            "The Closed lifecycle cohort does not reconcile. Review the dbt data-quality checks."
+        )
+    with st.expander("Why some Closed revisions are not in the matched cohort"):
+        exclusion_table = pd.DataFrame(
+            [
+                {
+                    "First applicable exclusion": "Conflicting lifecycle dates",
+                    "Revisions": excluded_conflicts,
+                },
+                {
+                    "First applicable exclusion": "Missing / unavailable lifecycle date",
+                    "Revisions": excluded_missing,
+                },
+                {
+                    "First applicable exclusion": "Dates out of chronological order",
+                    "Revisions": excluded_order,
+                },
+            ]
+        )
+        st.dataframe(exclusion_table, hide_index=True, width="stretch")
+        st.caption(
+            "Exclusion reasons are mutually exclusive. Conflicts take priority, then missing dates, "
+            "then out-of-order dates. Matched plus excluded revisions reconcile to all records marked Closed."
         )
 
-    # Fact-to-mart lifecycle reconciliation is enforced by dbt tests.
     st.caption(
-        "A populated COMPLETED_DATE is source information, not proof that a permit "
-        "was successfully completed. Only records marked Closed enter the lifecycle "
-        "summary. A negative interval removes only that specific date comparison "
-        "from its duration statistics; it does not remove the revision from every "
-        "other analysis."
+        "A populated completion date is not proof of successful completion. Only records marked Closed "
+        "enter the lifecycle cohort; each interval is elapsed calendar days, not business days."
     )
 
-    st.subheader("What the numbers mean")
-    st.markdown("""
-    - **Logical revision:** one permit number, revision number and permit type. Physical source rows for the same revision are consolidated before these checks.
-    - **Revisions with at least one finding:** each affected logical revision is counted once, even when it has several findings.
-    - **Findings by check:** counts are separate for each check and can overlap; do not add them to calculate unique affected revisions.
-    - **Conflicting values:** current source rows disagree, including a mix of missing and populated values. The disputed value is withheld instead of arbitrarily selecting one.
-    - **Missing / unavailable field:** no value is available and no conflict was detected. Missing values can be expected for some attributes, permit statuses or lifecycle stages and are not automatically errors.
-    - **Missing / unavailable date:** no consistent date is available and no date conflict was detected. Missing dates can be expected for some statuses and are not automatically errors.
-    - **Negative interval:** the recorded dates run backwards. The corresponding duration is excluded from that measure's published statistics; other durations for the same revision can still be used. Durations are elapsed calendar days, not business days.
-    - **Active age:** calendar days from application date to the dashboard's as-of date. It is an ongoing age, not a completed lifecycle duration.
-    - **Lifecycle duration:** elapsed calendar days between the selected dates for a revision marked Closed. The dashboard does not infer why a permit took longer.
-    - **Median:** half of the duration values are below it and half are above it.
-    - **90th percentile:** 9 out of 10 duration values are at or below this value; it highlights the higher end of the distribution.
-    - **Grouped summaries:** the charts compare statistics calculated within each application-year and permit-type group, rather than one statistic calculated across all permits.
-    """)
-    st.subheader("What to keep in mind")
-    st.markdown("""
-    - Toronto's published data changes over time, so counts and results can change after a new release.
-    - The latest application year is incomplete; compare it carefully with earlier years.
-    - DuckDB uses the latest published database from GitHub; Snowflake queries the configured analytics relations. Neither backend queries the City website directly.
-    - Data is cached for up to 24 hours, unless **Refresh data now** is selected.
-    - These charts describe what appears in the data. They do not show why a permit took longer.
-    """)
+    with st.expander("Definitions and interpretation"):
+        st.subheader("What the numbers mean")
+        st.markdown("""
+        - **Logical revision:** one permit number, revision number and permit type. Physical source rows for the same revision are consolidated before these checks.
+        - **Revisions with at least one finding:** each affected logical revision is counted once, even when it has several findings.
+        - **Findings by check:** counts are separate for each check and can overlap; do not add them to calculate unique affected revisions.
+        - **Conflicting values:** current source rows disagree, including a mix of missing and populated values. The disputed value is withheld instead of arbitrarily selecting one.
+        - **Missing / unavailable field:** no value is available and no conflict was detected. Missing values can be expected for some attributes, permit statuses or lifecycle stages and are not automatically errors.
+        - **Missing / unavailable date:** no consistent date is available and no date conflict was detected. Missing dates can be expected for some statuses and are not automatically errors.
+        - **Negative interval:** the recorded dates run backwards. The corresponding duration is excluded from that measure's published statistics; other durations for the same revision can still be used. Durations are elapsed calendar days, not business days.
+        - **Active age:** calendar days from application date to the dashboard's as-of date. It is an ongoing age, not a completed lifecycle duration.
+        - **Lifecycle duration:** elapsed calendar days between the selected dates for a revision marked Closed. The dashboard does not infer why a permit took longer.
+        - **Median:** half of the duration values are below it and half are above it.
+        - **90th percentile:** 9 out of 10 duration values are at or below this value; it highlights the higher end of the distribution.
+        - **Grouped summaries:** the charts compare statistics calculated within each application-year and permit-type group, rather than one statistic calculated across all permits.
+        """)
+        st.subheader("What to keep in mind")
+        st.markdown("""
+        - Toronto's published data changes over time, so counts and results can change after a new release.
+        - The latest application year is incomplete; compare it carefully with earlier years.
+        - DuckDB uses the latest published database from GitHub; Snowflake queries the configured analytics relations. Neither backend queries the City website directly.
+        - Data is cached for up to 24 hours, unless **Refresh data now** is selected.
+        - These charts describe what appears in the data. They do not show why a permit took longer.
+        """)
 
 
 @st.cache_data(ttl=900, max_entries=1, show_spinner=False)
@@ -1945,122 +2068,202 @@ def metricflow_page() -> None:
 
     active_type = pd.DataFrame(results.get("active_by_permit_type") or [])
     active_year = pd.DataFrame(results.get("active_by_year") or [])
+    active_metric_options = {
+        "Current revisions": ("active_permit_revision_count", "Revisions"),
+        "Age-eligible revisions": (
+            "eligible_active_permit_revision_count",
+            "Revisions",
+        ),
+        "Median current age": ("median_active_permit_age_days", "Calendar days"),
+        "Approx. P90 current age": ("p90_active_permit_age_days", "Calendar days"),
+    }
+    selected_active_label = st.selectbox(
+        "Active measure",
+        list(active_metric_options),
+        key="metricflow_active_group_measure",
+    )
+    active_metric, active_unit = active_metric_options[selected_active_label]
     active_chart_cols = st.columns(2)
     with active_chart_cols[0]:
-        st.markdown("**Active revisions by permit type**")
+        st.markdown(f"**{selected_active_label} by permit type**")
         dimension = "active_permit_revision__permit_type"
-        metric = "active_permit_revision_count"
-        if not active_type.empty and {dimension, metric}.issubset(active_type.columns):
-            active_type[metric] = number(active_type[metric])
-            active_type = active_type.sort_values(metric, ascending=True)
-            fig = px.bar(active_type, x=metric, y=dimension, orientation="h")
+        if not active_type.empty and {dimension, active_metric}.issubset(
+            active_type.columns
+        ):
+            active_type[active_metric] = number(active_type[active_metric])
+            active_type = active_type.sort_values(active_metric, ascending=True)
+            fig = px.bar(
+                active_type,
+                x=active_metric,
+                y=dimension,
+                orientation="h",
+                labels={active_metric: active_unit, dimension: "Permit type"},
+            )
             fig.update_traces(marker_color=TEAL)
             st.plotly_chart(
                 chart_layout(fig, max(340, 34 * len(active_type) + 100)),
                 width="stretch",
             )
         else:
-            st.caption("No permit-type breakdown is available in this result package.")
+            st.caption("No permit-type breakdown is available for this measure.")
     with active_chart_cols[1]:
-        st.markdown("**Active revisions by application year**")
+        st.markdown(f"**{selected_active_label} by application year**")
         year_dimension = "metric_time__year"
-        if not active_year.empty and {year_dimension, metric}.issubset(
+        if not active_year.empty and {year_dimension, active_metric}.issubset(
             active_year.columns
         ):
             active_year[year_dimension] = number(active_year[year_dimension])
-            active_year[metric] = number(active_year[metric])
+            active_year[active_metric] = number(active_year[active_metric])
             active_year = active_year.sort_values(year_dimension)
-            fig = px.bar(active_year, x=year_dimension, y=metric)
-            fig.update_traces(marker_color=TEAL)
-            st.plotly_chart(chart_layout(fig), width="stretch")
-        else:
-            st.caption(
-                "No application-year breakdown is available in this result package."
+            fig = px.line(
+                active_year,
+                x=year_dimension,
+                y=active_metric,
+                markers=True,
+                labels={active_metric: active_unit, year_dimension: "Application year"},
             )
+            fig.update_traces(line=dict(color=TEAL), marker=dict(color=TEAL))
+            st.plotly_chart(chart_layout(fig, 360), width="stretch")
+        else:
+            st.caption("No application-year breakdown is available for this measure.")
 
     st.divider()
     st.subheader("Closed-permit lifecycle")
     cleared_metrics = [
         (
-            "Current logical revisions",
-            fmt_int(cleared.get("cleared_permit_revision_count")),
-            "One row per current Cleared revision",
-        ),
-        (
-            "Median application to issue",
+            "Median application → issue",
             fmt_days(cleared.get("median_application_to_issue_days")),
-            "Closed records with a valid interval",
+            f"Approx. P90: {fmt_days(cleared.get('p90_application_to_issue_days'))} · "
+            f"n={fmt_int(cleared.get('closed_application_to_issue_valid_revision_count'))} valid Closed revisions",
         ),
         (
-            "Approx. 90th-percentile application to issue",
-            fmt_days(cleared.get("p90_application_to_issue_days")),
-            "Closed records with a valid interval",
-        ),
-        (
-            "Median application to completion",
-            fmt_days(cleared.get("median_application_to_completion_days")),
-            "Closed records with a valid interval",
-        ),
-        (
-            "Approx. 90th-percentile application to completion",
-            fmt_days(cleared.get("p90_application_to_completion_days")),
-            "Closed records with a valid interval",
-        ),
-        (
-            "Median issue to completion",
+            "Median issue → completion",
             fmt_days(cleared.get("median_issue_to_completion_days")),
-            "Closed records with a valid interval",
+            f"Approx. P90: {fmt_days(cleared.get('p90_issue_to_completion_days'))} · "
+            f"n={fmt_int(cleared.get('closed_issue_to_completion_valid_revision_count'))} valid Closed revisions",
         ),
         (
-            "Approx. 90th-percentile issue to completion",
-            fmt_days(cleared.get("p90_issue_to_completion_days")),
-            "Closed records with a valid interval",
+            "Median application → completion",
+            fmt_days(cleared.get("median_application_to_completion_days")),
+            f"Approx. P90: {fmt_days(cleared.get('p90_application_to_completion_days'))} · "
+            f"n={fmt_int(cleared.get('closed_application_to_completion_valid_revision_count'))} valid Closed revisions",
         ),
     ]
-    for start in range(0, len(cleared_metrics), 4):
-        if start:
-            st.markdown('<div style="height: 1.25rem;"></div>', unsafe_allow_html=True)
-        columns = st.columns(min(4, len(cleared_metrics) - start))
-        for column, (label, value, foot) in zip(
-            columns, cleared_metrics[start : start + 4], strict=True
-        ):
-            with column:
-                metric_card(label, value, foot)
+    lifecycle_cols = st.columns(3, gap="medium")
+    for column, (label, value, foot) in zip(
+        lifecycle_cols, cleared_metrics, strict=True
+    ):
+        with column:
+            metric_card(label, value, foot)
+    st.caption(
+        f"{fmt_int(cleared.get('cleared_permit_revision_count'))} current Cleared revisions; "
+        "lifecycle durations are calculated only for records marked Closed."
+    )
 
     cleared_type = pd.DataFrame(results.get("cleared_by_permit_type") or [])
     cleared_year = pd.DataFrame(results.get("cleared_by_year") or [])
+    interval_metrics = {
+        "Application to issue": (
+            "median_application_to_issue_days",
+            "p90_application_to_issue_days",
+            "closed_application_to_issue_valid_revision_count",
+        ),
+        "Issue to completion": (
+            "median_issue_to_completion_days",
+            "p90_issue_to_completion_days",
+            "closed_issue_to_completion_valid_revision_count",
+        ),
+        "Application to completion": (
+            "median_application_to_completion_days",
+            "p90_application_to_completion_days",
+            "closed_application_to_completion_valid_revision_count",
+        ),
+    }
+    selected_interval = st.selectbox(
+        "Closed lifecycle interval",
+        list(interval_metrics),
+        index=2,
+        key="metricflow_cleared_interval",
+    )
+    selected_statistic = st.selectbox(
+        "Statistic",
+        ["Median", "Approx. P90", "Valid records"],
+        key="metricflow_cleared_statistic",
+    )
+    statistic_index = {
+        "Median": 0,
+        "Approx. P90": 1,
+        "Valid records": 2,
+    }[selected_statistic]
+    cleared_metric = interval_metrics[selected_interval][statistic_index]
+    cleared_unit = (
+        "Valid Closed revisions"
+        if selected_statistic == "Valid records"
+        else "Calendar days"
+    )
     cleared_chart_cols = st.columns(2)
+    dimension = "cleared_permit_revision__permit_type"
     with cleared_chart_cols[0]:
-        st.markdown("**Median application-to-completion days by permit type**")
-        dimension = "cleared_permit_revision__permit_type"
-        metric = "median_application_to_completion_days"
-        if not cleared_type.empty and {dimension, metric}.issubset(
+        chart_statistic = (
+            "Valid Closed records"
+            if selected_statistic == "Valid records"
+            else selected_statistic
+        )
+        st.markdown(
+            f"**{chart_statistic} — {selected_interval.lower()} by permit type**"
+        )
+        if not cleared_type.empty and {dimension, cleared_metric}.issubset(
             cleared_type.columns
         ):
-            cleared_type[metric] = number(cleared_type[metric])
-            cleared_type = cleared_type.sort_values(metric, ascending=True)
-            fig = px.bar(cleared_type, x=metric, y=dimension, orientation="h")
+            view = cleared_type.copy()
+            view[cleared_metric] = number(view[cleared_metric])
+            view = view.sort_values(cleared_metric, ascending=True)
+            fig = px.bar(
+                view,
+                x=cleared_metric,
+                y=dimension,
+                orientation="h",
+                labels={cleared_metric: cleared_unit, dimension: "Permit type"},
+            )
             fig.update_traces(marker_color=TEAL)
             st.plotly_chart(
-                chart_layout(fig, max(340, 34 * len(cleared_type) + 100)),
+                chart_layout(fig, max(340, 34 * len(view) + 100)),
                 width="stretch",
             )
         else:
-            st.caption("No permit-type lifecycle breakdown is available.")
+            st.caption(
+                "No permit-type lifecycle breakdown is available for this measure."
+            )
     with cleared_chart_cols[1]:
-        st.markdown("**Median application-to-completion days by year**")
+        st.markdown(f"**{chart_statistic} — {selected_interval.lower()} by year**")
         year_dimension = "metric_time__year"
-        if not cleared_year.empty and {year_dimension, metric}.issubset(
+        if not cleared_year.empty and {year_dimension, cleared_metric}.issubset(
             cleared_year.columns
         ):
-            cleared_year[year_dimension] = number(cleared_year[year_dimension])
-            cleared_year[metric] = number(cleared_year[metric])
-            cleared_year = cleared_year.sort_values(year_dimension)
-            fig = px.line(cleared_year, x=year_dimension, y=metric, markers=True)
+            view = cleared_year.copy()
+            view[year_dimension] = number(view[year_dimension])
+            view[cleared_metric] = number(view[cleared_metric])
+            view = view.sort_values(year_dimension)
+            fig = px.line(
+                view,
+                x=year_dimension,
+                y=cleared_metric,
+                markers=True,
+                labels={
+                    cleared_metric: cleared_unit,
+                    year_dimension: "Application year",
+                },
+            )
             fig.update_traces(line=dict(color=TEAL), marker=dict(color=TEAL))
-            st.plotly_chart(chart_layout(fig), width="stretch")
+            st.plotly_chart(chart_layout(fig, 360), width="stretch")
         else:
-            st.caption("No application-year lifecycle breakdown is available.")
+            st.caption(
+                "No application-year lifecycle breakdown is available for this measure."
+            )
+    st.caption(
+        "Valid-record counts are interval-specific: a Closed revision is counted only when that date pair "
+        "has both dates and a non-negative elapsed duration. The three intervals can therefore have different denominators."
+    )
 
     with st.expander("Semantic models and metric definitions"):
         st.markdown(
@@ -2096,20 +2299,8 @@ def main() -> None:
             if backend == "duckdb"
             else ""
         )
-        snowflake_config = (
-            snowflake_dashboard_settings() if backend == "snowflake" else {}
-        )
-        config_fingerprint = (
-            hashlib.sha256(
-                json.dumps(snowflake_config, sort_keys=True, default=str).encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            if backend == "snowflake"
-            else ""
-        )
     except Exception as exc:
-        st.error("The dashboard backend configuration could not be loaded.")
+        st.error("The dashboard backend selection could not be loaded.")
         with st.expander("Technical details"):
             st.code(f"{type(exc).__name__}: {exc}")
         st.stop()
@@ -2126,6 +2317,25 @@ def main() -> None:
             "in dbt and evaluated by open-source MetricFlow"
         )
         return
+
+    try:
+        snowflake_config = (
+            snowflake_dashboard_settings() if backend == "snowflake" else {}
+        )
+        config_fingerprint = (
+            hashlib.sha256(
+                json.dumps(snowflake_config, sort_keys=True, default=str).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if backend == "snowflake"
+            else ""
+        )
+    except Exception as exc:
+        st.error("The selected warehouse backend configuration could not be loaded.")
+        with st.expander("Technical details"):
+            st.code(f"{type(exc).__name__}: {exc}")
+        st.stop()
     last_loaded_at = float(st.session_state.get("_dashboard_loaded_at", 0.0))
     cache_may_have_expired = (time() - last_loaded_at) >= CACHE_TTL_SECONDS
     backend_key = (backend, config_fingerprint, duckdb_path)
@@ -2181,6 +2391,7 @@ def main() -> None:
                         active,
                         summary,
                         active_backlog,
+                        active_backlog_by_year_type,
                         matched_lifecycle,
                         pooled_lifecycle,
                         cleared_count,
@@ -2207,6 +2418,7 @@ def main() -> None:
                 active,
                 summary,
                 active_backlog,
+                active_backlog_by_year_type,
                 matched_lifecycle,
                 pooled_lifecycle,
                 cleared_count,
@@ -2223,7 +2435,7 @@ def main() -> None:
         if backend == "duckdb" and duckdb_path:
             st.markdown(
                 "Check `DASHBOARD_DUCKDB_PATH` and confirm the local database exists "
-                "and contains all six required dbt relations."
+                "and contains all seven required dbt relations."
             )
         elif backend == "duckdb":
             st.markdown(
@@ -2234,7 +2446,7 @@ def main() -> None:
         else:
             st.markdown(
                 "Check the Snowflake connection settings, the dashboard role's "
-                "read-only grants, and whether all six required dbt relations "
+                "read-only grants, and whether all seven required dbt relations "
                 "exist in the configured analytics schema. The app will not silently "
                 "switch to DuckDB when Snowflake fails."
             )
@@ -2279,6 +2491,7 @@ def main() -> None:
         overview(
             active.copy(),
             active_backlog.copy(),
+            active_backlog_by_year_type.copy(),
             matched_lifecycle.copy(),
             pooled_lifecycle.copy(),
             backend,

@@ -22,6 +22,11 @@ QUALITY_METRIC_VALUES = {
     "active_exclusion_status_conflict": 2,
     "cleared_revision_count": 200,
     "application_date_usable": 150,
+    "closed_revision_count": 100,
+    "closed_matched_three_date_count": 75,
+    "closed_excluded_conflicting_date_count": 5,
+    "closed_excluded_missing_date_count": 15,
+    "closed_excluded_out_of_order_date_count": 5,
     "closed_both_dates_available": 80,
 }
 
@@ -85,6 +90,13 @@ class FakeCursor:
         elif "MART_ACTIVE_PERMIT_AGE" in upper:
             self.description = [("PERMIT_NUM",), ("IS_AGE_ELIGIBLE",), ("AS_OF_DATE",)]
             self.rows = [("00123", True, "2026-11-19")]
+        elif "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE" in upper:
+            self.description = [
+                ("APPLICATION_YEAR",),
+                ("PERMIT_TYPE",),
+                ("OVER_365_DAYS_COUNT",),
+            ]
+            self.rows = [(2025, "Residential", 7)]
         elif "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE" in upper:
             self.description = [("APPLICATION_YEAR",), ("PERMIT_TYPE",), ("MEASURE",)]
             self.rows = [(2025, "Residential", "Application to issue")]
@@ -215,6 +227,7 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
         active,
         summary,
         backlog,
+        backlog_by_year_type,
         matched,
         pooled,
         cleared_count,
@@ -225,6 +238,7 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
     assert active.loc[0, "permit_num"] == "00123"
     assert summary.loc[0, "permit_type"] == "Residential"
     assert backlog.loc[0, "summary_level"] == "overall"
+    assert backlog_by_year_type.loc[0, "over_365_days_count"] == 7
     assert matched.loc[0, "matched_cohort_count"] == 25
     assert pooled.loc[0, "median_days"] == 28.0
     assert cleared_count == 200
@@ -233,6 +247,7 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
     assert set(backend.REQUIRED_RELATIONS) == {
         "MART_ACTIVE_PERMIT_AGE",
         "MART_ACTIVE_BACKLOG_SUMMARY",
+        "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
         "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
         "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
         "MART_CLEARED_LIFECYCLE_POOLED",
@@ -245,6 +260,15 @@ def test_read_uses_only_dbt_marts_and_closes_connection(
     assert quality["cleared_revision_count"] == 200
     assert quality["application_date_usable"] == 150
     assert quality["closed_both_dates_available"] == 80
+    assert quality["closed_revision_count"] == 100
+    assert quality["closed_matched_three_date_count"] == 75
+    assert (
+        quality["closed_matched_three_date_count"]
+        + quality["closed_excluded_conflicting_date_count"]
+        + quality["closed_excluded_missing_date_count"]
+        + quality["closed_excluded_out_of_order_date_count"]
+        == quality["closed_revision_count"]
+    )
     assert not any(
         "FCT_ACTIVE_PERMIT_REVISION" in query or "FCT_CLEARED_PERMIT_REVISION" in query
         for query in cursor.queries
@@ -265,8 +289,8 @@ def test_refresh_timestamp_is_optional_before_first_refresh(
     connection = FakeConnection(FakeCursor(set(backend.REQUIRED_RELATIONS)))
     install_snowflake_stubs(monkeypatch, connection)
     result = backend.load_snowflake_dashboard_data(CONFIG)
-    assert result[7] is None
     assert result[8] is None
+    assert result[9] is None
     assert connection.fake_cursor.closed and connection.closed
 
 
@@ -283,6 +307,6 @@ def test_old_snowflake_metadata_schema_keeps_refresh_and_omits_source_time(
     install_snowflake_stubs(monkeypatch, connection)
 
     result = backend.load_snowflake_dashboard_data(CONFIG)
-    assert result[7] == refresh_timestamp
-    assert result[8] is None
+    assert result[8] == refresh_timestamp
+    assert result[9] is None
     assert connection.fake_cursor.closed and connection.closed

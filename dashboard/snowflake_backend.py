@@ -11,6 +11,7 @@ import pandas as pd
 REQUIRED_RELATIONS = (
     "MART_ACTIVE_PERMIT_AGE",
     "MART_ACTIVE_BACKLOG_SUMMARY",
+    "MART_ACTIVE_BACKLOG_BY_YEAR_TYPE",
     "MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE",
     "MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
     "MART_CLEARED_LIFECYCLE_POOLED",
@@ -56,6 +57,10 @@ REQUIRED_QUALITY_METRICS = (
     "completion_date_no_usable",
     "both_dates_available",
     "closed_revision_count",
+    "closed_matched_three_date_count",
+    "closed_excluded_conflicting_date_count",
+    "closed_excluded_missing_date_count",
+    "closed_excluded_out_of_order_date_count",
     "closed_both_dates_available",
     "non_closed_both_dates_available",
     "cleared_builder_name_missing",
@@ -83,6 +88,7 @@ def _fetch_dataframe(cursor: Any, query: str) -> pd.DataFrame:
 def load_snowflake_dashboard_data(
     config: Mapping[str, Any],
 ) -> tuple[
+    pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
@@ -205,6 +211,9 @@ def load_snowflake_dashboard_data(
         active_backlog = _fetch_dataframe(
             cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_BACKLOG_SUMMARY"
         )
+        active_backlog_by_year_type = _fetch_dataframe(
+            cursor, f"SELECT * FROM {qualified_schema}.MART_ACTIVE_BACKLOG_BY_YEAR_TYPE"
+        )
         matched_lifecycle = _fetch_dataframe(
             cursor,
             f"SELECT * FROM {qualified_schema}.MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE",
@@ -221,6 +230,7 @@ def load_snowflake_dashboard_data(
             ("MART_ACTIVE_PERMIT_AGE", active),
             ("MART_CLEARED_LIFECYCLE_BY_YEAR_TYPE", summary),
             ("MART_ACTIVE_BACKLOG_SUMMARY", active_backlog),
+            ("MART_ACTIVE_BACKLOG_BY_YEAR_TYPE", active_backlog_by_year_type),
             ("MART_CLEARED_LIFECYCLE_MATCHED_BY_YEAR_TYPE", matched_lifecycle),
             ("MART_CLEARED_LIFECYCLE_POOLED", pooled_lifecycle),
             ("MART_DATA_QUALITY_SUMMARY", quality_frame),
@@ -243,6 +253,7 @@ def load_snowflake_dashboard_data(
             active,
             summary,
             active_backlog,
+            active_backlog_by_year_type,
             matched_lifecycle,
             pooled_lifecycle,
             cleared_revision_count,

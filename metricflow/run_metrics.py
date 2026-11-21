@@ -26,6 +26,9 @@ ACTIVE_METRICS = ",".join(
 CLEARED_METRICS = ",".join(
     (
         "cleared_permit_revision_count",
+        "closed_application_to_issue_valid_revision_count",
+        "closed_application_to_completion_valid_revision_count",
+        "closed_issue_to_completion_valid_revision_count",
         "median_application_to_issue_days",
         "p90_application_to_issue_days",
         "median_application_to_completion_days",
