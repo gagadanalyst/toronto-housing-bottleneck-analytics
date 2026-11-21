@@ -1,8 +1,8 @@
 # Toronto Housing Bottleneck Analytics — Snowflake + DuckDB
 
-An end-to-end Analytics Engineering project using City of Toronto building-permit data, with **DuckDB and Snowflake as supported warehouse backends**. A dedicated Python extraction application validates Active and Cleared source snapshots and publishes immutable archive bundles. A separate dlt-backed Mode 1 loader applies incremental changes through isolated, validated backend candidates. A manual-only Mode 2 path reconstructs the retained archive history in isolated targets, compares the resulting histories, and requires a separate explicitly authorized promotion. One shared dbt project supplies the analytical models, and the Streamlit dashboard selects its data source through an explicit backend setting.
+An end-to-end Analytics Engineering project built on City of Toronto building-permit data. It combines a validated Python extraction pipeline, immutable source archives, isolated incremental and historical warehouse-loading paths, a shared dbt analytics layer, and a deployed Streamlit data product. **DuckDB and Snowflake are supported warehouse backends.** A separate, pinned MetricFlow workflow validates dbt v2 semantic definitions and publishes precomputed Active and Cleared metrics from the published DuckDB warehouse for the dashboard's fifth page; MetricFlow is not a public-dashboard runtime dependency.
 
-**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)
+**[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[MetricFlow implementation guide](metricflow/README.md)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)
 
 ## Analytical questions this project answers
 
@@ -31,8 +31,9 @@ Using current logical Active permit revisions and records marked `Closed`, the d
 | Historical reconstruction | Mode 2 is a separate manual-only full-history replay and parity path. It produces isolated reconstruction evidence; a different workflow performs explicitly authorized production promotion. |
 | Warehouse history | SCD Type 2 tracking for source changes observed between retained snapshots. This is observed history, not a complete real-world event ledger. |
 | Analytics engineering | One dbt project for DuckDB and Snowflake, with staging models, revision-level facts, dimensions, marts, contracts, tests, and documentation. |
+| Semantic metrics | dbt v2 model-embedded semantic definitions for Active and Cleared permit revisions, queried by an isolated MetricFlow workflow and published as six reusable result groups. |
 | Reliability | Persistent incremental-loader state, immutable source archives, candidate validation, SCD2 and quarantine checks, baseline verification, independent backend promotion, and recovery procedures. |
-| Data product | A deployed Streamlit dashboard with explicit DuckDB/Snowflake backend selection and Active/Cleared data-quality reporting. |
+| Data product | A deployed five-page Streamlit dashboard: four existing interactive analytics pages plus a MetricFlow results page, with explicit DuckDB/Snowflake selection for the warehouse-backed views. |
 
 The analysis is descriptive, not causal. It examines observed active-permit ages and dates recorded for permits marked `Closed`; it does not claim to explain why a permit took a given amount of time.
 
@@ -89,6 +90,10 @@ flowchart TB
     DPROD --> PUB
     PUB --> APP["Streamlit dashboard<br/>DASHBOARD_BACKEND selects source"]
     ANALYTICS --> APP
+    MF["MetricFlow workflow<br/>validate dbt v2 semantic models and query metrics"]
+    MFR["metrics-latest<br/>versioned JSON results"]
+    PUB --> MF --> MFR
+    MFR -->|"Metrics & semantic layer page"| APP
     PUB --> PAGES["GitHub Pages dbt documentation"]
 ```
 
@@ -97,6 +102,8 @@ The V2 Snapshot Archive workflow is the extraction and immutable-evidence bounda
 Mode 2 is not part of the daily loading path. Its manual-only replay reconstructs the retained archive history in isolated DuckDB and Snowflake targets and retains validation evidence. It does not write to canonical production. The separate full-history promotion workflow requires explicit approval, verifies the selected replay evidence, and rechecks production baselines before promoting. Its Snowflake leg is optional and gated independently.
 
 The archive history is bounded by the snapshots actually retained. Reconstructing all retained archives does not establish a complete real-world permit event history or recover changes that were never captured in a snapshot. SCD2 validity windows describe observed source changes between snapshots.
+
+MetricFlow is a separate semantic-metrics publication path, not another warehouse loader. After a successful Mode 1 DuckDB publication, its workflow validates the dbt v2 semantic definitions, executes the configured metric queries against the published DuckDB warehouse, and publishes a versioned JSON package in the `metrics-latest` GitHub Release. Pull-request validation uses a disposable restored database and does not publish results; manual backfill can target an already successful Mode 1 DuckDB publication. The MetricFlow environment is isolated from the production dbt and Streamlit dependencies.
 
 `SNOWFLAKE_OPERATIONS_ENABLED` controls Snowflake workflow operations; it does not choose the dashboard backend. `DASHBOARD_BACKEND` chooses which warehouse the same dashboard reads. The app defaults to DuckDB when the setting is omitted, and a connection failure is shown rather than silently substituting results from the other warehouse.
 
@@ -224,12 +231,17 @@ If a real credential is detected, treat it as exposed and rotate/revoke it; dele
 
 ## Live dashboard
 
-**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. The dashboard supports both DuckDB and Snowflake; `DASHBOARD_BACKEND` selects the source (`duckdb` or `snowflake`). If neither the environment variable nor the Streamlit secret is set, the app defaults to DuckDB. Both paths query the same dbt analytical relations rather than calling Toronto CKAN directly. Connection or query errors are shown rather than silently switching backends. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successful DuckDB publication or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has four sections, each with a distinct analytical purpose:
+**[Open the dashboard](https://toronto-housing-bottleneck.streamlit.app/)**. The dashboard supports both DuckDB and Snowflake; `DASHBOARD_BACKEND` selects the source (`duckdb` or `snowflake`). If neither the environment variable nor the Streamlit secret is set, the app defaults to DuckDB. Both paths query the same dbt analytical relations rather than calling Toronto CKAN directly. Connection or query errors are shown rather than silently switching backends. Results are cached for 24 hours, with a manual refresh option. The sidebar's last-successful-refresh timestamp is displayed in Toronto local time (ET) and comes from the last successful DuckDB publication or the Snowflake refresh-metadata table. If a DuckDB refresh fails before publication, its unpromoted timestamp does not replace the timestamp in the published artifact. The dashboard has five pages, each with a distinct analytical purpose:
 
 - **The story** — decision-oriented overview of the current Active backlog by application-year cohort and permit type. It compares eligible and ineligible records, highlights older backlog thresholds, and reports age statistics. It also presents pooled lifecycle durations for matched Closed permits and an application-year/permit-type cohort explorer using that same matched cohort.
 - **Active permits** — interactive exploration of ongoing Active-permit ages by permit type, including distributions, median and 90th-percentile age, and individual permit-revision details. Filters allow the viewer to narrow the analysis by permit type and age.
 - **Closed-permit timelines** — lifecycle comparisons for records marked `Closed`, by application year, permit type and date interval. This page uses the broader lifecycle mart and reports date-pair counts, usable non-negative duration counts, and group-level duration summaries.
 - **Data quality & definitions** — logical-revision findings, overlapping check counts, Active age eligibility and exclusions, Cleared date completeness, metric definitions and interpretation caveats.
+- **Metrics & semantic layer** — centrally defined Active and Cleared metrics, displayed overall and by permit type and application year. This page consumes precomputed results from the `metrics-latest` release rather than executing MetricFlow in the Streamlit process.
+
+**How the semantic page relates to the other four.** The first four pages retain their existing dbt serving-mart and dashboard calculation paths; they have not been migrated to MetricFlow. The Active page reads `mart_active_permit_age` (also the source model for its semantic definition) and calculates its filter-responsive statistics in Pandas, including an exact P90. MetricFlow publishes overall and grouped measures from the same semantic model, with an approximate continuous P90. The Closed-permit timelines page reads `mart_cleared_lifecycle_by_year_type`, which contains application-year/permit-type group summaries. MetricFlow instead defines lifecycle measures on `fct_cleared_permit_revision` at logical permit-revision grain. Those outputs answer related questions but are not interchangeable: their cohorts, grouping and aggregation levels differ. The Story and Data quality pages also continue to use their existing dbt marts.
+
+**Current semantic-layer scope.** MetricFlow currently queries the published DuckDB warehouse only. The Metrics & semantic layer page reads that DuckDB-generated result package regardless of the dashboard's `DASHBOARD_BACKEND` setting; selecting Snowflake for the existing warehouse-backed pages does not switch MetricFlow execution to Snowflake.
 
 **How to interpret the two lifecycle views.** The Story page calculates pooled median and 90th-percentile durations across individual permit revisions in one matched Closed cohort: all three dates must be present and chronologically ordered. The Closed-permit timelines page uses the broader lifecycle mart, which summarizes records within application-year and permit-type groups. Its displayed median of group medians and median of group 90th percentiles are summaries of group-level statistics, not pooled permit-level median and P90 values. The two views therefore answer related questions but use different cohorts and aggregation levels.
 
@@ -298,11 +310,13 @@ The local dashboard downloads the published DuckDB asset and therefore needs net
 | `.github/workflows/snapshot-replay.yml` | Manual-only Mode 2 full-history replay and parity evidence. |
 | `.github/workflows/promote-snapshot-rebuild.yml` | Separate, explicitly authorized Mode 2 production promotion. |
 | `.github/workflows/snowflake-serving-schema.yml` | Isolated Snowflake serving build and promotion after a verified upstream handoff or deliberate manual dispatch. |
+| `.github/workflows/metricflow-metrics.yml` | PR validation and separate publication of precomputed MetricFlow results after a successful DuckDB Mode 1 publication. |
+| `metricflow/` | Isolated MetricFlow dependencies, semantic-metric query runner, and implementation guide. |
 | `.github/workflows/ci.yml`, `.github/workflows/secret-scan.yml` | Code-quality CI and Gitleaks checks. |
 | `src/toronto_housing_ingestion/` | Shared ingestion, warehouse, SCD2, replay, and validation implementation. |
 | `tests/` | Unit/integration tests, source-fallback tests, warehouse checks, and SCD2 regressions. |
 | `dbt/` | Shared DuckDB/Snowflake analytical models, contracts, and documentation. |
-| `dashboard/app.py` | Streamlit data product with explicit backend selection. |
+| `dashboard/app.py` | Five-page Streamlit data product with explicit warehouse backend selection and a published MetricFlow results page. |
 | `infra/snowflake/` | Snowflake setup SQL and operating guide. |
 | `docs/decisions/0001-dataset-scope.md` | Dataset-selection rationale and gates for expanding source scope. |
 | `docs/snapshot-archive-replay-baseline.md` | Archive, Mode 1, Mode 2, promotion, and recovery runbook. |
@@ -315,7 +329,7 @@ The local dashboard downloads the published DuckDB asset and therefore needs net
 - **SCD2 is observed history, not a complete event ledger:** changes between snapshots and exact real-world status-transition times cannot be inferred.
 - **The warehouse release rolls forward:** `warehouse-latest` is replaceable and does not preserve every previous warehouse state. Immutable source snapshot Releases preserve the retained input bundles, not every intermediate warehouse version.
 - **No causal claims:** the available fields do not establish why a permit took longer.
-- **Deferred work:** additional datasets, historical DuckDB-to-Snowflake SCD2 reconciliation, a new orchestration framework, parallel dbt model trees, and a dbt Semantic Layer are outside the current scope. A semantic layer may be considered once metric definitions and consumption needs are stable.
+- **Semantic metrics scope:** MetricFlow currently executes the Active and Cleared semantic models against the published DuckDB warehouse. Snowflake MetricFlow execution and migrating the four existing interactive pages to query MetricFlow are future extensions; those pages continue to use their established dbt serving marts.
 
 ## Project timeline and development practice
 
