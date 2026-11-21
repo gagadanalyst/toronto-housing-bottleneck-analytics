@@ -149,8 +149,8 @@ def test_separate_workflow_is_triggered_by_mode1_and_publishes_results():
     assert "pull_request:" in workflow
     assert "validate_pr:" in workflow
     assert "workflow_run:" in workflow
-    assert "Mode 1 Incremental Loader (Validated Staging)" in workflow
-    assert "Stage Mode 1 DuckDB changes" in workflow
+    assert "Transformation / dbt Serving Refresh" in workflow
+    assert "Build and publish DuckDB serving warehouse" in workflow
     assert "source_run_head_sha" in workflow
     assert (
         "ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.source.outputs.source_run_head_sha }}"
@@ -159,7 +159,7 @@ def test_separate_workflow_is_triggered_by_mode1_and_publishes_results():
     assert "--source-commit" in workflow
     assert "Publish the four verified DuckDB production assets" in workflow
     assert "metrics-latest" in workflow
-    assert "mode1-incremental-loader.yml" in workflow
+    assert "transformation-dbt-serving.yml" in workflow
     assert "github.event.workflow_run.conclusion == 'success'" not in workflow
 
 

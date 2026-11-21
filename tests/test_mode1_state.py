@@ -768,17 +768,15 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
     assert "persist_validated_snowflake_candidate.outcome == 'success'" in workflow
     assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2))"' in workflow
     assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2 + 1))"' in workflow
-    assert workflow.index(
-        "Dispatch the Snowflake serving-schema refresh"
-    ) < workflow.index("Persist the promoted Snowflake Mode 1 checkpoint")
+    assert "Dispatch the Snowflake serving-schema refresh" not in workflow
     assert (
         "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
         in workflow
     )
     assert (
-        "if: always() && steps.promote_snowflake_candidate.outcome == 'success' "
-        "&& steps.dispatch_snowflake_serving.outcome == 'success'"
-    ) in workflow
+        "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
+        in workflow
+    )
     assert workflow.count("steps.replay.outputs.has_pending_archives != 'true'") == 2
     assert "rebootstrap_from_mode2:" in workflow
     assert "default: false" in workflow

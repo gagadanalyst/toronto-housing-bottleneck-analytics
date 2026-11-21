@@ -34,19 +34,18 @@ model-embedded semantic YAML.
    DuckDB asset to a disposable runner file, validates the semantic definitions,
    and executes the six sample query groups. It does not publish a release or
    modify production data.
-2. **Successful Mode 1 DuckDB publication:** after a successful DuckDB job has
+2. **Successful Transformation DuckDB publication:** after a successful DuckDB job has
    published the new warehouse, the workflow verifies the source run and source
    commit, restores the published database to a disposable runner file, runs
    MetricFlow, and uploads `toronto-metricflow-results.json` to the persistent
-   `metrics-latest` GitHub Release. If Mode 1 did not publish a new DuckDB
-   warehouse, MetricFlow publication is skipped.
+   `metrics-latest` GitHub Release. If the Transformation workflow did not publish a new DuckDB `warehouse`, MetricFlow publication is skipped.
 3. **Manual backfill:** `workflow_dispatch` accepts the ID of an already
-   successful Mode 1 run that published DuckDB. The workflow rechecks that run
+   successful Transformation run that published DuckDB. The workflow rechecks that run
    and the warehouse provenance; it does not run another ingestion or warehouse
    load. Manual dispatch must target `main`.
 
 The result package includes the six query outputs plus generation time and the
-identity of the Mode 1 warehouse refresh used to calculate them. The release is
+identity of the Transformation warehouse refresh used to calculate them. The release is
 a separately versioned result artifact; it is not the DuckDB warehouse itself.
 
 ## Dashboard consumption and relationship to the other pages
@@ -108,7 +107,7 @@ python metricflow/run_metrics.py \
   --output /tmp/toronto-metricflow-results
 ```
 
-Replace the sample run ID and commit with the successful Mode 1 run identity
+Replace the sample run ID and commit with the successful Transformation run identity
 recorded in `metadata.dashboard_refresh_metadata`. When both arguments are
 supplied, the runner checks them against the warehouse metadata before querying.
 They must be supplied together. Pull-request validation omits both arguments;

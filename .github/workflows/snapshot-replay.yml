@@ -47,7 +47,35 @@ concurrency:
   queue: max
 
 jobs:
+  seed-loading-baseline:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.compare_run_id == '' &&
+      (inputs.backends == 'both' || inputs.backends == 'duckdb')
+    name: Seed or verify the canonical DuckDB Loading baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: toronto-housing-data-publication
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install Loading baseline validation dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Seed or verify loading-latest before Mode 2 reconstruction
+        run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY" --backup-dir "$RUNNER_TEMP/loading-seed-backup-${GITHUB_RUN_ID}"
+
   duckdb:
+    needs: seed-loading-baseline
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.compare_run_id == '' &&
@@ -109,6 +137,8 @@ jobs:
           baseline=data/recovery/snapshot-replay/duckdb-production-baseline.json
           if [ ! -s "$baseline" ]; then
             python -m scripts.restore_duckdb_production \
+              --release-tag loading-latest \
+              --database-asset toronto-loading.duckdb \
               --output data/warehouse/toronto.duckdb
             python -m scripts.snapshot_replay_baseline \
               --backend duckdb \

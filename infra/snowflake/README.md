@@ -81,7 +81,7 @@ Never commit passwords, account identifiers that are intended to be secret, toke
 
 ## Automated refresh and the Snowflake gate
 
-The **Mode 1 Incremental Loader (Validated Staging)** workflow (`.github/workflows/mode1-incremental-loader.yml`) is the daily production-loading path. It stages and validates each backend independently before promoting that backend's candidate.
+The **Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)** workflow (`.github/workflows/mode1-incremental-loader.yml`) is the daily production-loading path. It stages and validates each backend independently before promoting that backend's candidate.
 
 The current operating design separates immutable source extraction, incremental
 production loading, historical reconstruction, and explicit promotion.
@@ -93,10 +93,7 @@ snapshots, publishes immutable archive Releases, and updates
 `snapshot_inventory.json`. It does not connect to Snowflake or write warehouse
 tables.
 
-The Mode 1 loader is `.github/workflows/mode1-incremental-loader.yml`. Its
-scheduled run is at 13:00 UTC and requires both
-`TORONTO_MODE1_ENABLED=true` and `TORONTO_MODE1_SCHEDULE_ENABLED=true`. A manual
-dispatch is restricted to `main` and can select `duckdb`, `snowflake`, or `both`.
+The Loading SCD2 / Mode 1 loader is `.github/workflows/mode1-incremental-loader.yml`. It follows Extraction completion, can be dispatched manually, and can run on Loading-specific code changes. The scheduled Complete Pipeline runs at 11 PM `America/Toronto` and checks `TORONTO_MODE1_ENABLED=true` and `TORONTO_MODE1_SCHEDULE_ENABLED=true`. If `TORONTO_EXTRACTION_SCHEDULE_ENABLED` is false, it starts Loading directly to process already-approved archives. Manual dispatch is restricted to `main` and can select `duckdb`, `snowflake`, or `both`.
 The Snowflake job additionally requires `SNOWFLAKE_OPERATIONS_ENABLED=true`.
 
 The Mode 1 Snowflake job:
@@ -108,15 +105,14 @@ The Mode 1 Snowflake job:
 5. Validates the source ledgers, DLT state, SCD2 integrity, duplicate/current
    keys, quarantine reconciliation, and the captured production baseline.
 6. Promotes the validated candidate through the guarded RAW schema swap.
-7. Explicitly dispatches the serving workflow with
-   `snapshot_loader_run_id` after RAW promotion succeeds.
+7. Persists the promoted Loading state. Transformation separately dispatches the serving workflow with `snapshot_loader_run_id` after a successful RAW promotion.
 
 The persistent Mode 1 state uses the `toronto-mode1-working-state` Release tag.
 Snowflake's working schema remains in Snowflake; the corresponding replay ledger
 and schema pointer are retained in the state Release. A partial source load can
 therefore be retried without treating a failed candidate as production.
 
-The Mode 1 workflow also checks that the retired
+The Loading workflow also checks that the retired
 `TORONTO_SNAPSHOT_LOADER_ENABLED` variable is not `true`. Keep that legacy
 variable false or unset. It is a fail-closed guard, not the switch that enables
 the current loader.
@@ -134,18 +130,15 @@ the selected successful Mode 2 run, its evidence, and the current production
 baselines. It requires explicit
 `confirm_full_history_promotion=true`. The DuckDB promotion can proceed
 independently; the Snowflake promotion leg is included only when
-`SNOWFLAKE_OPERATIONS_ENABLED=true`. After a successful Snowflake promotion,
-the workflow explicitly dispatches serving with
-`snapshot_rebuild_promotion_run_id`.
+`SNOWFLAKE_OPERATIONS_ENABLED=true`. After a successful Snowflake full-history promotion, the promotion workflow dispatches Loading with `rebootstrap_from_mode2=true` and the exact Mode 2 replay run ID and attempt. Loading reboots its persistent state from that accepted generation. Transformation follows a successful, validated Loading handoff and dispatches Snowflake serving with the resulting successful Loading run identity (`snapshot_loader_run_id`).
 
 ### Snowflake serving handoff
 
 `.github/workflows/snowflake-serving-schema.yml` is an explicit serving build.
 It accepts at most one verified upstream promotion identity:
 
-- `snapshot_loader_run_id` for successful Mode 1 RAW promotion.
-- `snapshot_rebuild_promotion_run_id` for successful Mode 2 full-history
-  promotion.
+- `snapshot_loader_run_id` for successful Loading SCD2 / Mode 1 RAW promotion.
+- No direct Mode 2 serving dispatch is used; Mode 2 promotion first reboots Loading state, then Transformation uses the successful Loading run identity.
 
 The serving workflow verifies the named successful main-branch workflow run and
 the relevant successful promotion job. It then creates a fresh
@@ -224,9 +217,7 @@ build or pre-promotion validation leaves the previous serving schema active;
 the previous version is retained after a swap.
 
 RAW and ANALYTICS are separate atomic schema swaps, not one Snowflake
-transaction. If RAW promotes successfully but serving fails, retry the serving
-workflow with the successful upstream promotion identity; do not replay or
-promote RAW solely to rebuild dbt.
+transaction. If RAW promotes successfully but serving fails, retry Transformation with `backends=snowflake`; do not replay or promote RAW solely to rebuild dbt.
 
 #### Quarantine handling
 
@@ -267,10 +258,10 @@ requires manual inspection before another write.
 | Failure point | Expected production state | Recovery action |
 |---|---|---|
 | Mode 1 RAW candidate preparation, replay, or validation fails before promotion | Existing `TORONTO.RAW` remains active; the rejected candidate is not the next baseline | Rerun the failed Mode 1 workflow attempt after resolving the error. The next attempt restores persistent working state and creates or resumes a fresh candidate. |
-| Mode 1 RAW promotion succeeds but the serving workflow fails | Promoted `TORONTO.RAW` remains active; the prior `TORONTO.ANALYTICS` remains active until a serving candidate passes | Retry only the serving workflow with the successful Mode 1 run ID. Do not replay RAW solely to rebuild dbt. |
+| Mode 1 RAW promotion succeeds but the serving workflow fails | Promoted `TORONTO.RAW` remains active; the prior `TORONTO.ANALYTICS` remains active until a serving candidate passes | Verify that the successful Mode 1 RAW promotion is canonical, then retry Transformation for Snowflake with `gh workflow run transformation-dbt-serving.yml --ref main -f backends=snowflake`. Do not replay RAW solely to rebuild dbt. |
 | Mode 2 Snowflake replay or joint parity fails | Canonical `TORONTO.RAW` is unchanged by the isolated replay | Inspect the run's replay summary, ledger, and evidence artifacts; correct the issue and rerun Mode 2. Do not invoke production promotion with incomplete evidence. |
 | Mode 2 Snowflake promotion or post-swap recovery fails | The RAW promotion may have reached a separate swap boundary; DuckDB may have a different result | Inspect the promotion run, canonical RAW, retained candidate schema, and generation/state markers before another write. Do not blindly retry an ambiguous promotion. |
-| Serving candidate build or pre-promotion validation fails | Existing `TORONTO.ANALYTICS` remains active | Retry serving against the same successful upstream promotion run. A fresh serving candidate is created for the new attempt. |
+| Serving candidate build or pre-promotion validation fails | Existing `TORONTO.ANALYTICS` remains active | Retry Transformation for Snowflake with `backends=snowflake`; it creates a fresh serving candidate without replaying RAW. |
 | One backend succeeds and the other fails | DuckDB and Snowflake promote independently | Recover only the failed backend; there is no distributed transaction or automatic cross-backend rollback. |
 
 For a pre-promotion Mode 1 failure, rerun the failed workflow's unsuccessful
@@ -289,22 +280,31 @@ gh workflow run mode1-incremental-loader.yml --ref main -f backends=snowflake
 This requires the Mode 1 controls and `SNOWFLAKE_OPERATIONS_ENABLED=true`.
 Do not use a manual dispatch to bypass candidate validation or state recovery.
 
-If RAW promotion succeeded and only serving failed, retry serving with the
-successful Mode 1 run ID:
+If Loading's Snowflake RAW promotion succeeded and only serving failed, first verify
+that the promoted RAW generation is canonical. Then retry Transformation for
+Snowflake. This is a serving-only retry; it does not replay RAW:
 
 ```bash
-gh workflow run snowflake-serving-schema.yml --ref main -f confirm_serving_schema=true -f snapshot_loader_run_id=MODE1_RUN_ID
+gh workflow run transformation-dbt-serving.yml --ref main -f backends=snowflake
 ```
 
-For a successful Mode 2 full-history promotion, use the promotion run ID instead:
+After a successful Mode 2 full-history promotion, the promotion workflow
+dispatches Loading with `rebootstrap_from_mode2=true` and the exact Mode 2 replay
+run ID and attempt. Loading reboots its persistent state from that accepted
+generation. Transformation follows after a successful, validated Loading
+handoff. Do not use the Mode 2 promotion run ID as a Transformation input.
+
+If the automatic Mode 2 Loading rebootstrap did not complete, rerun Loading
+with the exact Mode 2 replay source identity:
 
 ```bash
-gh workflow run snowflake-serving-schema.yml --ref main -f confirm_serving_schema=true -f snapshot_rebuild_promotion_run_id=PROMOTION_RUN_ID
+gh workflow run mode1-incremental-loader.yml --ref main -f backends=snowflake -f baseline_run_id=MODE2_RUN_ID -f baseline_attempt=MODE2_RUN_ATTEMPT -f rebootstrap_from_mode2=true
 ```
 
-If a loader/promoter run failed only because its serving-dispatch step failed,
-verify that the desired RAW generation is already canonical. In that special
-case, a deliberate manual serving build without an upstream ID is available:
+If the automatic Transformation handoff did not occur after a successful
+canonical RAW promotion, verify the intended RAW generation is active before
+using the explicitly confirmed manual Snowflake serving recovery path. Use
+this only as an exceptional fallback:
 
 ```bash
 gh workflow run snowflake-serving-schema.yml --ref main -f confirm_serving_schema=true

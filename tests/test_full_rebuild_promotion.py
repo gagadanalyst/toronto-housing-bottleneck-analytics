@@ -230,7 +230,7 @@ def test_promotion_workflow_validates_the_exact_source_run_attempt():
     assert "selected source workflow attempt does not match" in workflow
 
 
-def test_snowflake_promotion_job_can_dispatch_the_serving_workflow():
+def test_mode2_promotion_delegates_serving_to_transformation():
     workflow = (
         Path(__file__).resolve().parents[1]
         / ".github"
@@ -238,8 +238,12 @@ def test_snowflake_promotion_job_can_dispatch_the_serving_workflow():
         / "promote-snapshot-rebuild.yml"
     ).read_text(encoding="utf-8")
     snowflake_job = workflow.split("  promote-snowflake:", 1)[1]
-    assert "actions: write" in snowflake_job.split("    env:", 1)[0]
-    assert "gh workflow run snowflake-serving-schema.yml" in snowflake_job
+    assert "actions: read" in snowflake_job.split("    env:", 1)[0]
+    assert "gh workflow run snowflake-serving-schema.yml" not in snowflake_job
+    assert "loading-latest" in workflow
+    assert "Publish validated DuckDB loading assets" in workflow
+    assert "dbt build" not in workflow
+    assert "deploy-dbt-docs" not in workflow
 
 
 def test_duckdb_only_full_rebuild_validates_both_source_ledgers():
@@ -311,9 +315,7 @@ def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
     duckdb_job = workflow.split("  promote-duckdb:", 1)[1].split(
         "  promote-snowflake:", 1
     )[0]
-    snowflake_job = workflow.split("  promote-snowflake:", 1)[1].split(
-        "  deploy-dbt-docs:", 1
-    )[0]
+    snowflake_job = workflow.split("  promote-snowflake:", 1)[1]
 
     assert "backend_policy: ${{ steps.policy.outputs.backend_policy }}" in workflow
     assert 'echo "backend_policy=duckdb-only"' in verify_job

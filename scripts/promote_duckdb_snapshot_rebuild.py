@@ -1,8 +1,8 @@
-"""Validate and locally stage a full-history Mode 2 DuckDB rebuild for publication.
+"""Validate and locally stage a full-history Mode 2 DuckDB rebuild for Loading publication.
 
 This command never writes to a remote warehouse. It verifies the isolated rebuild,
-provenance ledger and quarantine records, proves dbt did not alter RAW state, then
-atomically places the validated dbt-built candidate at the workflow publication path.
+provenance ledger, quarantine records and RAW/DLT state, then atomically places
+the validated SCD2 candidate at the workflow Loading publication path.
 """
 
 from __future__ import annotations
@@ -444,9 +444,12 @@ def promote(
     expected_source = Path(report["candidate"]).resolve()
     if source_candidate.resolve() != expected_source:
         raise ValueError("source candidate path does not match the replay evidence.")
-    if candidate.resolve() != Path("data/warehouse/dbt-ci/toronto.duckdb").resolve():
+    if (
+        candidate.resolve()
+        != Path("data/warehouse/loading-candidate/toronto.duckdb").resolve()
+    ):
         raise ValueError(
-            "dbt candidate must be the isolated data/warehouse/dbt-ci/toronto.duckdb copy."
+            "Loading candidate must be the isolated data/warehouse/loading-candidate/toronto.duckdb copy."
         )
     if production.resolve() != Path("data/warehouse/toronto.duckdb").resolve():
         raise ValueError("Publication target must be data/warehouse/toronto.duckdb.")

@@ -1,13 +1,6 @@
-name: V2 Snapshot Archive
+name: Extraction / V2 Snapshot Archive
 
 on:
-  push:
-    branches:
-      - main
-      - refactor/separate-extraction
-    paths:
-      - .github/workflows/v2-snapshot-archive.yml
-      - extraction/**
   pull_request:
     branches:
       - main
@@ -15,13 +8,16 @@ on:
     paths:
       - .github/workflows/v2-snapshot-archive.yml
       - extraction/**
-  schedule:
-    - cron: "17 10 * * *"
   workflow_dispatch:
     inputs:
       confirm_publish:
         description: Explicitly authorize permanent V2 Release publication
         required: true
+        type: boolean
+        default: false
+      pipeline_schedule:
+        description: Set only when dispatched by the scheduled Complete Pipeline
+        required: false
         type: boolean
         default: false
 
@@ -35,9 +31,6 @@ concurrency:
 
 jobs:
   archive:
-    if: >-
-      github.event_name != 'schedule' ||
-      vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true'
     name: Extract and publish V2 source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -72,17 +65,26 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}
+          EXTRACTION_SCHEDULE_ENABLED: ${{ vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED }}
           CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+          PIPELINE_SCHEDULE: ${{ inputs.pipeline_schedule }}
         run: |
-          if [ "$EXTRACTION_ENABLED" != "true" ] ||
-             [ "$CONFIRM_PUBLISH" != "true" ] ||
-             [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "Manual V2 publication requires TORONTO_EXTRACTION_ENABLED=true, confirm_publish=true, and main." >&2
+          if [ "$CONFIRM_PUBLISH" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "V2 publication requires confirm_publish=true and the main branch." >&2
+            exit 1
+          fi
+          if [ "$PIPELINE_SCHEDULE" = "true" ]; then
+            if [ "$EXTRACTION_SCHEDULE_ENABLED" != "true" ]; then
+              echo "Scheduled Extraction requires TORONTO_EXTRACTION_SCHEDULE_ENABLED=true." >&2
+              exit 1
+            fi
+          elif [ "$EXTRACTION_ENABLED" != "true" ]; then
+            echo "Manual Extraction requires TORONTO_EXTRACTION_ENABLED=true." >&2
             exit 1
           fi
 
       - name: Require a branch ref for archive publication
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [ "$GITHUB_REF_TYPE" != "branch" ]; then
             echo "V2 archive publication and inventory updates require a branch ref." >&2
@@ -91,7 +93,7 @@ jobs:
 
       - name: Check whether source snapshots changed
         id: change_check
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch'
         working-directory: extraction
         env:
           GH_TOKEN: ${{ github.token }}
@@ -102,12 +104,11 @@ jobs:
         id: extract
         if: >-
           (
-            (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
-             github.ref == 'refs/heads/main')
+             github.ref == 'refs/heads/main' &&
+             ((inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+              (inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true')))
           ) &&
           steps.change_check.outcome == 'success' &&
           steps.change_check.outputs.no_change != 'true'
@@ -140,12 +141,11 @@ jobs:
       - name: Report unchanged source snapshots
         if: >-
           (
-            (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
-             github.ref == 'refs/heads/main')
+             github.ref == 'refs/heads/main' &&
+             ((inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+              (inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true')))
           ) &&
           steps.change_check.outcome == 'success' &&
           steps.change_check.outputs.no_change == 'true'
@@ -155,12 +155,11 @@ jobs:
         if: >-
           always() &&
           (
-            (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
-             github.ref == 'refs/heads/main')
+             github.ref == 'refs/heads/main' &&
+             ((inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+              (inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true')))
           ) &&
           steps.change_check.outcome == 'success' &&
           steps.change_check.outputs.no_change != 'true' &&
@@ -177,12 +176,11 @@ jobs:
       - name: Publish and verify V2 GitHub Release asset
         if: >-
           (
-            (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
-             github.ref == 'refs/heads/main')
+             github.ref == 'refs/heads/main' &&
+             ((inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+              (inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true')))
           ) &&
           steps.change_check.outcome == 'success' &&
           steps.change_check.outputs.no_change != 'true' &&
@@ -198,12 +196,11 @@ jobs:
       - name: Append verified archive to snapshot inventory
         if: >-
           (
-            (github.event_name == 'schedule' &&
-             vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             vars.TORONTO_EXTRACTION_ENABLED == 'true' &&
              inputs.confirm_publish == true &&
-             github.ref == 'refs/heads/main')
+             github.ref == 'refs/heads/main' &&
+             ((inputs.pipeline_schedule == true && vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED == 'true') ||
+              (inputs.pipeline_schedule != true && vars.TORONTO_EXTRACTION_ENABLED == 'true')))
           ) &&
           steps.change_check.outcome == 'success' &&
           steps.change_check.outputs.no_change != 'true' &&

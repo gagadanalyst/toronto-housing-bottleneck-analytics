@@ -31,6 +31,9 @@ jobs:
   verify:
     name: Verify full-history evidence and production baselines
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
@@ -219,10 +222,17 @@ jobs:
           test -s "$root/snowflake/exports/raw_cleared_permits_history.csv.gz"
           test -s "$root/joint-validation.json"
 
+      - name: Seed or verify loading-latest before full-history promotion checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY"
+
       - name: Verify the authoritative DuckDB production baseline has not changed since reconstruction began
         run: |
           mkdir -p data/warehouse
           python -m scripts.restore_duckdb_production \
+            --release-tag loading-latest \
+            --database-asset toronto-loading.duckdb \
             --output data/warehouse/toronto.duckdb
           python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
@@ -355,13 +365,13 @@ jobs:
   promote-duckdb:
     name: Promote DuckDB full-history candidate
     needs: verify
+    outputs:
+      loading_published: ${{ steps.publish_loading_assets.outcome == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: write
       actions: read
-      pages: write
-      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
@@ -373,10 +383,9 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-      - name: Install DuckDB and dbt dependencies
+      - name: Install DuckDB full-history validation dependencies
         run: |
           python -m pip install -e ".[dev]"
-          python -m pip install -r dbt/requirements.txt
       - name: Restore full-history candidate and promotion evidence
         run: |
           mkdir -p data/recovery/snapshot-replay
@@ -387,82 +396,27 @@ jobs:
             -C data/recovery/snapshot-replay
           test -s data/recovery/snapshot-replay/promotion-authorized.json
           test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
+      - name: Seed or verify loading-latest before DuckDB full-history promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY"
       - name: Restore and recheck the authoritative DuckDB production baseline
         run: |
           mkdir -p data/warehouse
           python -m scripts.restore_duckdb_production \
+            --release-tag loading-latest \
+            --database-asset toronto-loading.duckdb \
             --output data/warehouse/toronto.duckdb
           python -m scripts.snapshot_replay_baseline \
             --backend duckdb \
             --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
 
-      - name: Prepare isolated dbt candidate from the rebuilt DuckDB history
+      - name: Prepare isolated DuckDB Loading candidate from the rebuilt history
         run: |
-          mkdir -p data/warehouse/dbt-ci
+          mkdir -p data/warehouse/loading-candidate
           cp "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
-            data/warehouse/dbt-ci/toronto.duckdb
-          echo "DBT_DUCKDB_PATH=${GITHUB_WORKSPACE}/data/warehouse/dbt-ci/toronto.duckdb" >> "$GITHUB_ENV"
-          echo "TORONTO_DBT_AS_OF_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
-      - name: Configure dbt profile
-        working-directory: dbt
-        run: cp profiles.yml.example profiles.yml
-      - name: Install dbt dependencies
-        working-directory: dbt
-        run: dbt deps --profiles-dir .
-      - name: Check dbt and build the full-history serving candidate
-        working-directory: dbt
-        run: |
-          dbt debug --profiles-dir .
-          dbt freshness --profiles-dir .
-          dbt build --profiles-dir . --vars "{\"as_of_date\": \"${TORONTO_DBT_AS_OF_DATE}\"}"
-          dbt docs generate --profiles-dir . --output-dir docs-site
-      - name: Inject Google Analytics into generated dbt docs
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          measurement_id = "G-7F7JW7LG51"
-          script_url = "https://www.googletagmanager.com/gtag/js?id=" + measurement_id
-          index = Path("dbt/docs-site/index.html")
-          html = index.read_text(encoding="utf-8")
-          if script_url not in html:
-              if html.count("</head>") != 1:
-                  raise SystemExit("Expected exactly one </head> in generated dbt docs")
-              tag = (
-                  '    <!-- Google tag (gtag.js) -->\n'
-                  f'    <script async src="{script_url}"></script>\n'
-                  '    <script>\n'
-                  '      window.dataLayer = window.dataLayer || [];\n'
-                  '      function gtag() { window.dataLayer.push(arguments); }\n'
-                  '      gtag("js", new Date());\n'
-                  f'      gtag("config", "{measurement_id}");\n'
-                  '    </script>\n'
-              )
-              index.write_text(html.replace("</head>", tag + "</head>", 1), encoding="utf-8")
-          PY
-      - name: Record rebuilt DuckDB dashboard refresh metadata
-        env:
-          SOURCE_COMMIT: ${{ github.sha }}
-          WORKFLOW_RUN_ID: ${{ github.run_id }}
-        run: |
-          python - <<'PY'
-          from datetime import datetime, timezone
-          import os
-          import duckdb
-          with duckdb.connect(os.environ["DBT_DUCKDB_PATH"]) as connection:
-              connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
-              connection.execute("""CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
-                  refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
-                  last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
-                  source_commit VARCHAR NOT NULL,
-                  workflow_run_id VARCHAR NOT NULL
-              )""")
-              connection.execute("DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1")
-              connection.execute(
-                  "INSERT INTO metadata.dashboard_refresh_metadata VALUES (1, ?, ?, ?)",
-                  (datetime.now(timezone.utc), os.environ["SOURCE_COMMIT"], os.environ["WORKFLOW_RUN_ID"]),
-              )
-          PY
+            data/warehouse/loading-candidate/toronto.duckdb
       - name: Recheck DuckDB production baseline immediately before promotion
         run: |
           python -m scripts.snapshot_replay_baseline \
@@ -473,29 +427,11 @@ jobs:
         run: |
           python -m scripts.promote_duckdb_snapshot_rebuild \
             --source-candidate "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
-            --candidate "$DBT_DUCKDB_PATH" \
+            --candidate data/warehouse/loading-candidate/toronto.duckdb \
             --production data/warehouse/toronto.duckdb \
             --summary data/recovery/snapshot-replay/duckdb-summary.json \
             --source-run-id "$SOURCE_RUN_ID" \
             --confirm-full-history
-      - name: Package rebuilt dbt documentation archive
-        run: |
-          test -s dbt/docs-site/index.html
-          mkdir -p data-assets/dbt-docs
-          cp -R dbt/docs-site/. data-assets/dbt-docs/
-          printf '%s\n' "Toronto Housing Analytics dbt documentation" "Extract and run: python3 -m http.server 8000" > data-assets/dbt-docs/README.txt
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-          source = Path("data-assets/dbt-docs")
-          archive = Path("data-assets/toronto-dbt-docs.zip")
-          with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
-              for path in sorted(p for p in source.rglob("*") if p.is_file()):
-                  zipped.write(path, path.relative_to(source).as_posix())
-          with ZipFile(archive) as zipped:
-              if zipped.testzip() is not None or "index.html" not in zipped.namelist():
-                  raise SystemExit("dbt documentation ZIP failed verification")
-          PY
       - name: Recheck and materialize the authorized archive set before publication
         env:
           GH_TOKEN: ${{ github.token }}
@@ -567,20 +503,25 @@ jobs:
             --archive-dir data/recovery/snapshot-replay/archives \
             --output-dir data-assets
 
-      - name: Publish the validated DuckDB, Parquet and dbt assets with rollback
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
-          WAREHOUSE_LATEST_TARGET_SHA: ${{ github.sha }}
-        run: python scripts/publish_release_assets.py
-      - name: Preserve the immutable DuckDB recovery checkpoint
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/publish_duckdb_recovery.py
-      - name: Upload GitHub Pages documentation artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - name: Publish validated DuckDB loading assets
+        id: publish_loading_assets
+        run: |
+          cp data/warehouse/toronto.duckdb data/warehouse/toronto-loading.duckdb
+          python -m scripts.publish_loading_assets \
+            --repository "$GITHUB_REPOSITORY" \
+            --database data/warehouse/toronto-loading.duckdb \
+            --active-parquet data-assets/toronto-active-permits.parquet \
+            --cleared-parquet data-assets/toronto-cleared-permits.parquet \
+            --backup-dir "$RUNNER_TEMP/loading-latest-backup-${GITHUB_RUN_ID}"
+      - name: Preserve the last-known-good Loading baseline on failure
+        if: always() && (steps.publish_loading_assets.outcome == 'failure' || steps.publish_loading_assets.outcome == 'cancelled')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: dbt/docs-site
+          name: loading-latest-recovery-mode2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/loading-latest-backup-${{ github.run_id }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
       - name: Upload DuckDB promotion result
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -592,6 +533,8 @@ jobs:
   promote-snowflake:
     name: Promote Snowflake full-history candidate
     needs: verify
+    outputs:
+      raw_promoted: ${{ steps.promote_snowflake_raw.outcome == 'success' }}
     if: >-
       needs.verify.result == 'success' &&
       needs.verify.outputs.backend_policy == 'both' &&
@@ -600,7 +543,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      actions: write
+      actions: read
       contents: read
     env:
       SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
@@ -628,6 +571,7 @@ jobs:
             --backend snowflake \
             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
       - name: Promote the fully validated Snowflake RAW history
+        id: promote_snowflake_raw
         run: |
           python -m scripts.promote_snowflake_snapshot_rebuild \
             --source-schema "${{ needs.verify.outputs.snowflake_schema }}" \
@@ -635,32 +579,49 @@ jobs:
             --expected-snapshots "${{ needs.verify.outputs.snapshot_count }}" \
             --summary data/recovery/snapshot-replay/snowflake-summary.json \
             --confirm-full-history
-      - name: Dispatch a separately validated Snowflake serving refresh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run snowflake-serving-schema.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f confirm_serving_schema=true \
-            -f snapshot_rebuild_promotion_run_id="${GITHUB_RUN_ID}"
       - name: Record the independent backend promotion boundary
         run: |
-          echo "Snowflake RAW full-history promotion passed. Snowflake serving refresh was dispatched separately." >> "$GITHUB_STEP_SUMMARY"
+          echo "Snowflake RAW full-history promotion passed. The independent Loading rebootstrap and Transformation stages own subsequent serving refresh." >> "$GITHUB_STEP_SUMMARY"
 
-  deploy-dbt-docs:
-    name: Deploy rebuilt dbt documentation to GitHub Pages
-    needs: promote-duckdb
-    if: needs.promote-duckdb.result == 'success'
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  rebootstrap-loading-duckdb:
+    name: Rebootstrap DuckDB Loading state from promoted Mode 2 history
+    needs: [verify, promote-duckdb]
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      needs.promote-duckdb.outputs.loading_published == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
     steps:
-      - name: Deploy dbt documentation
-        id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+      - name: Rebootstrap persistent DuckDB Mode 1 state from the promoted full history
+        run: |
+          gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=duckdb             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
+
+  rebootstrap-loading-snowflake:
+    name: Rebootstrap Snowflake Loading state from promoted Mode 2 history
+    needs: [verify, promote-snowflake]
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      needs.promote-snowflake.outputs.raw_promoted == 'true' &&
+      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+    steps:
+      - name: Rebootstrap persistent Snowflake Mode 1 state from the promoted full history
+        run: |
+          gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=snowflake             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
