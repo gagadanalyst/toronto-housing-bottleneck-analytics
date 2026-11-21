@@ -54,6 +54,10 @@ WITH model AS (
         UNION ALL SELECT 'completion_date_no_usable'
         UNION ALL SELECT 'both_dates_available'
         UNION ALL SELECT 'closed_revision_count'
+        UNION ALL SELECT 'closed_matched_three_date_count'
+        UNION ALL SELECT 'closed_excluded_conflicting_date_count'
+        UNION ALL SELECT 'closed_excluded_missing_date_count'
+        UNION ALL SELECT 'closed_excluded_out_of_order_date_count'
         UNION ALL SELECT 'closed_both_dates_available'
         UNION ALL SELECT 'non_closed_both_dates_available'
         UNION ALL SELECT 'cleared_builder_name_missing'
@@ -83,6 +87,26 @@ WITH model AS (
     WHERE (SELECT metric_value FROM model WHERE metric_name = 'closed_both_dates_available') <>
           (SELECT COALESCE(SUM(eligible_date_pairs), 0)
            FROM {{ ref('mart_cleared_lifecycle_by_year_type') }}
+           WHERE measure = 'Application to completion')
+
+    UNION ALL
+
+    SELECT CAST('closed_revision_count' AS VARCHAR), 'matched_closed_cohort_does_not_reconcile'
+    WHERE (SELECT metric_value FROM model WHERE metric_name = 'closed_revision_count') <>
+          (SELECT COALESCE(SUM(metric_value), 0)
+           FROM model WHERE metric_name IN (
+               'closed_matched_three_date_count',
+               'closed_excluded_conflicting_date_count',
+               'closed_excluded_missing_date_count',
+               'closed_excluded_out_of_order_date_count'
+           ))
+
+    UNION ALL
+
+    SELECT CAST('closed_matched_three_date_count' AS VARCHAR), 'matched_count_does_not_reconcile_to_matched_lifecycle_mart'
+    WHERE (SELECT metric_value FROM model WHERE metric_name = 'closed_matched_three_date_count') <>
+          (SELECT COALESCE(SUM(matched_cohort_count), 0)
+           FROM {{ ref('mart_cleared_lifecycle_matched_by_year_type') }}
            WHERE measure = 'Application to completion')
 )
 SELECT * FROM failures

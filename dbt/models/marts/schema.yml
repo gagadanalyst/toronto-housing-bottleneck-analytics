@@ -211,6 +211,21 @@ models:
         type: simple
         agg: sum
         expr: 1
+      - name: closed_application_to_issue_valid_revision_count
+        description: Count of logical Closed revisions with a non-negative application-to-issue interval.
+        type: simple
+        agg: count
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_issue_days ELSE NULL END"
+      - name: closed_application_to_completion_valid_revision_count
+        description: Count of logical Closed revisions with a non-negative application-to-completion interval.
+        type: simple
+        agg: count
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_completion_days ELSE NULL END"
+      - name: closed_issue_to_completion_valid_revision_count
+        description: Count of logical Closed revisions with a non-negative issue-to-completion interval.
+        type: simple
+        agg: count
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN issue_to_completion_days ELSE NULL END"
       - name: median_application_to_issue_days
         description: Median non-negative elapsed calendar days from application to issue among records marked Closed.
         type: simple
@@ -655,9 +670,10 @@ models:
       contract:
         enforced: true
     description: >-
-      Metric-level Active and Cleared data-quality aggregates and Active age
-      exclusion counts. Dashboard adapters read these prepared values and do
-      not reproduce quality aggregation SQL.
+      Metric-level Active and Cleared data-quality aggregates, Active age
+      exclusions, and a mutually exclusive reconciliation of the matched
+      three-date Closed lifecycle cohort. Dashboard adapters read these
+      prepared values and do not reproduce quality aggregation SQL.
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

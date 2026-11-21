@@ -16,7 +16,8 @@ model-embedded semantic YAML.
   logical Cleared revision count and median / approximate continuous P90 for
   application-to-issue, application-to-completion, and issue-to-completion.
   Duration metrics include records marked `Closed` and exclude negative values
-  for each interval.
+  for each interval. Three interval-specific valid-record count metrics expose
+  the denominator behind each grouped median and approximate P90.
 - **Dimensions:** permit type and application year (through the application-date
   time dimension).
 - **Six result groups:** Active overall, by permit type, and by year; Cleared
@@ -50,14 +51,20 @@ a separately versioned result artifact; it is not the DuckDB warehouse itself.
 
 ## Dashboard consumption and relationship to the other pages
 
-The **Metrics & semantic layer** page is the fifth page in the Streamlit
+The **Metrics & semantic layer** page is the fifth and final page in the Streamlit
 application. It downloads the JSON asset from `metrics-latest` and presents the
-precomputed metrics. The page's refresh button clears the result cache and
-re-fetches the release asset. The public Streamlit runtime does not run dbt or
+precomputed metrics. Visitors can select among all published Active count / age
+measures and all three Cleared interval medians / approximate P90s / valid-record
+counts for the grouped permit-type and application-year views. Each interval has
+its own valid Closed-revision denominator. The page caches the result package for
+15 minutes; its refresh button clears the cache and re-fetches the release asset. The public Streamlit runtime does not run dbt or
 MetricFlow, connect to a MetricFlow service, or install MetricFlow dependencies.
 
 The four existing pages retain their established dbt serving-mart and dashboard
-calculation paths; they have not been migrated to MetricFlow:
+calculation paths; they have not been migrated to MetricFlow. The Story page now
+uses the existing `mart_active_backlog_by_year_type` relation for a joint
+application-year × permit-type view. The other three analytical pages continue
+to use their established serving models:
 
 - **The story** reads existing Active backlog and matched Closed lifecycle
   summary marts.

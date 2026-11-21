@@ -98,6 +98,43 @@ cleared_fact AS (
             AS both_dates_available,
         CAST(SUM(CASE WHEN status = 'Closed' THEN 1 ELSE 0 END) AS BIGINT)
             AS closed_revision_count,
+        CAST(SUM(CASE
+            WHEN status = 'Closed'
+                AND NOT COALESCE(application_date_conflict, FALSE)
+                AND NOT COALESCE(issued_date_conflict, FALSE)
+                AND NOT COALESCE(completed_date_conflict, FALSE)
+                AND application_date IS NOT NULL
+                AND issued_date IS NOT NULL
+                AND completed_date IS NOT NULL
+                AND application_date <= issued_date
+                AND issued_date <= completed_date
+            THEN 1 ELSE 0 END) AS BIGINT) AS closed_matched_three_date_count,
+        CAST(SUM(CASE
+            WHEN status = 'Closed' AND (
+                COALESCE(application_date_conflict, FALSE)
+                OR COALESCE(issued_date_conflict, FALSE)
+                OR COALESCE(completed_date_conflict, FALSE)
+            ) THEN 1 ELSE 0 END) AS BIGINT)
+            AS closed_excluded_conflicting_date_count,
+        CAST(SUM(CASE
+            WHEN status = 'Closed'
+                AND NOT COALESCE(application_date_conflict, FALSE)
+                AND NOT COALESCE(issued_date_conflict, FALSE)
+                AND NOT COALESCE(completed_date_conflict, FALSE)
+                AND (application_date IS NULL OR issued_date IS NULL OR completed_date IS NULL)
+            THEN 1 ELSE 0 END) AS BIGINT)
+            AS closed_excluded_missing_date_count,
+        CAST(SUM(CASE
+            WHEN status = 'Closed'
+                AND NOT COALESCE(application_date_conflict, FALSE)
+                AND NOT COALESCE(issued_date_conflict, FALSE)
+                AND NOT COALESCE(completed_date_conflict, FALSE)
+                AND application_date IS NOT NULL
+                AND issued_date IS NOT NULL
+                AND completed_date IS NOT NULL
+                AND NOT (application_date <= issued_date AND issued_date <= completed_date)
+            THEN 1 ELSE 0 END) AS BIGINT)
+            AS closed_excluded_out_of_order_date_count,
         CAST(SUM(CASE WHEN status = 'Closed' AND application_date IS NOT NULL AND completed_date IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT)
             AS closed_both_dates_available,
         CAST(SUM(CASE WHEN status IS NULL OR status <> 'Closed' THEN
@@ -163,6 +200,10 @@ metrics AS (
     UNION ALL SELECT 'completion_date_no_usable', completion_date_no_usable, 'cleared_coverage' FROM cleared_fact
     UNION ALL SELECT 'both_dates_available', both_dates_available, 'cleared_coverage' FROM cleared_fact
     UNION ALL SELECT 'closed_revision_count', closed_revision_count, 'cleared_coverage' FROM cleared_fact
+    UNION ALL SELECT 'closed_matched_three_date_count', closed_matched_three_date_count, 'cleared_cohort' FROM cleared_fact
+    UNION ALL SELECT 'closed_excluded_conflicting_date_count', closed_excluded_conflicting_date_count, 'cleared_cohort' FROM cleared_fact
+    UNION ALL SELECT 'closed_excluded_missing_date_count', closed_excluded_missing_date_count, 'cleared_cohort' FROM cleared_fact
+    UNION ALL SELECT 'closed_excluded_out_of_order_date_count', closed_excluded_out_of_order_date_count, 'cleared_cohort' FROM cleared_fact
     UNION ALL SELECT 'closed_both_dates_available', closed_both_dates_available, 'cleared_coverage' FROM cleared_fact
     UNION ALL SELECT 'non_closed_both_dates_available', non_closed_both_dates_available, 'cleared_coverage' FROM cleared_fact
     UNION ALL SELECT 'cleared_builder_name_missing', cleared_builder_name_missing, 'cleared_checks' FROM cleared_fact
