@@ -425,7 +425,13 @@ def _validate_replay_contract(
         raise ValueError("V2 replay contract validation references are invalid.")
 
 
-def validate_warehouse_eligibility(archives: list[SnapshotArchive]) -> None:
+def validate_warehouse_eligibility(
+    archives: list[SnapshotArchive],
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
+    initial_source_baselines: dict[str, tuple[int, str]] | None = None,
+    completed_source_observations: set[tuple[str, str]] | None = None,
+) -> None:
     """Reject poor-quality archives from warehouse replay without deleting them.
 
     V2 thresholds are read from the checksum-verified replay contract.
@@ -438,6 +444,35 @@ def validate_warehouse_eligibility(archives: list[SnapshotArchive]) -> None:
         raise ValueError("Warehouse quality gate received no archives.")
 
     previous_counts: dict[str, tuple[int, str]] = {}
+    for source_name, baseline in (initial_source_baselines or {}).items():
+        if source_name not in SOURCE_NAMES:
+            raise ValueError(
+                f"Unsupported initial quality-baseline source: {source_name!r}"
+            )
+        if (
+            not isinstance(baseline, tuple)
+            or len(baseline) != 2
+            or type(baseline[0]) is not int
+            or baseline[0] < 1
+            or not isinstance(baseline[1], str)
+            or not baseline[1].strip()
+        ):
+            raise ValueError(
+                f"Invalid initial quality baseline for {source_name!r}."
+            )
+        previous_counts[source_name] = baseline
+
+    completed_observations = completed_source_observations or set()
+    for observation in completed_observations:
+        if (
+            not isinstance(observation, tuple)
+            or len(observation) != 2
+            or observation[1] not in SOURCE_NAMES
+            or not isinstance(observation[0], str)
+            or not observation[0]
+        ):
+            raise ValueError("Invalid completed source-observation identity.")
+
     blockers: list[str] = []
 
     for archive in ordered:
@@ -450,6 +485,11 @@ def validate_warehouse_eligibility(archives: list[SnapshotArchive]) -> None:
         for source_name in SOURCE_NAMES:
             source = archive.sources.get(source_name)
             if source is None:
+                continue
+
+            # This source observation is already reflected in the warehouse.
+            # Do not compare it with a newer source-specific quality baseline.
+            if (archive.snapshot_id, source_name) in completed_observations:
                 continue
 
             if source.error:
@@ -466,6 +506,15 @@ def validate_warehouse_eligibility(archives: list[SnapshotArchive]) -> None:
                     f"{archive.snapshot_id}/{source_name}: row count "
                     f"{current_count!r} is not warehouse-eligible"
                 )
+                continue
+
+            # Skip only this source observation. In particular, do not advance
+            # its previous-count baseline; the next valid observation must be
+            # compared with the preceding non-excluded observation.
+            if source_exclusions and (
+                archive.snapshot_id,
+                source_name,
+            ) in source_exclusions:
                 continue
 
             if archive.format_version != 2:

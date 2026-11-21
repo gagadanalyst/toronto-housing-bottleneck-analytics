@@ -101,6 +101,28 @@ def test_quality_gate_uses_v1_archive_as_previous_v2_row_baseline():
         validate_warehouse_eligibility([previous, current])
 
 
+def test_excluded_source_does_not_advance_its_quality_baseline():
+    baseline = _archive(
+        1, _counts(100, 100), minimum=50, maximum_change=20
+    )
+    excluded = _archive(
+        2, _counts(1, 105), minimum=50, maximum_change=20
+    )
+    following = _archive(
+        3, _counts(110, 110), minimum=50, maximum_change=20
+    )
+
+    validate_warehouse_eligibility(
+        [baseline, excluded, following],
+        source_exclusions={
+            ("snapshot-2", "active_permits"): {
+                "archive_sha256": "a" * 64,
+                "reason": "test exclusion",
+            }
+        },
+    )
+
+
 def test_quality_gate_rejects_zero_row_v2_source():
     archive = _archive(1, _counts(0))
     with pytest.raises(ValueError, match="not warehouse-eligible"):
@@ -131,10 +153,10 @@ def test_full_history_quality_gate_runs_before_candidate_open():
     preflight = source[start:end]
 
     assert "validate_inventory_archives" in preflight
-    assert "validate_warehouse_eligibility(archives)" in preflight
+    assert "source_exclusions=source_exclusions" in preflight
 
     run_body = source[source.index("def run(") :]
-    assert run_body.index("_validate_full_history_inventory(args)") < run_body.index(
+    assert run_body.index("_validate_full_history_inventory(args, source_exclusions)") < run_body.index(
         "target = _build_target(args)"
     )
 
@@ -221,3 +243,49 @@ def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():
         'run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"'
         in promotion
     )
+
+
+
+def test_quality_gate_uses_source_specific_baselines_and_skips_loaded_observations():
+    already_loaded = _archive(
+        2,
+        _counts(50, 100),
+        maximum_change=20,
+    )
+    pending = _archive(
+        3,
+        _counts(110, 220),
+        maximum_change=20,
+    )
+
+    validate_warehouse_eligibility(
+        [already_loaded, pending],
+        initial_source_baselines={
+            "active_permits": (100, "active-reference"),
+            "cleared_permits": (200, "cleared-reference"),
+        },
+        completed_source_observations={
+            ("snapshot-2", "active_permits"),
+            ("snapshot-2", "cleared_permits"),
+        },
+    )
+
+
+def test_quality_gate_applies_each_source_change_limit_to_its_own_baseline():
+    pending = _archive(
+        3,
+        _counts(110, 250),
+        maximum_change=20,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cleared_permits.*exceeding the contract maximum",
+    ):
+        validate_warehouse_eligibility(
+            [pending],
+            initial_source_baselines={
+                "active_permits": (100, "active-reference"),
+                "cleared_permits": (200, "cleared-reference"),
+            },
+        )

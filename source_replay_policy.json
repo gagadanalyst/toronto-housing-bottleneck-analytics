@@ -1,0 +1,11 @@
+{
+  "policy_version": 1,
+  "exclusions": [
+    {
+      "snapshot_id": "c555a0a2ac48471abe2f8365c36e0ee4",
+      "source_name": "active_permits",
+      "archive_sha256": "8644e7979f021bab85ab8e2171c619c5627e6ab65ea56b6f6a5e583472b0a25e",
+      "reason": "Transient CKAN source undercount"
+    }
+  ]
+}

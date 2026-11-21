@@ -142,6 +142,57 @@ def test_coordinator_persists_each_source_status_to_candidate_ledger(
     assert target.snapshot_status("s1", "cleared_permits") == "succeeded"
 
 
+def test_source_exclusion_skips_active_but_still_loads_cleared(
+    tmp_path, monkeypatch
+):
+    archives = [_archive("s1", 1), _archive("s2", 2)]
+    target = _PersistentTarget()
+
+    monkeypatch.setattr(
+        replay_targets,
+        "extract_source",
+        lambda archive, source, destination: (
+            Path(destination) / f"{source}.parquet"
+        ),
+    )
+
+    exclusions = {
+        ("s1", "active_permits"): {
+            "snapshot_id": "s1",
+            "source_name": "active_permits",
+            "archive_sha256": archives[0].archive_sha256,
+            "reason": "test source exclusion",
+        }
+    }
+
+    report = replay_targets.replay_backend(
+        archives,
+        source_configs={
+            "active_permits": _config(),
+            "cleared_permits": _config(),
+        },
+        target=target,
+        ledger_path=tmp_path / "ledger.sqlite",
+        staging_root=tmp_path / "staging",
+        source_exclusions=exclusions,
+    )
+
+    assert report["status"] == "passed"
+    assert target.snapshot_status("s1", "active_permits") == "excluded"
+    assert target.snapshot_status("s1", "cleared_permits") == "succeeded"
+    assert ("active_permits", "s1") not in target.loaded
+    assert ("cleared_permits", "s1") in target.loaded
+    assert ("active_permits", "s2") in target.loaded
+    assert report["source_exclusions"] == [
+        {
+            "snapshot_id": "s1",
+            "source_name": "active_permits",
+            "archive_sha256": archives[0].archive_sha256,
+            "reason": "test source exclusion",
+        }
+    ]
+
+
 def test_duckdb_candidate_must_be_inside_recovery_root(tmp_path):
     root = tmp_path / "recovery"
     assert (
