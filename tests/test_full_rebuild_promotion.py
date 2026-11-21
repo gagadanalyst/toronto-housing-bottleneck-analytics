@@ -93,6 +93,7 @@ def _complete_duckdb_report():
             "status": "passed",
             "sources": {source: dict(metrics) for source in sources},
         },
+        "source_exclusions": [],
         "ledger_entries": [
             {
                 **identity,
@@ -438,11 +439,13 @@ def test_snowflake_promotion_summary_requires_quarantine_counts(tmp_path):
         snapshot_count_discovered=1,
         snapshot_count_selected=1,
     )
+    report["source_exclusions"] = []
     report["ledger_entries"] = [
         {
             "snapshot_id": "123:1",
             "source_name": source,
             "status": "succeeded",
+            "warehouse_status": "succeeded",
             "run_id": "123",
             "run_attempt": 1,
             "source_commit": "a" * 40,

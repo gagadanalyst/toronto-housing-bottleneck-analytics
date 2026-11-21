@@ -23,6 +23,10 @@ from scripts.replay_targets import (
     validation_queries,
 )
 from scripts.snowflake_candidate_utils import decode_state, rebase_pipeline_state
+from scripts.source_replay_policy import (
+    load_source_replay_policy,
+    validate_report_source_exclusions,
+)
 
 TABLES = {
     "RAW_ACTIVE_PERMITS": ("PERMIT_NUM", "REVISION_NUM", "PERMIT_TYPE"),
@@ -81,7 +85,10 @@ def _assert_schema_owner(cursor, schema: str) -> None:
 
 
 def _expected_ledger_from_summary(
-    path: Path, run_id: str
+    path: Path,
+    run_id: str,
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, dict[str, object]]:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
@@ -130,6 +137,10 @@ def _expected_ledger_from_summary(
         raise ValueError(
             "Snowflake summary must contain two source ledger entries per archive."
         )
+    warehouse_statuses = validate_report_source_exclusions(
+        report,
+        source_exclusions or {},
+    )
     expected: dict[str, dict[str, object]] = {}
     for item in records:
         if not isinstance(item, dict):
@@ -167,7 +178,10 @@ def _expected_ledger_from_summary(
                 f"Snowflake replay ledger entry lacks immutable identity "
                 f"or quarantine evidence: {key}."
             )
-        expected[key] = item
+        expected[key] = {
+            **item,
+            "warehouse_status": warehouse_statuses[(snapshot_id, source)],
+        }
     wanted = {
         f"{item.get('snapshot_id')}|{source}"
         for item in snapshots
@@ -320,14 +334,25 @@ def _validate_schema(
                 f"Duplicate or unexpected Snowflake snapshot ledger identity: {key}."
             )
         observed_keys.add(key)
-        if str(row[4]).lower() != "succeeded":
+        item = expected_ledger.get(key) if expected_ledger is not None else None
+        if expected_ledger is not None and item is None:
+            raise RuntimeError(f"Unexpected Snowflake RAW ledger entry: {key}.")
+
+        expected_status = (
+            str(item["warehouse_status"]) if item is not None else "succeeded"
+        )
+        observed_status = str(row[4]).lower()
+        if (
+            expected_status not in {"succeeded", "excluded"}
+            or observed_status != expected_status
+        ):
             raise RuntimeError(
-                f"Snowflake snapshot ledger entry is not succeeded: {key}."
+                f"Snowflake snapshot ledger status differs from replay evidence "
+                f"for {key}: expected={expected_status!r}, "
+                f"observed={observed_status!r}."
             )
-        if expected_ledger is not None:
-            item = expected_ledger.get(key)
-            if item is None:
-                raise RuntimeError(f"Unexpected Snowflake RAW ledger entry: {key}.")
+
+        if item is not None:
             comparisons = (
                 (run_id, str(item["run_id"])),
                 (attempt, int(item["run_attempt"])),
@@ -423,6 +448,7 @@ def promote(
     confirmed: bool,
     summary_path: Path | None = None,
     expected_ledger: dict[str, dict[str, object]] | None = None,
+    source_policy_path: Path = Path("source_replay_policy.json"),
 ) -> None:
     from scripts.snowflake_operations import require_snowflake_operations_enabled
 
@@ -446,7 +472,12 @@ def promote(
         raise ValueError(
             "The full-history replay summary is required for provenance validation."
         )
-    expected_ledger = _expected_ledger_from_summary(summary_path, expected_run_id)
+    source_exclusions = load_source_replay_policy(source_policy_path)
+    expected_ledger = _expected_ledger_from_summary(
+        summary_path,
+        expected_run_id,
+        source_exclusions=source_exclusions,
+    )
     if len(expected_ledger) != expected_snapshots * 2:
         raise ValueError(
             "Expected snapshot count differs from full-history summary ledger size."
@@ -561,6 +592,11 @@ def main() -> int:
     parser.add_argument("--source-run-id", required=True)
     parser.add_argument("--expected-snapshots", required=True, type=int)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument(
+        "--source-policy",
+        type=Path,
+        default=Path("source_replay_policy.json"),
+    )
     parser.add_argument("--confirm-full-history", action="store_true")
     args = parser.parse_args()
     uri = os.environ.get("SNOWFLAKE_DLT_CONNECTION", "")
@@ -574,6 +610,7 @@ def main() -> int:
             args.expected_snapshots,
             confirmed=args.confirm_full_history,
             summary_path=args.summary,
+            source_policy_path=args.source_policy,
         )
         return 0
     except Exception as exc:

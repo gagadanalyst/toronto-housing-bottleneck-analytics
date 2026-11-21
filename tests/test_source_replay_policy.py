@@ -4,6 +4,7 @@ import pytest
 
 from scripts.source_replay_policy import (
     load_source_replay_policy,
+    validate_report_source_exclusions,
     validate_source_replay_policy,
 )
 
@@ -77,3 +78,89 @@ def test_full_inventory_requires_every_policy_exclusion():
 
     with pytest.raises(ValueError, match="missing policy exclusions"):
         validate_source_replay_policy([], exclusions, require_all=True)
+
+
+def test_summary_exclusion_requires_matching_policy_and_warehouse_status():
+    exclusion = _record()
+    report = {
+        "history_scope": "full",
+        "snapshots": [{"snapshot_id": "snapshot-a"}],
+        "source_exclusions": [exclusion],
+        "ledger_entries": [
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "active_permits",
+                "warehouse_status": "excluded",
+                "archive_sha256": "a" * 64,
+            },
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "cleared_permits",
+                "warehouse_status": "succeeded",
+                "archive_sha256": "a" * 64,
+            },
+        ],
+    }
+    policy = {("snapshot-a", "active_permits"): exclusion}
+
+    statuses = validate_report_source_exclusions(report, policy)
+
+    assert statuses == {
+        ("snapshot-a", "active_permits"): "excluded",
+        ("snapshot-a", "cleared_permits"): "succeeded",
+    }
+
+
+def test_summary_rejects_excluded_source_without_policy():
+    exclusion = _record()
+    report = {
+        "history_scope": "full",
+        "snapshots": [{"snapshot_id": "snapshot-a"}],
+        "source_exclusions": [exclusion],
+        "ledger_entries": [
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "active_permits",
+                "warehouse_status": "excluded",
+                "archive_sha256": "a" * 64,
+            },
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "cleared_permits",
+                "warehouse_status": "succeeded",
+                "archive_sha256": "a" * 64,
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="undeclared or mismatched exclusion"):
+        validate_report_source_exclusions(report, {})
+
+
+def test_summary_rejects_policy_exclusion_that_was_loaded():
+    exclusion = _record()
+    report = {
+        "history_scope": "full",
+        "snapshots": [{"snapshot_id": "snapshot-a"}],
+        "source_exclusions": [exclusion],
+        "ledger_entries": [
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "active_permits",
+                "warehouse_status": "succeeded",
+                "archive_sha256": "a" * 64,
+            },
+            {
+                "snapshot_id": "snapshot-a",
+                "source_name": "cleared_permits",
+                "warehouse_status": "succeeded",
+                "archive_sha256": "a" * 64,
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="warehouse status"):
+        validate_report_source_exclusions(
+            report,
+            {("snapshot-a", "active_permits"): exclusion},
+        )
