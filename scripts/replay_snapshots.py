@@ -377,7 +377,6 @@ def _validate_incremental_quality_baseline(
     return record
 
 
-
 def _latest_successful_source_records(
     records: list[dict[str, Any]],
     source_exclusions: dict[tuple[str, str], dict[str, str]],
@@ -485,10 +484,7 @@ def _validate_incremental_source_quality_baseline(
             f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
             f"is invalid: {detail}"
         )
-    if (
-        type(source.row_count) is not int
-        or source.row_count < 1
-    ):
+    if type(source.row_count) is not int or source.row_count < 1:
         raise RuntimeError(
             f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
             "has an invalid row count."
@@ -686,13 +682,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 archive.snapshot_id
                 for archive in pending_archives
                 if (
-                    round(
-                        archive.sources[source_name].extracted_at.timestamp(), 6
-                    ),
+                    round(archive.sources[source_name].extracted_at.timestamp(), 6),
                     int(archive.run_id),
                     int(archive.run_attempt),
                     archive.snapshot_id,
-                ) < source_reference_order
+                )
+                < source_reference_order
                 and (archive.snapshot_id, source_name)
                 not in completed_source_observations
                 and (archive.snapshot_id, source_name) not in source_exclusions
@@ -727,9 +722,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "archive_sha256": source_baseline_archives[
                         source_name
                     ].archive_sha256,
-                    "row_count": source_baseline_archives[
-                        source_name
-                    ].sources[source_name].row_count,
+                    "row_count": source_baseline_archives[source_name]
+                    .sources[source_name]
+                    .row_count,
                 }
                 for source_name in SOURCE_NAMES
             },
@@ -783,7 +778,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode == "incremental":
         # An exclusion cannot retroactively remove an observation already
         # loaded into this candidate. A fresh full-history rebuild is required.
-        for (snapshot_id, source_name) in source_exclusions:
+        for snapshot_id, source_name in source_exclusions:
             if target.snapshot_status(snapshot_id, source_name) == "succeeded":
                 raise RuntimeError(
                     "Mode 1 cannot apply a source exclusion retroactively to "

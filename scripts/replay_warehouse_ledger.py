@@ -263,10 +263,7 @@ def validate_canonical_baseline(
                 f"for each source; found {sources}."
             )
 
-        if any(
-            str(row[5]).lower() not in {"succeeded", "excluded"}
-            for row in entries
-        ):
+        if any(str(row[5]).lower() not in {"succeeded", "excluded"} for row in entries):
             raise RuntimeError(
                 f"Both sources must have succeeded or been excluded "
                 f"for snapshot {snapshot_id}."

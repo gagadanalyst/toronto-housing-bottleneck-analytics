@@ -1245,9 +1245,7 @@ def replay_backend(
             warehouse_status = getattr(target, "snapshot_status", lambda *_: None)(
                 archive.snapshot_id, source_name
             )
-            exclusion = source_exclusions.get(
-                (archive.snapshot_id, source_name)
-            )
+            exclusion = source_exclusions.get((archive.snapshot_id, source_name))
 
             # Never accept a persisted exclusion that is absent from policy.
             if warehouse_status == "excluded" and exclusion is None:
@@ -1318,9 +1316,7 @@ def replay_backend(
                     )
                     break
 
-                set_snapshot_status = getattr(
-                    target, "set_snapshot_status", None
-                )
+                set_snapshot_status = getattr(target, "set_snapshot_status", None)
                 if not callable(set_snapshot_status):
                     stream["blocked"].append(
                         {
@@ -1357,9 +1353,7 @@ def replay_backend(
                 )
 
                 try:
-                    set_snapshot_status(
-                        archive, source_name, "loading"
-                    )
+                    set_snapshot_status(archive, source_name, "loading")
                     # Exclusion skips loading, not archive-contract validation.
                     validate_source_contract(
                         archive,

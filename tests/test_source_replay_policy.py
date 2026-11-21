@@ -32,15 +32,14 @@ def test_loads_valid_source_replay_policy(tmp_path):
             }
           ]
         }
-        """ % ("a" * 64),
+        """
+        % ("a" * 64),
         encoding="utf-8",
     )
 
     result = load_source_replay_policy(path)
 
-    assert result == {
-        ("snapshot-a", "active_permits"): _record()
-    }
+    assert result == {("snapshot-a", "active_permits"): _record()}
 
 
 def test_rejects_duplicate_source_exclusions(tmp_path):
@@ -67,18 +66,14 @@ def test_rejects_archive_checksum_mismatch():
         snapshot_id="snapshot-a",
         archive_sha256="b" * 64,
     )
-    exclusions = {
-        ("snapshot-a", "active_permits"): _record()
-    }
+    exclusions = {("snapshot-a", "active_permits"): _record()}
 
     with pytest.raises(ValueError, match="checksum mismatch"):
         validate_source_replay_policy([archive], exclusions)
 
 
 def test_full_inventory_requires_every_policy_exclusion():
-    exclusions = {
-        ("snapshot-a", "active_permits"): _record()
-    }
+    exclusions = {("snapshot-a", "active_permits"): _record()}
 
     with pytest.raises(ValueError, match="missing policy exclusions"):
         validate_source_replay_policy([], exclusions, require_all=True)

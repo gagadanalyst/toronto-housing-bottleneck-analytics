@@ -285,9 +285,7 @@ def _validate_report(
     if not isinstance(selected_records, list):
         raise ValueError(f"{backend} report snapshots must be a list.")
     selected_ids = {
-        item.get("snapshot_id")
-        for item in selected_records
-        if isinstance(item, dict)
+        item.get("snapshot_id") for item in selected_records if isinstance(item, dict)
     }
 
     expected_report_exclusions = {
@@ -295,16 +293,12 @@ def _validate_report(
     }
     report_exclusions = report.get("source_exclusions", [])
     if not isinstance(report_exclusions, list):
-        raise ValueError(
-            f"{backend} source_exclusions evidence must be a list."
-        )
+        raise ValueError(f"{backend} source_exclusions evidence must be a list.")
 
     actual_report_exclusions = set()
     for item in report_exclusions:
         if not isinstance(item, dict):
-            raise ValueError(
-                f"{backend} source exclusion evidence is invalid."
-            )
+            raise ValueError(f"{backend} source exclusion evidence is invalid.")
         key = (item.get("snapshot_id"), item.get("source_name"))
         policy_entry = source_exclusions.get(key)
         if (
@@ -484,12 +478,8 @@ def validate_reports(
     """Validate each backend and require identical successful archive coverage."""
     source_exclusions = source_exclusions or {}
     checked = {
-        "duckdb": _validate_report(
-            duckdb_report, "duckdb", source_exclusions
-        ),
-        "snowflake": _validate_report(
-            snowflake_report, "snowflake", source_exclusions
-        ),
+        "duckdb": _validate_report(duckdb_report, "duckdb", source_exclusions),
+        "snowflake": _validate_report(snowflake_report, "snowflake", source_exclusions),
     }
     duck_scope = _validate_scope(duckdb_report, "duckdb")
     snow_scope = _validate_scope(snowflake_report, "snowflake")

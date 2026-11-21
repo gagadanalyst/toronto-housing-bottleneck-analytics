@@ -142,18 +142,14 @@ def test_coordinator_persists_each_source_status_to_candidate_ledger(
     assert target.snapshot_status("s1", "cleared_permits") == "succeeded"
 
 
-def test_source_exclusion_skips_active_but_still_loads_cleared(
-    tmp_path, monkeypatch
-):
+def test_source_exclusion_skips_active_but_still_loads_cleared(tmp_path, monkeypatch):
     archives = [_archive("s1", 1), _archive("s2", 2)]
     target = _PersistentTarget()
 
     monkeypatch.setattr(
         replay_targets,
         "extract_source",
-        lambda archive, source, destination: (
-            Path(destination) / f"{source}.parquet"
-        ),
+        lambda archive, source, destination: Path(destination) / f"{source}.parquet",
     )
 
     exclusions = {

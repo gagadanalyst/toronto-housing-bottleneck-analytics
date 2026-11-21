@@ -907,7 +907,6 @@ def test_rebuild_inventory_gate_runs_before_candidate_open(tmp_path, monkeypatch
         replay_snapshots.run(args)
 
 
-
 def test_latest_successful_source_records_uses_independent_non_excluded_rows():
     records = []
 

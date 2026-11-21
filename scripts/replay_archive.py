@@ -457,9 +457,7 @@ def validate_warehouse_eligibility(
             or not isinstance(baseline[1], str)
             or not baseline[1].strip()
         ):
-            raise ValueError(
-                f"Invalid initial quality baseline for {source_name!r}."
-            )
+            raise ValueError(f"Invalid initial quality baseline for {source_name!r}.")
         previous_counts[source_name] = baseline
 
     completed_observations = completed_source_observations or set()
@@ -511,10 +509,14 @@ def validate_warehouse_eligibility(
             # Skip only this source observation. In particular, do not advance
             # its previous-count baseline; the next valid observation must be
             # compared with the preceding non-excluded observation.
-            if source_exclusions and (
-                archive.snapshot_id,
-                source_name,
-            ) in source_exclusions:
+            if (
+                source_exclusions
+                and (
+                    archive.snapshot_id,
+                    source_name,
+                )
+                in source_exclusions
+            ):
                 continue
 
             if archive.format_version != 2:

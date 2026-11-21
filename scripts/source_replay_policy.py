@@ -18,9 +18,7 @@ def load_source_replay_policy(
     try:
         policy = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Cannot read source replay policy: {path}"
-        ) from exc
+        raise ValueError(f"Cannot read source replay policy: {path}") from exc
 
     if not isinstance(policy, dict):
         raise ValueError("Source replay policy must be a JSON object.")

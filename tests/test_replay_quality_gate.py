@@ -102,15 +102,9 @@ def test_quality_gate_uses_v1_archive_as_previous_v2_row_baseline():
 
 
 def test_excluded_source_does_not_advance_its_quality_baseline():
-    baseline = _archive(
-        1, _counts(100, 100), minimum=50, maximum_change=20
-    )
-    excluded = _archive(
-        2, _counts(1, 105), minimum=50, maximum_change=20
-    )
-    following = _archive(
-        3, _counts(110, 110), minimum=50, maximum_change=20
-    )
+    baseline = _archive(1, _counts(100, 100), minimum=50, maximum_change=20)
+    excluded = _archive(2, _counts(1, 105), minimum=50, maximum_change=20)
+    following = _archive(3, _counts(110, 110), minimum=50, maximum_change=20)
 
     validate_warehouse_eligibility(
         [baseline, excluded, following],
@@ -156,9 +150,9 @@ def test_full_history_quality_gate_runs_before_candidate_open():
     assert "source_exclusions=source_exclusions" in preflight
 
     run_body = source[source.index("def run(") :]
-    assert run_body.index("_validate_full_history_inventory(args, source_exclusions)") < run_body.index(
-        "target = _build_target(args)"
-    )
+    assert run_body.index(
+        "_validate_full_history_inventory(args, source_exclusions)"
+    ) < run_body.index("target = _build_target(args)")
 
 
 def test_v2_manual_publication_requires_explicit_authorization():
@@ -243,7 +237,6 @@ def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():
         'run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"'
         in promotion
     )
-
 
 
 def test_quality_gate_uses_source_specific_baselines_and_skips_loaded_observations():
