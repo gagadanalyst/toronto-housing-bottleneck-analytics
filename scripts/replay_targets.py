@@ -1163,12 +1163,29 @@ def replay_backend(
     target: Any,
     ledger_path: Path,
     staging_root: Path,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Replay both source streams independently into one isolated backend."""
     if set(source_configs) != set(SOURCE_NAMES):
         raise ValueError(
             "Replay requires exactly the Active and Cleared source configurations."
         )
+
+    source_exclusions = source_exclusions or {}
+
+    # Recheck each declared exclusion against the immutable archive identity.
+    for archive in archives:
+        for source_name in SOURCE_NAMES:
+            exclusion = source_exclusions.get((archive.snapshot_id, source_name))
+            if (
+                exclusion is not None
+                and archive.archive_sha256 != exclusion["archive_sha256"]
+            ):
+                raise ValueError(
+                    "Source exclusion archive checksum mismatch for "
+                    f"{archive.snapshot_id}/{source_name}."
+                )
+
     ledger = ReplayLedger(ledger_path)
     if archives:
         ledger.register_archives(target.backend, archives)
@@ -1177,9 +1194,12 @@ def replay_backend(
             for archive in archives:
                 register_archive(archive)
                 for source_name in SOURCE_NAMES:
-                    if (
-                        target.snapshot_status(archive.snapshot_id, source_name)
-                        == "succeeded"
+                    native_status = target.snapshot_status(
+                        archive.snapshot_id, source_name
+                    )
+                    if native_status == "succeeded" or (
+                        native_status == "excluded"
+                        and (archive.snapshot_id, source_name) in source_exclusions
                     ):
                         if (
                             ledger.status(
@@ -1204,6 +1224,7 @@ def replay_backend(
         "backend": target.backend,
         "status": "passed",
         "sources": {},
+        "source_exclusions": [],
     }
 
     for source_name in SOURCE_NAMES:
@@ -1217,12 +1238,173 @@ def replay_backend(
             "failed": [],
             "blocked": [],
             "loads": [],
+            "excluded": [],
         }
         for archive in ordered:
             status = ledger.status(target.backend, source_name, archive.snapshot_id)
             warehouse_status = getattr(target, "snapshot_status", lambda *_: None)(
                 archive.snapshot_id, source_name
             )
+            exclusion = source_exclusions.get((archive.snapshot_id, source_name))
+
+            # Never accept a persisted exclusion that is absent from policy.
+            if warehouse_status == "excluded" and exclusion is None:
+                stream["blocked"].append(
+                    {
+                        "snapshot_id": archive.snapshot_id,
+                        "reason": (
+                            "Candidate contains a source exclusion that is not "
+                            "declared in the current source replay policy."
+                        ),
+                    }
+                )
+                break
+
+            if exclusion is not None:
+                exclusion_record = {
+                    "snapshot_id": archive.snapshot_id,
+                    "source_name": source_name,
+                    "archive_sha256": archive.archive_sha256,
+                    "reason": exclusion["reason"],
+                }
+
+                # A loaded source cannot be retroactively excluded from SCD2.
+                if warehouse_status == "succeeded":
+                    stream["blocked"].append(
+                        {
+                            "snapshot_id": archive.snapshot_id,
+                            "reason": (
+                                "This source was already loaded into the candidate. "
+                                "Discard the candidate and perform a fresh full "
+                                "rebuild to apply the source exclusion."
+                            ),
+                        }
+                    )
+                    break
+
+                # Idempotent retry: the candidate already records the exclusion.
+                if warehouse_status == "excluded":
+                    if status != "succeeded":
+                        if status != "loading":
+                            ledger.mark(
+                                target.backend,
+                                source_name,
+                                archive.snapshot_id,
+                                "loading",
+                            )
+                        ledger.mark(
+                            target.backend,
+                            source_name,
+                            archive.snapshot_id,
+                            "succeeded",
+                        )
+                    stream["skipped"] += 1
+                    stream["excluded"].append(exclusion_record)
+                    report["source_exclusions"].append(exclusion_record)
+                    continue
+
+                if status == "succeeded":
+                    stream["blocked"].append(
+                        {
+                            "snapshot_id": archive.snapshot_id,
+                            "reason": (
+                                "Run ledger says this source succeeded but the "
+                                "candidate warehouse ledger does not. Refusing "
+                                "to apply an exclusion to an uncertain state."
+                            ),
+                        }
+                    )
+                    break
+
+                set_snapshot_status = getattr(target, "set_snapshot_status", None)
+                if not callable(set_snapshot_status):
+                    stream["blocked"].append(
+                        {
+                            "snapshot_id": archive.snapshot_id,
+                            "reason": (
+                                "Replay target cannot persist source exclusions "
+                                "in its native warehouse ledger."
+                            ),
+                        }
+                    )
+                    break
+
+                try:
+                    ledger.assert_can_load(
+                        target.backend, source_name, archive.snapshot_id
+                    )
+                    assert_can_load = getattr(target, "assert_can_load", None)
+                    if callable(assert_can_load):
+                        assert_can_load(archive, source_name)
+                except Exception as exc:
+                    stream["blocked"].append(
+                        {
+                            "snapshot_id": archive.snapshot_id,
+                            "reason": f"{type(exc).__name__}: {exc}"[:4000],
+                        }
+                    )
+                    break
+
+                ledger.mark(
+                    target.backend,
+                    source_name,
+                    archive.snapshot_id,
+                    "loading",
+                )
+
+                try:
+                    set_snapshot_status(archive, source_name, "loading")
+                    # Exclusion skips loading, not archive-contract validation.
+                    validate_source_contract(
+                        archive,
+                        source_name,
+                        source_configs[source_name],
+                    )
+                    set_snapshot_status(
+                        archive,
+                        source_name,
+                        "excluded",
+                        error=exclusion["reason"],
+                    )
+                    # Run-ledger success means the exclusion decision was processed.
+                    # The native warehouse ledger retains the distinct excluded state.
+                    ledger.mark(
+                        target.backend,
+                        source_name,
+                        archive.snapshot_id,
+                        "succeeded",
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:4000]
+                    try:
+                        set_snapshot_status(
+                            archive,
+                            source_name,
+                            "failed",
+                            error=error,
+                        )
+                    except Exception as status_exc:
+                        error += (
+                            f"; persisting failure status also failed: "
+                            f"{type(status_exc).__name__}: {status_exc}"
+                        )[:1000]
+                    ledger.mark(
+                        target.backend,
+                        source_name,
+                        archive.snapshot_id,
+                        "failed",
+                        error=error,
+                    )
+                    stream["failed"].append(
+                        {"snapshot_id": archive.snapshot_id, "error": error}
+                    )
+                    break
+
+                stream["skipped"] += 1
+                stream["excluded"].append(exclusion_record)
+                report["source_exclusions"].append(exclusion_record)
+                continue
+
             if status == "succeeded" or warehouse_status == "succeeded":
                 if status != "succeeded":
                     ledger.mark(

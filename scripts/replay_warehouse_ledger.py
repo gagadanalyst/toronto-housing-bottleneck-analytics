@@ -263,9 +263,10 @@ def validate_canonical_baseline(
                 f"for each source; found {sources}."
             )
 
-        if any(str(row[5]).lower() != "succeeded" for row in entries):
+        if any(str(row[5]).lower() not in {"succeeded", "excluded"} for row in entries):
             raise RuntimeError(
-                f"Both sources must have succeeded for snapshot {snapshot_id}."
+                f"Both sources must have succeeded or been excluded "
+                f"for snapshot {snapshot_id}."
             )
 
     return {
@@ -285,7 +286,7 @@ def completed_snapshot_ids(target: Any) -> set[str]:
                     FROM "{target.dataset}".toronto_snapshot_ledger
                     GROUP BY snapshot_id
                     HAVING COUNT(DISTINCT source_name) = 2
-                       AND COUNT_IF(LOWER(status) = 'succeeded') = 2'''
+                       AND COUNT_IF(LOWER(status) IN ('succeeded', 'excluded')) = 2'''
             ).fetchall()
         return {str(row[0]) for row in rows}
 
@@ -297,7 +298,7 @@ def completed_snapshot_ids(target: Any) -> set[str]:
                     FROM TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
                     GROUP BY SNAPSHOT_ID
                     HAVING COUNT(DISTINCT SOURCE_NAME) = 2
-                       AND COUNT_IF(LOWER(STATUS) = 'succeeded') = 2'''
+                       AND COUNT_IF(LOWER(STATUS) IN ('succeeded', 'excluded')) = 2'''
             )
             return {str(row[0]) for row in cursor.fetchall()}
         finally:
@@ -424,9 +425,11 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                     _assert_identity(tuple(old), values, "DuckDB")
                     connection.execute(
                         f'''UPDATE "{target.dataset}".toronto_snapshot_ledger
-                            SET status=CASE WHEN LOWER(status)='succeeded'
+                            SET status=CASE
+                                            WHEN LOWER(status) IN ('succeeded', 'excluded')
                                             THEN status ELSE 'pending' END,
-                                error=CASE WHEN LOWER(status)='succeeded'
+                                error=CASE
+                                           WHEN LOWER(status) IN ('succeeded', 'excluded')
                                            THEN error ELSE NULL END,
                                 updated_at=CURRENT_TIMESTAMP,
                                 release_tag=COALESCE(release_tag, ?),
@@ -490,9 +493,11 @@ def register_archive(target: Any, archive: SnapshotArchive) -> None:
                     _assert_identity(tuple(old), values, "Snowflake")
                     cursor.execute(
                         f'''UPDATE TORONTO."{target.schema}".TORONTO_SNAPSHOT_LEDGER
-                            SET STATUS=CASE WHEN LOWER(STATUS)='succeeded'
+                            SET STATUS=CASE
+                                            WHEN LOWER(STATUS) IN ('succeeded', 'excluded')
                                             THEN STATUS ELSE 'pending' END,
-                                ERROR=CASE WHEN LOWER(STATUS)='succeeded'
+                                ERROR=CASE
+                                           WHEN LOWER(STATUS) IN ('succeeded', 'excluded')
                                            THEN ERROR ELSE NULL END,
                                 UPDATED_AT=CURRENT_TIMESTAMP(),
                                 RELEASE_TAG=COALESCE(RELEASE_TAG, %s),
@@ -575,12 +580,15 @@ def _assert_replay_order_rows(
         if snapshot_key == archive.snapshot_id:
             current_status = normalized_status
             continue
-        if other_order < current_order and normalized_status != "succeeded":
+        if other_order < current_order and normalized_status not in {
+            "succeeded",
+            "excluded",
+        }:
             earlier_incomplete.append(f"{snapshot_key}={normalized_status}")
         elif other_order > current_order and normalized_status != "pending":
             later_started.append(f"{snapshot_key}={normalized_status}")
 
-    if current_status == "succeeded":
+    if current_status in {"succeeded", "excluded"}:
         return
     if earlier_incomplete:
         raise RuntimeError(
@@ -643,6 +651,7 @@ def set_snapshot_status(
         "pending",
         "loading",
         "succeeded",
+        "excluded",
         "failed",
     }:
         raise ValueError("Invalid source or snapshot status.")

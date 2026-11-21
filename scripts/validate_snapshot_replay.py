@@ -12,6 +12,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from scripts.source_replay_policy import load_source_replay_policy
+
 SOURCE_NAMES = ("active_permits", "cleared_permits")
 BACKENDS = ("duckdb", "snowflake")
 INTEGRITY_FIELDS = (
@@ -49,8 +51,11 @@ def _load_json(path: Path, backend: str) -> dict[str, Any]:
 
 
 def _validate_report(
-    report: dict[str, Any], backend: str
+    report: dict[str, Any],
+    backend: str,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
+    source_exclusions = source_exclusions or {}
     if report.get("backend") != backend or report.get("status") != "passed":
         raise ValueError(
             f"{backend} replay did not pass or report the expected backend."
@@ -142,10 +147,30 @@ def _validate_report(
             raise ValueError(
                 f"{backend}/{source_name}/{snapshot_id} ledger status is not succeeded."
             )
-        if record.get("warehouse_status") != "succeeded":
+        exclusion = source_exclusions.get((snapshot_id, source_name))
+        warehouse_status = record.get("warehouse_status")
+
+        if warehouse_status == "excluded":
+            if exclusion is None:
+                raise ValueError(
+                    f"{backend}/{source_name}/{snapshot_id} is excluded "
+                    "without a matching source policy entry."
+                )
+            if record.get("archive_sha256") != exclusion["archive_sha256"]:
+                raise ValueError(
+                    f"{backend}/{source_name}/{snapshot_id} exclusion checksum "
+                    "does not match the policy."
+                )
+        elif warehouse_status == "succeeded":
+            if exclusion is not None:
+                raise ValueError(
+                    f"{backend}/{source_name}/{snapshot_id} is declared excluded "
+                    "but was loaded into the warehouse."
+                )
+        else:
             raise ValueError(
                 f"{backend}/{source_name}/{snapshot_id} native warehouse "
-                "ledger status is not succeeded."
+                "ledger status is neither succeeded nor a valid exclusion."
             )
 
         counts = tuple(record.get(field) for field in QUARANTINE_FIELDS[:3])
@@ -240,6 +265,63 @@ def _validate_report(
                     f"{backend} source ledger identity mismatch for "
                     f"{snapshot_id}: {field}."
                 )
+
+    excluded_ledger_keys = {
+        (snapshot_id, source_name)
+        for snapshot_id, sources in grouped.items()
+        for source_name, record in sources.items()
+        if record.get("warehouse_status") == "excluded"
+    }
+
+    if report.get("history_scope") == "full":
+        missing = set(source_exclusions) - excluded_ledger_keys
+        if missing:
+            raise ValueError(
+                f"{backend} full-history report is missing source exclusions: "
+                f"{sorted(missing)}."
+            )
+
+    selected_records = report.get("snapshots", [])
+    if not isinstance(selected_records, list):
+        raise ValueError(f"{backend} report snapshots must be a list.")
+    selected_ids = {
+        item.get("snapshot_id") for item in selected_records if isinstance(item, dict)
+    }
+
+    expected_report_exclusions = {
+        key for key in source_exclusions if key[0] in selected_ids
+    }
+    report_exclusions = report.get("source_exclusions", [])
+    if not isinstance(report_exclusions, list):
+        raise ValueError(f"{backend} source_exclusions evidence must be a list.")
+
+    actual_report_exclusions = set()
+    for item in report_exclusions:
+        if not isinstance(item, dict):
+            raise ValueError(f"{backend} source exclusion evidence is invalid.")
+        key = (item.get("snapshot_id"), item.get("source_name"))
+        policy_entry = source_exclusions.get(key)
+        if (
+            policy_entry is None
+            or item.get("archive_sha256") != policy_entry["archive_sha256"]
+            or item.get("reason") != policy_entry["reason"]
+            or key[0] not in selected_ids
+        ):
+            raise ValueError(
+                f"{backend} report contains an undeclared or mismatched "
+                f"source exclusion: {key}."
+            )
+        if key in actual_report_exclusions:
+            raise ValueError(
+                f"{backend} report contains duplicate source exclusion: {key}."
+            )
+        actual_report_exclusions.add(key)
+
+    if actual_report_exclusions != expected_report_exclusions:
+        raise ValueError(
+            f"{backend} report source exclusions do not match the policy "
+            "for the selected archives."
+        )
 
     return dict(grouped)
 
@@ -376,19 +458,28 @@ def _parse_scope_date(value: str | None, backend: str, label: str) -> date | Non
         ) from exc
 
 
-def validate_backend_report(report: dict[str, Any], backend: str) -> dict[str, Any]:
+def validate_backend_report(
+    report: dict[str, Any],
+    backend: str,
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Validate one backend's archive, ledger, quarantine, SCD2 and scope evidence."""
-    _validate_report(report, backend)
+    _validate_report(report, backend, source_exclusions)
     return _validate_scope(report, backend)
 
 
 def validate_reports(
-    duckdb_report: dict[str, Any], snowflake_report: dict[str, Any]
+    duckdb_report: dict[str, Any],
+    snowflake_report: dict[str, Any],
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Validate each backend and require identical successful archive coverage."""
+    source_exclusions = source_exclusions or {}
     checked = {
-        "duckdb": _validate_report(duckdb_report, "duckdb"),
-        "snowflake": _validate_report(snowflake_report, "snowflake"),
+        "duckdb": _validate_report(duckdb_report, "duckdb", source_exclusions),
+        "snowflake": _validate_report(snowflake_report, "snowflake", source_exclusions),
     }
     duck_scope = _validate_scope(duckdb_report, "duckdb")
     snow_scope = _validate_scope(snowflake_report, "snowflake")
@@ -413,6 +504,11 @@ def validate_reports(
                         f"Archive provenance mismatch for {snapshot_id}/"
                         f"{source_name}: {field}."
                     )
+            if left["warehouse_status"] != right["warehouse_status"]:
+                raise ValueError(
+                    f"Backend exclusion status mismatch for {snapshot_id}/"
+                    f"{source_name}."
+                )
             for field in QUARANTINE_FIELDS:
                 if left[field] != right[field]:
                     raise ValueError(
@@ -464,6 +560,8 @@ def validate_reports(
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
         "quarantine_parity": "passed",
+        "source_exclusion_parity": "passed",
+        "source_exclusions": duckdb_report.get("source_exclusions", []),
         "mode": duck_scope["mode"],
         "history_scope": duck_scope["history_scope"],
         "full_history": duck_scope["full_history"],
@@ -492,12 +590,18 @@ def main() -> int:
     parser.add_argument("--duckdb-summary", type=Path, required=True)
     parser.add_argument("--snowflake-summary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-policy",
+        type=Path,
+        default=Path("source_replay_policy.json"),
+    )
     args = parser.parse_args()
 
     try:
         result = validate_reports(
             _load_json(args.duckdb_summary, "duckdb"),
             _load_json(args.snowflake_summary, "snowflake"),
+            source_exclusions=load_source_replay_policy(args.source_policy),
         )
     except Exception as exc:
         print(f"REPLAY VALIDATION FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)

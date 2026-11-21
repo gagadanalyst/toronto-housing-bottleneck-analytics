@@ -121,7 +121,7 @@ def test_main_reuses_one_local_generation_id_for_run_and_finalization(
     monkeypatch.setattr(
         validate_snapshot_replay,
         "validate_backend_report",
-        lambda report, backend: None,
+        lambda report, backend, **kwargs: None,
     )
 
     assert replay_snapshots.main() == 0
@@ -166,7 +166,7 @@ def test_main_finalizes_generation_after_backend_validation(
     )
     monkeypatch.setattr(replay_snapshots, "run", lambda _args: {"status": "passed"})
 
-    def validate(report, backend):
+    def validate(report, backend, **kwargs):
         assert backend == "duckdb"
         assert ledger.generation_record("duckdb", generation_id)["status"] == "RUNNING"
         if validation_error:
@@ -465,19 +465,41 @@ def test_run_uses_latest_successful_archive_as_quality_baseline_before_target_op
         "source_records": baseline_sources,
     }
 
+    source_ledger_records = [
+        {
+            "source_name": source_name,
+            "snapshot_id": "baseline",
+            "format_version": baseline_archive.format_version,
+            "order_timestamp": baseline_sources[source_name]["order_timestamp"],
+            "run_id": baseline_archive.run_id,
+            "run_attempt": baseline_archive.run_attempt,
+            "source_commit": baseline_archive.source_commit,
+            "archive_sha256": baseline_archive.archive_sha256,
+            "release_tag": baseline_archive.release_tag,
+            "asset_name": baseline_archive.asset_name,
+            "status": "succeeded",
+        }
+        for source_name in ("active_permits", "cleared_permits")
+    ]
+
     local_ledger = SimpleNamespace(
         completed_snapshot_ids=lambda backend: {"baseline"},
         latest_successful_snapshot=lambda backend: baseline_record,
-        snapshot_records=lambda backend: [],
+        snapshot_records=lambda backend: source_ledger_records,
     )
 
     class FakeTarget:
+        backend = "duckdb"
+
         def __init__(self, *args, **kwargs):
             seen["target_mode"] = kwargs["mode"]
             seen["steps"].append("target-open")
 
         def completed_snapshot_ids(self):
             return {"baseline"}
+
+        def snapshot_status(self, snapshot_id, source_name):
+            return seen.get("retroactive_status")
 
     def fake_validate_baseline(target, snapshot_id, snapshot_count):
         seen["steps"].append("baseline-preflight")
@@ -493,9 +515,10 @@ def test_run_uses_latest_successful_archive_as_quality_baseline_before_target_op
         seen["steps"].append("discovery")
         return [pending_archive, baseline_archive]
 
-    def fake_quality_gate(archives):
+    def fake_quality_gate(archives, **kwargs):
         seen["steps"].append("quality")
         seen["quality_ids"] = [item.snapshot_id for item in archives]
+        seen["quality_kwargs"] = kwargs
 
     def fake_replay_backend(archives, **kwargs):
         seen["loaded_ids"] = [item.snapshot_id for item in archives]
@@ -513,6 +536,22 @@ def test_run_uses_latest_successful_archive_as_quality_baseline_before_target_op
     )
     monkeypatch.setattr(replay_snapshots, "ReplayLedger", lambda path: local_ledger)
     monkeypatch.setattr(replay_snapshots, "DuckDBReplayTarget", FakeTarget)
+    monkeypatch.setattr(
+        replay_snapshots.replay_warehouse_ledger,
+        "snapshot_records",
+        lambda target: [
+            {
+                "snapshot_id": "baseline",
+                "source_name": source_name,
+                "status": "succeeded",
+                "quarantined_row_count": 0,
+                "quarantined_bad_row_count": 0,
+                "quarantined_business_key_count": 0,
+                "quarantine_sha256": None,
+            }
+            for source_name in ("active_permits", "cleared_permits")
+        ],
+    )
     monkeypatch.setattr(replay_snapshots, "discover_archives", fake_discover)
     monkeypatch.setattr(
         replay_snapshots, "validate_warehouse_eligibility", fake_quality_gate
@@ -554,7 +593,15 @@ def test_run_uses_latest_successful_archive_as_quality_baseline_before_target_op
     assert seen["target_mode"] == "incremental"
     assert seen["baseline"] == ("42022028625:1", 28)
     assert seen["excluded"] == set()
-    assert seen["quality_ids"] == ["baseline", "pending"]
+    assert seen["quality_ids"] == ["pending"]
+    assert seen["quality_kwargs"]["initial_source_baselines"] == {
+        "active_permits": (100, "baseline"),
+        "cleared_permits": (100, "baseline"),
+    }
+    assert seen["quality_kwargs"]["completed_source_observations"] == {
+        ("baseline", "active_permits"),
+        ("baseline", "cleared_permits"),
+    }
     assert seen["loaded_ids"] == ["pending"]
     assert report["warehouse_quality_preflight"]["status"] == "passed"
     assert report["warehouse_quality_preflight"]["baseline_snapshot_id"] == "baseline"
@@ -568,14 +615,38 @@ def test_run_uses_latest_successful_archive_as_quality_baseline_before_target_op
     assert "has_pending_archives=true" in outputs
     assert "history_scope=incremental" in outputs
 
+    # An already-loaded excluded source must block incremental replay.
+    seen["retroactive_status"] = "succeeded"
+    with pytest.raises(
+        RuntimeError,
+        match="cannot apply a source exclusion retroactively",
+    ):
+        replay_snapshots.run(args)
+
 
 def test_incremental_quality_gate_rejects_missing_baseline_archive_before_target_open(
     tmp_path, monkeypatch
 ):
+    source_ledger_records = [
+        {
+            "source_name": source_name,
+            "snapshot_id": "baseline",
+            "format_version": 2,
+            "order_timestamp": 10.0,
+            "run_id": "10",
+            "run_attempt": 1,
+            "source_commit": "a" * 40,
+            "archive_sha256": "b" * 64,
+            "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+            "asset_name": "toronto-raw-snapshot-v2-bundle-baseline.zip",
+            "status": "succeeded",
+        }
+        for source_name in ("active_permits", "cleared_permits")
+    ]
     local_ledger = SimpleNamespace(
         completed_snapshot_ids=lambda backend: {"baseline"},
         latest_successful_snapshot=lambda backend: {"snapshot_id": "baseline"},
-        snapshot_records=lambda backend: [],
+        snapshot_records=lambda backend: source_ledger_records,
     )
 
     def forbidden(*args, **kwargs):
@@ -663,7 +734,7 @@ def test_rebuild_discovers_all_archives_before_selecting_scope(tmp_path, monkeyp
     monkeypatch.setattr(
         replay_snapshots,
         "_validate_full_history_inventory",
-        lambda args: fake_discover(
+        lambda args, source_exclusions=None: fake_discover(
             args.repository, args.archive_dir, exclude_snapshot_ids=set()
         ),
     )
@@ -808,7 +879,7 @@ def test_rebuild_inventory_gate_runs_before_candidate_open(tmp_path, monkeypatch
     def forbidden(*args, **kwargs):
         raise AssertionError("candidate/config/ledger opened before inventory check")
 
-    def reject_inventory(args):
+    def reject_inventory(args, source_exclusions=None):
         raise ValueError("inventory does not match Release assets")
 
     monkeypatch.setattr(
@@ -834,3 +905,38 @@ def test_rebuild_inventory_gate_runs_before_candidate_open(tmp_path, monkeypatch
     )
     with pytest.raises(ValueError, match="inventory does not match"):
         replay_snapshots.run(args)
+
+
+def test_latest_successful_source_records_uses_independent_non_excluded_rows():
+    records = []
+
+    def add(source_name, snapshot_id, timestamp):
+        records.append(
+            {
+                "source_name": source_name,
+                "snapshot_id": snapshot_id,
+                "status": "succeeded",
+                "order_timestamp": float(timestamp),
+                "run_id": str(timestamp),
+                "run_attempt": 1,
+            }
+        )
+
+    add("active_permits", "active-valid", 10)
+    add("active_permits", "active-excluded-1", 20)
+    add("active_permits", "active-excluded-2", 30)
+    add("cleared_permits", "cleared-valid", 10)
+    add("cleared_permits", "cleared-latest", 30)
+
+    exclusions = {
+        ("active-excluded-1", "active_permits"): {},
+        ("active-excluded-2", "active_permits"): {},
+    }
+
+    selected = replay_snapshots._latest_successful_source_records(
+        records,
+        exclusions,
+    )
+
+    assert selected["active_permits"]["snapshot_id"] == "active-valid"
+    assert selected["cleared_permits"]["snapshot_id"] == "cleared-latest"

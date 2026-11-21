@@ -185,6 +185,44 @@ def test_native_ledger_enforces_chronology_independently_per_source(tmp_path):
         replay_warehouse_ledger.assert_replay_order(target, newer, "cleared_permits")
 
 
+def test_excluded_source_is_terminal_for_completion_and_chronology(tmp_path):
+    target = _target(tmp_path / "candidate.duckdb")
+    older = _archive("snapshot-older", 1, run_id=1001)
+    replay_warehouse_ledger.register_archive(target, older)
+
+    replay_warehouse_ledger.set_snapshot_status(
+        target,
+        older,
+        "active_permits",
+        "excluded",
+        error="Transient CKAN source undercount",
+    )
+    replay_warehouse_ledger.set_snapshot_status(
+        target, older, "cleared_permits", "succeeded"
+    )
+
+    # Re-registering the immutable archive must preserve the exclusion.
+    replay_warehouse_ledger.register_archive(target, older)
+    assert (
+        replay_warehouse_ledger.snapshot_status(
+            target, older.snapshot_id, "active_permits"
+        )
+        == "excluded"
+    )
+
+    assert replay_warehouse_ledger.completed_snapshot_ids(target) == {older.snapshot_id}
+    assert (
+        replay_warehouse_ledger.validate_canonical_baseline(
+            target, older.snapshot_id, 1
+        )["status"]
+        == "passed"
+    )
+
+    newer = _archive("snapshot-newer", 2, run_id=1002)
+    replay_warehouse_ledger.register_archive(target, newer)
+    replay_warehouse_ledger.assert_replay_order(target, newer, "active_permits")
+
+
 def test_native_ledger_blocks_late_older_snapshot_after_newer_write(tmp_path):
     target = _target(tmp_path / "candidate.duckdb")
     older = _archive("snapshot-older", 1, run_id=1001)

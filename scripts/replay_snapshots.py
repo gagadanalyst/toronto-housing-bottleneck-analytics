@@ -31,6 +31,10 @@ from scripts.snapshot_inventory import (
     validate_inventory_archives,
     validate_inventory_assets,
 )
+from scripts.source_replay_policy import (
+    load_source_replay_policy,
+    validate_source_replay_policy,
+)
 
 V1_TAG = re.compile(r"toronto-raw-snapshot-archive-\d{4}-\d{2}\Z")
 V2_TAG = re.compile(r"toronto-raw-snapshot-v2-archive-\d{4}-\d{2}\Z")
@@ -373,8 +377,146 @@ def _validate_incremental_quality_baseline(
     return record
 
 
-def _validate_full_history_inventory(args: argparse.Namespace) -> list[SnapshotArchive]:
+def _latest_successful_source_records(
+    records: list[dict[str, Any]],
+    source_exclusions: dict[tuple[str, str], dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Choose the newest successful, non-excluded observation per source."""
+    latest: dict[str, dict[str, Any]] = {}
+    latest_order: dict[str, tuple[float, int, int, str]] = {}
+
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("Mode 1 source ledger contains an invalid record.")
+
+        source_name = record.get("source_name")
+        snapshot_id = record.get("snapshot_id")
+        if source_name not in SOURCE_NAMES:
+            raise RuntimeError(
+                f"Mode 1 source ledger has an unsupported source: {source_name!r}."
+            )
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise RuntimeError("Mode 1 source ledger contains an invalid snapshot ID.")
+
+        if record.get("status") != "succeeded":
+            continue
+        if (snapshot_id, source_name) in source_exclusions:
+            continue
+
+        try:
+            order = (
+                float(record["order_timestamp"]),
+                int(record["run_id"]),
+                int(record["run_attempt"]),
+                snapshot_id,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "Mode 1 source ledger contains invalid ordering metadata for "
+                f"{source_name}/{snapshot_id}."
+            ) from exc
+
+        if source_name not in latest_order or order > latest_order[source_name]:
+            latest[source_name] = dict(record)
+            latest_order[source_name] = order
+
+    missing = set(SOURCE_NAMES) - set(latest)
+    if missing:
+        raise RuntimeError(
+            "Mode 1 has no successful, non-excluded quality baseline for: "
+            + ", ".join(sorted(missing))
+        )
+
+    return latest
+
+
+def _validate_incremental_source_quality_baseline(
+    archive: SnapshotArchive,
+    source_name: str,
+    record: dict[str, Any],
+) -> None:
+    """Verify one source's reference archive against its successful ledger row."""
+    if source_name not in SOURCE_NAMES:
+        raise ValueError(f"Unsupported quality-baseline source: {source_name!r}.")
+
+    if archive.snapshot_id != record.get("snapshot_id"):
+        raise RuntimeError(
+            f"Mode 1 {source_name} quality archive does not match its ledger record."
+        )
+    if record.get("source_name") != source_name:
+        raise RuntimeError(
+            f"Mode 1 {source_name} quality record has a mismatched source identity."
+        )
+    if record.get("status") != "succeeded":
+        raise RuntimeError(
+            f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
+            "was not successfully loaded."
+        )
+
+    identity_fields = (
+        "format_version",
+        "run_id",
+        "run_attempt",
+        "source_commit",
+        "archive_sha256",
+        "release_tag",
+        "asset_name",
+    )
+    integer_fields = {"format_version", "run_attempt"}
+
+    for field in identity_fields:
+        actual = getattr(archive, field)
+        expected = record.get(field)
+        if field in integer_fields:
+            matches = int(actual) == int(expected)
+        else:
+            matches = str(actual) == str(expected)
+        if not matches:
+            raise RuntimeError(
+                f"Mode 1 {source_name} quality reference {archive.snapshot_id} "
+                f"disagrees with its ledger field {field!r}."
+            )
+
+    source = archive.sources.get(source_name)
+    if source is None or source.error:
+        detail = source.error if source is not None else "source is missing"
+        raise RuntimeError(
+            f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
+            f"is invalid: {detail}"
+        )
+    if type(source.row_count) is not int or source.row_count < 1:
+        raise RuntimeError(
+            f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
+            "has an invalid row count."
+        )
+
+    try:
+        expected_timestamp = round(float(record["order_timestamp"]), 6)
+        actual_timestamp = round(source.extracted_at.timestamp(), 6)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
+            "has invalid extraction timestamp evidence."
+        ) from exc
+
+    if actual_timestamp != expected_timestamp:
+        raise RuntimeError(
+            f"Mode 1 {source_name}/{archive.snapshot_id} quality reference "
+            "does not match its persisted source extraction timestamp."
+        )
+
+
+def _validate_full_history_inventory(
+    args: argparse.Namespace,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
+) -> list[SnapshotArchive]:
     """Verify the complete Release set and every archive before opening a candidate."""
+    if source_exclusions is None:
+        policy_path = Path(
+            getattr(args, "source_policy", Path("source_replay_policy.json"))
+        )
+        source_exclusions = load_source_replay_policy(policy_path)
+
     inventory = load_inventory(args.inventory, args.repository)
     assets = list_release_assets(args.repository)
     validate_inventory_assets(inventory, assets)
@@ -384,16 +526,35 @@ def _validate_full_history_inventory(args: argparse.Namespace) -> list[SnapshotA
         exclude_snapshot_ids=set(),
     )
     validate_inventory_archives(inventory, archives, args.repository)
+
+    # Require every policy entry to identify an archive in the complete
+    # immutable inventory, and verify its archive SHA-256.
+    validate_source_replay_policy(
+        archives,
+        source_exclusions,
+        require_all=True,
+    )
+
     # Reject poor-quality source history before either backend candidate is opened.
-    validate_warehouse_eligibility(archives)
+    validate_warehouse_eligibility(
+        archives,
+        source_exclusions=source_exclusions,
+    )
     return archives
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     # Validate scope and source quality before opening a backend candidate.
     _validate_selection_request(args)
+    source_policy_path = Path(
+        getattr(args, "source_policy", Path("source_replay_policy.json"))
+    )
+    source_exclusions = load_source_replay_policy(source_policy_path)
+
     prevalidated_rebuild_archives = (
-        _validate_full_history_inventory(args) if args.mode == "rebuild" else None
+        _validate_full_history_inventory(args, source_exclusions)
+        if args.mode == "rebuild"
+        else None
     )
 
     ledger = ReplayLedger(args.ledger)
@@ -409,12 +570,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         baseline_snapshot_id = str(baseline_record["snapshot_id"])
+
+        # The newest fully completed bundle remains the canonical Mode 1
+        # baseline, but each source can have a different last valid observation.
+        source_ledger_records = ledger.snapshot_records(args.backend)
+        source_baseline_records = _latest_successful_source_records(
+            source_ledger_records,
+            source_exclusions,
+        )
+        source_baseline_ids = {
+            record["snapshot_id"] for record in source_baseline_records.values()
+        }
+        reference_ids = {baseline_snapshot_id, *source_baseline_ids}
+
         archives_with_baseline = discover_archives(
             args.repository,
             args.archive_dir,
-            # Download the last successful archive again solely as a quality
+            # Re-fetch the common bundle baseline and each source-specific
             # reference. Other fully completed snapshots remain excluded.
-            exclude_snapshot_ids=run_completed - {baseline_snapshot_id},
+            exclude_snapshot_ids=run_completed - reference_ids,
+        )
+        validate_source_replay_policy(
+            archives_with_baseline,
+            source_exclusions,
         )
 
         baseline_matches = [
@@ -432,10 +610,50 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         baseline_archive = baseline_matches[0]
         _validate_incremental_quality_baseline(baseline_archive, baseline_record)
 
+        source_baseline_archives: dict[str, SnapshotArchive] = {}
+        initial_source_baselines: dict[str, tuple[int, str]] = {}
+
+        for source_name in SOURCE_NAMES:
+            source_record = source_baseline_records[source_name]
+            source_snapshot_id = source_record["snapshot_id"]
+            matches = [
+                archive
+                for archive in archives_with_baseline
+                if archive.snapshot_id == source_snapshot_id
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Mode 1 {source_name} quality-reference archive "
+                    f"{source_snapshot_id!r} must be present exactly once in "
+                    f"GitHub Releases; found {len(matches)}."
+                )
+
+            source_archive = matches[0]
+            _validate_incremental_source_quality_baseline(
+                source_archive,
+                source_name,
+                source_record,
+            )
+            source_baseline_archives[source_name] = source_archive
+            initial_source_baselines[source_name] = (
+                source_archive.sources[source_name].row_count,
+                source_snapshot_id,
+            )
+
+        # A successful source stream can be ahead of the latest fully
+        # completed bundle. Such observations are already in the candidate:
+        # keep their sibling pending, but do not re-evaluate the loaded side.
+        completed_source_observations = {
+            (record["snapshot_id"], record["source_name"])
+            for record in source_ledger_records
+            if record.get("status") == "succeeded"
+        }
+
         pending_archives = [
             archive
             for archive in archives_with_baseline
             if archive.snapshot_id != baseline_snapshot_id
+            and archive.snapshot_id not in run_completed
         ]
         older_pending = [
             archive.snapshot_id
@@ -445,27 +663,93 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if older_pending:
             raise RuntimeError(
                 "Mode 1 found pending archives that do not follow the latest "
-                "successfully loaded baseline: " + ", ".join(sorted(older_pending))
+                "successfully loaded bundle baseline: "
+                + ", ".join(sorted(older_pending))
             )
 
-        quality_archives = [baseline_archive, *pending_archives]
-        validate_warehouse_eligibility(quality_archives)
+        # Do not seed a source from a later successful observation if an
+        # earlier non-excluded observation for that source is still pending.
+        for source_name in SOURCE_NAMES:
+            reference = source_baseline_records[source_name]
+            source_reference_order = (
+                round(float(reference["order_timestamp"]), 6),
+                int(reference["run_id"]),
+                int(reference["run_attempt"]),
+                reference["snapshot_id"],
+            )
 
-        # The reference archive is not replayed a second time.
+            unresolved_older = [
+                archive.snapshot_id
+                for archive in pending_archives
+                if (
+                    round(archive.sources[source_name].extracted_at.timestamp(), 6),
+                    int(archive.run_id),
+                    int(archive.run_attempt),
+                    archive.snapshot_id,
+                )
+                < source_reference_order
+                and (archive.snapshot_id, source_name)
+                not in completed_source_observations
+                and (archive.snapshot_id, source_name) not in source_exclusions
+            ]
+            if unresolved_older:
+                raise RuntimeError(
+                    f"Mode 1 {source_name} has pending observations older than "
+                    f"its selected quality baseline "
+                    f"{source_baseline_records[source_name]['snapshot_id']}: "
+                    + ", ".join(sorted(unresolved_older))
+                )
+
+        if pending_archives:
+            validate_warehouse_eligibility(
+                pending_archives,
+                source_exclusions=source_exclusions,
+                initial_source_baselines=initial_source_baselines,
+                completed_source_observations=completed_source_observations,
+            )
+
         archives_discovered = pending_archives
+        quality_preflight = {
+            "status": "passed",
+            "basis": (
+                "latest_successful_non_excluded_source_observation_plus_pending_archives"
+            ),
+            "baseline_snapshot_id": baseline_snapshot_id,
+            "baseline_archive_sha256": baseline_archive.archive_sha256,
+            "source_baselines": {
+                source_name: {
+                    "snapshot_id": source_baseline_archives[source_name].snapshot_id,
+                    "archive_sha256": source_baseline_archives[
+                        source_name
+                    ].archive_sha256,
+                    "row_count": source_baseline_archives[source_name]
+                    .sources[source_name]
+                    .row_count,
+                }
+                for source_name in SOURCE_NAMES
+            },
+            "completed_source_observations_skipped": [
+                {
+                    "snapshot_id": snapshot_id,
+                    "source_name": source_name,
+                }
+                for snapshot_id, source_name in sorted(
+                    completed_source_observations
+                    & {
+                        (archive.snapshot_id, source_name)
+                        for archive in pending_archives
+                        for source_name in SOURCE_NAMES
+                    }
+                )
+            ],
+            "snapshot_ids_checked": [
+                archive.snapshot_id for archive in pending_archives
+            ],
+        }
         selected_archives, history_scope = select_archives(
             archives_discovered,
             mode=args.mode,
         )
-        quality_preflight = {
-            "status": "passed",
-            "basis": "latest_successful_backend_snapshot_plus_pending_archives",
-            "baseline_snapshot_id": baseline_snapshot_id,
-            "baseline_archive_sha256": baseline_archive.archive_sha256,
-            "snapshot_ids_checked": [
-                archive.snapshot_id for archive in quality_archives
-            ],
-        }
     else:
         if prevalidated_rebuild_archives is None:
             raise RuntimeError("Full-history inventory verification did not run.")
@@ -492,6 +776,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     target_completed = target.completed_snapshot_ids()
 
     if args.mode == "incremental":
+        # An exclusion cannot retroactively remove an observation already
+        # loaded into this candidate. A fresh full-history rebuild is required.
+        for snapshot_id, source_name in source_exclusions:
+            if target.snapshot_status(snapshot_id, source_name) == "succeeded":
+                raise RuntimeError(
+                    "Mode 1 cannot apply a source exclusion retroactively to "
+                    f"{snapshot_id}/{source_name}: the candidate already records "
+                    "that source as succeeded. Perform a fresh full-history "
+                    "rebuild before resuming incremental replay."
+                )
+
         if target_completed != run_completed:
             provenance_only = sorted(run_completed - target_completed)
             candidate_only = sorted(target_completed - run_completed)
@@ -535,6 +830,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             target=target,
             ledger_path=args.ledger,
             staging_root=args.staging_dir,
+            source_exclusions=source_exclusions,
         )
         report.update(
             {
@@ -698,6 +994,12 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("snapshot_inventory.json"),
         help="Versioned inventory required for every full-history rebuild",
     )
+    parser.add_argument(
+        "--source-policy",
+        type=Path,
+        default=Path("source_replay_policy.json"),
+        help="Versioned source-level warehouse replay exclusion policy",
+    )
     parser.add_argument("--config", type=Path, default=Path("open_data_config.yml"))
     parser.add_argument(
         "--archive-dir",
@@ -772,7 +1074,19 @@ def main() -> int:
             # comparison job does not control this backend's generation status.
             from scripts.validate_snapshot_replay import validate_backend_report
 
-            validate_backend_report(report, args.backend)
+            validate_backend_report(
+                report,
+                args.backend,
+                source_exclusions=load_source_replay_policy(
+                    Path(
+                        getattr(
+                            args,
+                            "source_policy",
+                            Path("source_replay_policy.json"),
+                        )
+                    )
+                ),
+            )
             ReplayLedger(args.ledger).finish_generation(
                 args.backend, generation_id, "SUCCEEDED"
             )

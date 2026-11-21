@@ -59,6 +59,11 @@ def _report(backend: str, *, checksum: str = "b" * 64) -> dict:
         "snapshot_count_discovered": 2,
         "snapshot_count_selected": 2,
         "snapshot_count_pending_before_load": 2,
+        "snapshots": [
+            {"snapshot_id": "snapshot-a"},
+            {"snapshot_id": "snapshot-b"},
+        ],
+        "source_exclusions": [],
         "selection": {
             "from_date": None,
             "to_date": None,
@@ -107,6 +112,47 @@ def test_identical_backend_reports_pass_with_complete_ledger_and_history():
         "snapshot-a",
         "snapshot-b",
     ]
+
+
+def test_declared_source_exclusion_is_validated_and_matches_backends():
+    policy_record = {
+        "snapshot_id": "snapshot-a",
+        "source_name": "active_permits",
+        "archive_sha256": "b" * 64,
+        "reason": "Transient CKAN source undercount",
+    }
+    policy = {
+        ("snapshot-a", "active_permits"): policy_record,
+    }
+
+    duckdb = _report("duckdb")
+    snowflake = _report("snowflake")
+
+    for report in (duckdb, snowflake):
+        active = next(
+            row
+            for row in report["ledger_entries"]
+            if row["snapshot_id"] == "snapshot-a"
+            and row["source_name"] == "active_permits"
+        )
+        active["warehouse_status"] = "excluded"
+        report["source_exclusions"] = [policy_record.copy()]
+
+    result = validate_reports(
+        duckdb,
+        snowflake,
+        source_exclusions=policy,
+    )
+    assert result["source_exclusion_parity"] == "passed"
+    assert result["source_exclusions"] == [policy_record]
+
+    snowflake["ledger_entries"][0]["warehouse_status"] = "succeeded"
+    with pytest.raises(ValueError, match="declared excluded but was loaded"):
+        validate_reports(
+            duckdb,
+            snowflake,
+            source_exclusions=policy,
+        )
 
 
 def test_quarantine_evidence_must_match_between_backends():
