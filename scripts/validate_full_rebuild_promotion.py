@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.replay_snapshots import discover_archives
+from scripts.source_replay_policy import load_source_replay_policy
 from scripts.validate_snapshot_replay import (
     _validate_report,
     _validate_scope,
@@ -83,12 +84,19 @@ def validate_full_rebuild(
     duckdb_report: dict[str, Any],
     snowflake_report: dict[str, Any],
     saved_joint: dict[str, Any],
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Retain the existing two-backend validation and parity requirements."""
     _require_full_report(duckdb_report, "duckdb")
     _require_full_report(snowflake_report, "snowflake")
 
-    recomputed = validate_reports(duckdb_report, snowflake_report)
+    source_exclusions = source_exclusions if source_exclusions is not None else {}
+    recomputed = validate_reports(
+        duckdb_report,
+        snowflake_report,
+        source_exclusions=source_exclusions,
+    )
 
     required = {
         "status": "passed",
@@ -99,6 +107,7 @@ def validate_full_rebuild(
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
         "quarantine_parity": "passed",
+        "source_exclusion_parity": "passed",
         "explicit_promotion_required": True,
         "promotion_performed": False,
     }
@@ -138,13 +147,22 @@ def validate_full_rebuild(
     return recomputed
 
 
-def validate_duckdb_only(duckdb_report: dict[str, Any]) -> dict[str, Any]:
+def validate_duckdb_only(
+    duckdb_report: dict[str, Any],
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Validate a complete DuckDB rebuild without requiring Snowflake evidence."""
     _require_full_report(duckdb_report, "duckdb")
 
     # These validators inspect both source ledgers, their archive provenance,
     # snapshot ordering and the detailed SCD2 integrity counters.
-    ledgers_by_snapshot = _validate_report(duckdb_report, "duckdb")
+    source_exclusions = source_exclusions if source_exclusions is not None else {}
+    ledgers_by_snapshot = _validate_report(
+        duckdb_report,
+        "duckdb",
+        source_exclusions,
+    )
     _validate_scope(duckdb_report, "duckdb")
 
     if not isinstance(ledgers_by_snapshot, dict):
@@ -226,6 +244,8 @@ def validate_duckdb_only(duckdb_report: dict[str, Any]) -> dict[str, Any]:
         "archive_provenance": "passed",
         "backend_snapshot_coverage": "not_applicable",
         "scd2_integrity": "passed",
+        "source_exclusion_validation": "passed",
+        "source_exclusions": duckdb_report.get("source_exclusions", []),
         "mode": "rebuild",
         "history_scope": "full",
         "full_history": True,
@@ -286,6 +306,11 @@ def main() -> int:
     parser.add_argument("--duckdb-summary", type=Path, required=True)
     parser.add_argument("--snowflake-summary", type=Path)
     parser.add_argument("--joint-validation", type=Path)
+    parser.add_argument(
+        "--source-policy",
+        type=Path,
+        default=Path("source_replay_policy.json"),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check-current-archives", action="store_true")
     parser.add_argument(
@@ -306,6 +331,7 @@ def main() -> int:
             )
 
         duck = _read(args.duckdb_summary, "DuckDB summary")
+        source_exclusions = load_source_replay_policy(args.source_policy)
 
         if args.policy == "both":
             if args.snowflake_summary is None or args.joint_validation is None:
@@ -314,14 +340,22 @@ def main() -> int:
                 )
             snow = _read(args.snowflake_summary, "Snowflake summary")
             joint = _read(args.joint_validation, "joint validation")
-            result = validate_full_rebuild(duck, snow, joint)
+            result = validate_full_rebuild(
+                duck,
+                snow,
+                joint,
+                source_exclusions=source_exclusions,
+            )
         else:
             if args.snowflake_summary is not None or args.joint_validation is not None:
                 raise ValueError(
                     "Policy 'duckdb-only' must not receive Snowflake or joint "
                     "validation evidence."
                 )
-            result = validate_duckdb_only(duck)
+            result = validate_duckdb_only(
+                duck,
+                source_exclusions=source_exclusions,
+            )
 
         verify_current_archives(
             result,

@@ -128,8 +128,13 @@ def test_full_rebuild_promotion_requires_all_scope_and_joint_fields(monkeypatch)
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
         "quarantine_parity": "passed",
+        "source_exclusion_parity": "passed",
     }
-    monkeypatch.setattr(promotion, "validate_reports", lambda *_args: recomputed)
+    monkeypatch.setattr(
+        promotion,
+        "validate_reports",
+        lambda *_args, **_kwargs: recomputed,
+    )
     saved = dict(recomputed)
     assert promotion.validate_full_rebuild(duck, snow, saved) == recomputed
 
@@ -137,6 +142,52 @@ def test_full_rebuild_promotion_requires_all_scope_and_joint_fields(monkeypatch)
     partial["history_scope"] = "partial"
     with pytest.raises(ValueError, match="full Mode 2"):
         promotion.validate_full_rebuild(partial, snow, saved)
+
+
+def test_full_rebuild_passes_source_policy_to_cross_backend_validation(monkeypatch):
+    duck, snow = _report("duckdb"), _report("snowflake")
+    recomputed = {
+        "status": "passed",
+        "mode": "rebuild",
+        "history_scope": "full",
+        "full_history": True,
+        "explicit_promotion_required": True,
+        "promotion_performed": False,
+        "snapshot_count": 1,
+        "snapshot_count_discovered": 1,
+        "snapshot_count_selected": 1,
+        "snapshots": duck["snapshots"],
+        "backends": {"duckdb": {}, "snowflake": {}},
+        "archive_provenance": "passed",
+        "backend_snapshot_coverage": "identical",
+        "scd2_integrity": "passed",
+        "quarantine_parity": "passed",
+        "source_exclusion_parity": "passed",
+    }
+    observed = {}
+
+    def capture_policy(*_args, **kwargs):
+        observed.update(kwargs)
+        return recomputed
+
+    monkeypatch.setattr(promotion, "validate_reports", capture_policy)
+
+    exclusion = {
+        "snapshot_id": "123:1",
+        "source_name": "active_permits",
+        "archive_sha256": "a" * 64,
+        "reason": "Transient CKAN source undercount",
+    }
+    policy = {("123:1", "active_permits"): exclusion}
+
+    promotion.validate_full_rebuild(
+        duck,
+        snow,
+        dict(recomputed),
+        source_exclusions=policy,
+    )
+
+    assert observed["source_exclusions"] == policy
 
 
 def test_full_rebuild_promotion_rejects_missing_joint_promotion_guard(monkeypatch):
@@ -157,8 +208,13 @@ def test_full_rebuild_promotion_rejects_missing_joint_promotion_guard(monkeypatc
         "backend_snapshot_coverage": "identical",
         "scd2_integrity": "passed",
         "quarantine_parity": "passed",
+        "source_exclusion_parity": "passed",
     }
-    monkeypatch.setattr(promotion, "validate_reports", lambda *_args: recomputed)
+    monkeypatch.setattr(
+        promotion,
+        "validate_reports",
+        lambda *_args, **_kwargs: recomputed,
+    )
     saved = dict(recomputed)
     saved["promotion_performed"] = True
     with pytest.raises(ValueError, match="promotion_performed"):
@@ -261,6 +317,37 @@ def test_duckdb_only_full_rebuild_validates_both_source_ledgers():
     assert result["history_scope"] == "full"
     assert result["source_ledger_entries"] == 2
     assert result["promotion_performed"] is False
+
+
+def test_duckdb_only_validates_policy_bound_source_exclusion():
+    report = _complete_duckdb_report()
+    active = next(
+        item
+        for item in report["ledger_entries"]
+        if item["source_name"] == "active_permits"
+    )
+    active["warehouse_status"] = "excluded"
+
+    exclusion = {
+        "snapshot_id": "123:1",
+        "source_name": "active_permits",
+        "archive_sha256": "b" * 64,
+        "reason": "Test source undercount",
+    }
+    report["source_exclusions"] = [exclusion]
+    policy = {("123:1", "active_permits"): exclusion}
+
+    with pytest.raises(ValueError, match="without a matching source policy entry"):
+        promotion.validate_duckdb_only(report, source_exclusions={})
+
+    result = promotion.validate_duckdb_only(
+        report,
+        source_exclusions=policy,
+    )
+
+    assert result["status"] == "passed"
+    assert result["source_exclusion_validation"] == "passed"
+    assert result["source_exclusions"] == [exclusion]
 
 
 def test_duckdb_only_rejects_partial_history():
