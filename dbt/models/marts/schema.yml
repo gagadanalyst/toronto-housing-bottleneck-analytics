@@ -93,6 +93,33 @@ models:
       permits have not necessarily completed their lifecycle. Their ages
       are right-censored observations and must not be interpreted as
       completed permit durations.
+    semantic_model:
+      enabled: true
+    primary_entity: active_permit_revision
+    agg_time_dimension: application_date
+    metrics:
+      - name: active_permit_revision_count
+        description: Count of current logical Active permit revisions.
+        type: simple
+        agg: sum
+        expr: 1
+      - name: eligible_active_permit_revision_count
+        description: Count of current Active permit revisions eligible for age analysis.
+        type: simple
+        agg: count
+        expr: age_since_application_days
+      - name: median_active_permit_age_days
+        description: Median elapsed calendar-day age of eligible current Active permits; this is right-censored age, not completed lifecycle duration.
+        type: simple
+        agg: median
+        expr: age_since_application_days
+      - name: p90_active_permit_age_days
+        description: 90th percentile elapsed calendar-day age of eligible current Active permits.
+        type: simple
+        agg: percentile
+        expr: age_since_application_days
+        percentile: 90
+        percentile_type: continuous
     columns:
       - name: permit_num
         data_type: VARCHAR
@@ -103,18 +130,25 @@ models:
       - name: permit_type
         data_type: VARCHAR
         description: City-defined permit type; part of the logical permit-revision key.
+        dimension:
+          type: categorical
       - name: builder_name
         data_type: VARCHAR
         description: Builder name consolidated from the current source rows.
       - name: status
         data_type: VARCHAR
         description: Consolidated trimmed source status.
+        dimension:
+          type: categorical
       - name: status_normalized
         data_type: VARCHAR
         description: Lowercase trimmed status used for cohort classification.
       - name: application_date
         data_type: DATE
         description: Consolidated application date; required for age eligibility.
+        granularity: day
+        dimension:
+          type: time
       - name: issued_date
         data_type: DATE
         description: Consolidated issue date, retained for analysis and drill-down.
@@ -167,6 +201,52 @@ models:
       non-null value. Negative lifecycle durations are retained in the raw
       duration columns and excluded from the corresponding analysis-facing
       duration columns. Durations are elapsed calendar days, not business days.
+    semantic_model:
+      enabled: true
+    primary_entity: cleared_permit_revision
+    agg_time_dimension: application_date
+    metrics:
+      - name: cleared_permit_revision_count
+        description: Count of current logical Cleared permit revisions.
+        type: simple
+        agg: sum
+        expr: 1
+      - name: median_application_to_issue_days
+        description: Median non-negative elapsed calendar days from application to issue among records marked Closed.
+        type: simple
+        agg: median
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_issue_days ELSE NULL END"
+      - name: p90_application_to_issue_days
+        description: 90th percentile non-negative elapsed calendar days from application to issue among records marked Closed.
+        type: simple
+        agg: percentile
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_issue_days ELSE NULL END"
+        percentile: 90
+        percentile_type: continuous
+      - name: median_application_to_completion_days
+        description: Median non-negative elapsed calendar days from application to completion among records marked Closed.
+        type: simple
+        agg: median
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_completion_days ELSE NULL END"
+      - name: p90_application_to_completion_days
+        description: 90th percentile non-negative elapsed calendar days from application to completion among records marked Closed.
+        type: simple
+        agg: percentile
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN application_to_completion_days ELSE NULL END"
+        percentile: 90
+        percentile_type: continuous
+      - name: median_issue_to_completion_days
+        description: Median non-negative elapsed calendar days from issue to completion among records marked Closed.
+        type: simple
+        agg: median
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN issue_to_completion_days ELSE NULL END"
+      - name: p90_issue_to_completion_days
+        description: 90th percentile non-negative elapsed calendar days from issue to completion among records marked Closed.
+        type: simple
+        agg: percentile
+        expr: "CASE WHEN LOWER(status) = 'closed' THEN issue_to_completion_days ELSE NULL END"
+        percentile: 90
+        percentile_type: continuous
     columns:
       - name: permit_num
         data_type: VARCHAR
@@ -177,6 +257,8 @@ models:
       - name: permit_type
         data_type: VARCHAR
         description: City permit type; part of the logical permit-revision key.
+        dimension:
+          type: categorical
         data_tests:
           # Purpose: prove every fact permit type has a corresponding dimension row,
           # while the dimension key is unique and non-null.
@@ -208,6 +290,9 @@ models:
       - name: application_date
         data_type: DATE
         description: Application date, published only when every current source row has the same non-null date.
+        granularity: day
+        dimension:
+          type: time
       - name: issued_date
         data_type: DATE
         description: Issue date, published only when every current source row has the same non-null date.
@@ -249,6 +334,8 @@ models:
         description: >-
           Normalized status, published only when all current source rows
           agree on the same non-null value.
+        dimension:
+          type: categorical
       - name: observed_status_values
         data_type: VARCHAR
         description: Distinct normalized status values observed across current
@@ -258,11 +345,14 @@ models:
         description: True when current source rows disagree on status, including null versus non-null.
   - name: dim_date
     description: >-
-      Continuous daily calendar spanning the lifecycle dates observed in the
-      Cleared Permits fact. One row per calendar date.
+      Continuous daily calendar spanning the observed Active and Cleared permit
+      dates through the current date. One row per calendar date.
+    time_spine:
+      standard_granularity_column: date_day
     columns:
       - name: date_day
         description: Calendar date; the dimension's unique key.
+        granularity: day
         data_tests:
           - not_null
           - unique

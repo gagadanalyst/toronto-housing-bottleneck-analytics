@@ -51,10 +51,15 @@ RELEASE_PAGE_URL = (
     "https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/"
     "releases/tag/warehouse-latest"
 )
+METRICFLOW_RELEASE_URL = (
+    "https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/"
+    "releases/download/metrics-latest/toronto-metricflow-results.json"
+)
 DBT_SCHEMA = "analytics"
 CACHE_TTL_SECONDS = 24 * 60 * 60
 NAV = [
     "The story",
+    "Metrics & semantic layer",
     "Active permits",
     "Closed-permit timelines",
     "Data quality & definitions",
@@ -675,7 +680,12 @@ def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, 
         page = st.radio("Explore", NAV, label_visibility="collapsed")
         st.divider()
         st.markdown("**Where the data comes from**")
-        if backend == "snowflake":
+        if page == "Metrics & semantic layer":
+            st.caption(
+                "Displays published MetricFlow results computed against the latest "
+                "DuckDB warehouse; the dashboard reads the versioned result package."
+            )
+        elif backend == "snowflake":
             st.caption(
                 "Reads the dashboard-facing dbt relations in TORONTO.ANALYTICS "
                 "using the configured Snowflake role."
@@ -692,7 +702,7 @@ def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, 
                 "The dashboard uses Toronto Open Data processed by this project's daily pipeline."
             )
         last_successful_refresh_slot = st.empty()
-        if st.button(
+        if page != "Metrics & semantic layer" and st.button(
             "Refresh data now",
             key="refresh_data_button",
             width="stretch",
@@ -711,16 +721,16 @@ def report_sidebar(backend: str, local_duckdb: bool = False) -> tuple[str, Any, 
             st.session_state["refresh_published_data"] = True
             st.rerun()
         loading_slot = st.empty()
-        if backend == "snowflake":
+        if page != "Metrics & semantic layer" and backend == "snowflake":
             st.caption(
                 "Data is cached for up to 24 hours. Refreshing re-queries Snowflake."
             )
-        elif local_duckdb:
+        elif page != "Metrics & semantic layer" and local_duckdb:
             st.caption(
                 "Data is cached for up to 24 hours. Refreshing re-reads the configured "
                 "local DuckDB database."
             )
-        else:
+        elif page != "Metrics & semantic layer":
             st.caption(
                 "Data is cached for up to 24 hours. Refreshing downloads the latest "
                 "published database from GitHub (about 120 MB)."
@@ -1826,6 +1836,252 @@ def quality_page(
     """)
 
 
+@st.cache_data(ttl=900, max_entries=1, show_spinner=False)
+def load_metricflow_results() -> dict[str, Any]:
+    """Load the latest precomputed MetricFlow results from the public Release."""
+    response = requests.get(
+        METRICFLOW_RELEASE_URL,
+        timeout=(10, 30),
+        headers={"User-Agent": "toronto-housing-bottleneck-streamlit/1.0"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("backend") != "duckdb"
+    ):
+        raise RuntimeError(
+            "The published MetricFlow results have an unsupported format."
+        )
+    required = {
+        "active_overall",
+        "active_by_permit_type",
+        "active_by_year",
+        "cleared_overall",
+        "cleared_by_permit_type",
+        "cleared_by_year",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise RuntimeError(
+            "The published MetricFlow results are missing sections: "
+            + ", ".join(missing)
+        )
+    return payload
+
+
+def metricflow_page() -> None:
+    hero(
+        "GOVERNED METRICS · OPEN-SOURCE METRICFLOW",
+        "Permit metrics, defined once",
+        "A reusable semantic layer defines how Active backlog and Closed-permit lifecycle metrics are calculated. MetricFlow executes those definitions against the published DuckDB warehouse; this page presents the latest versioned results.",
+    )
+    if st.button(
+        "Refresh MetricFlow results",
+        key="refresh_metricflow_results",
+        help="Fetch the latest published MetricFlow result package from GitHub.",
+    ):
+        load_metricflow_results.clear()
+        st.rerun()
+
+    try:
+        results = load_metricflow_results()
+    except Exception as exc:
+        st.info(
+            "MetricFlow results have not been published yet, or the latest result "
+            "package is temporarily unavailable. The existing dashboard data is "
+            "unaffected."
+        )
+        st.markdown(
+            "[MetricFlow workflow runs ↗](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/actions/workflows/metricflow-metrics.yml)"
+        )
+        with st.expander("Technical details"):
+            st.code(f"{type(exc).__name__}: {exc}")
+        return
+
+    active_rows = results.get("active_overall") or []
+    cleared_rows = results.get("cleared_overall") or []
+    if not active_rows or not cleared_rows:
+        st.warning("The latest MetricFlow result package contains no overall metrics.")
+        return
+
+    active = active_rows[0]
+    cleared = cleared_rows[0]
+    st.caption(
+        "Precomputed from the published DuckDB warehouse · "
+        f"Generated {format_refresh_timestamp(results.get('generated_at_utc'))} · "
+        f"Warehouse refresh {format_refresh_timestamp(results.get('warehouse_refresh_timestamp_utc'))} · "
+        f"Mode 1 run {results.get('warehouse_refresh_run_id', 'unknown')}"
+    )
+
+    st.subheader("Current Active permit backlog")
+    active_cards = st.columns(4)
+    active_metrics = [
+        (
+            "Current logical revisions",
+            fmt_int(active.get("active_permit_revision_count")),
+            "One row per current permit revision",
+        ),
+        (
+            "Age-eligible revisions",
+            fmt_int(active.get("eligible_active_permit_revision_count")),
+            "Has usable status and application date",
+        ),
+        (
+            "Median current age",
+            fmt_days(active.get("median_active_permit_age_days")),
+            "Eligible current permits only",
+        ),
+        (
+            "90th-percentile age",
+            fmt_days(active.get("p90_active_permit_age_days")),
+            "Eligible current permits only",
+        ),
+    ]
+    for column, (label, value, foot) in zip(active_cards, active_metrics, strict=True):
+        with column:
+            metric_card(label, value, foot)
+
+    active_type = pd.DataFrame(results.get("active_by_permit_type") or [])
+    active_year = pd.DataFrame(results.get("active_by_year") or [])
+    active_chart_cols = st.columns(2)
+    with active_chart_cols[0]:
+        st.markdown("**Active revisions by permit type**")
+        dimension = "active_permit_revision__permit_type"
+        metric = "active_permit_revision_count"
+        if not active_type.empty and {dimension, metric}.issubset(active_type.columns):
+            active_type[metric] = number(active_type[metric])
+            active_type = active_type.sort_values(metric, ascending=True)
+            fig = px.bar(active_type, x=metric, y=dimension, orientation="h")
+            st.plotly_chart(
+                chart_layout(fig, max(340, 34 * len(active_type) + 100)),
+                width="stretch",
+            )
+        else:
+            st.caption("No permit-type breakdown is available in this result package.")
+    with active_chart_cols[1]:
+        st.markdown("**Active revisions by application year**")
+        year_dimension = "metric_time__year"
+        if not active_year.empty and {year_dimension, metric}.issubset(
+            active_year.columns
+        ):
+            active_year[year_dimension] = number(active_year[year_dimension])
+            active_year[metric] = number(active_year[metric])
+            active_year = active_year.sort_values(year_dimension)
+            fig = px.bar(active_year, x=year_dimension, y=metric)
+            st.plotly_chart(chart_layout(fig), width="stretch")
+        else:
+            st.caption(
+                "No application-year breakdown is available in this result package."
+            )
+
+    st.divider()
+    st.subheader("Closed-permit lifecycle")
+    cleared_metrics = [
+        (
+            "Current logical revisions",
+            fmt_int(cleared.get("cleared_permit_revision_count")),
+            "One row per current Cleared revision",
+        ),
+        (
+            "Median application to issue",
+            fmt_days(cleared.get("median_application_to_issue_days")),
+            "Closed records with a valid interval",
+        ),
+        (
+            "90th-percentile application to issue",
+            fmt_days(cleared.get("p90_application_to_issue_days")),
+            "Closed records with a valid interval",
+        ),
+        (
+            "Median application to completion",
+            fmt_days(cleared.get("median_application_to_completion_days")),
+            "Closed records with a valid interval",
+        ),
+        (
+            "90th-percentile application to completion",
+            fmt_days(cleared.get("p90_application_to_completion_days")),
+            "Closed records with a valid interval",
+        ),
+        (
+            "Median issue to completion",
+            fmt_days(cleared.get("median_issue_to_completion_days")),
+            "Closed records with a valid interval",
+        ),
+        (
+            "90th-percentile issue to completion",
+            fmt_days(cleared.get("p90_issue_to_completion_days")),
+            "Closed records with a valid interval",
+        ),
+    ]
+    for start in range(0, len(cleared_metrics), 4):
+        columns = st.columns(min(4, len(cleared_metrics) - start))
+        for column, (label, value, foot) in zip(
+            columns, cleared_metrics[start : start + 4], strict=True
+        ):
+            with column:
+                metric_card(label, value, foot)
+
+    cleared_type = pd.DataFrame(results.get("cleared_by_permit_type") or [])
+    cleared_year = pd.DataFrame(results.get("cleared_by_year") or [])
+    cleared_chart_cols = st.columns(2)
+    with cleared_chart_cols[0]:
+        st.markdown("**Median application-to-completion days by permit type**")
+        dimension = "cleared_permit_revision__permit_type"
+        metric = "median_application_to_completion_days"
+        if not cleared_type.empty and {dimension, metric}.issubset(
+            cleared_type.columns
+        ):
+            cleared_type[metric] = number(cleared_type[metric])
+            cleared_type = cleared_type.sort_values(metric, ascending=True)
+            fig = px.bar(cleared_type, x=metric, y=dimension, orientation="h")
+            st.plotly_chart(
+                chart_layout(fig, max(340, 34 * len(cleared_type) + 100)),
+                width="stretch",
+            )
+        else:
+            st.caption("No permit-type lifecycle breakdown is available.")
+    with cleared_chart_cols[1]:
+        st.markdown("**Median application-to-completion days by year**")
+        year_dimension = "metric_time__year"
+        if not cleared_year.empty and {year_dimension, metric}.issubset(
+            cleared_year.columns
+        ):
+            cleared_year[year_dimension] = number(cleared_year[year_dimension])
+            cleared_year[metric] = number(cleared_year[metric])
+            cleared_year = cleared_year.sort_values(year_dimension)
+            fig = px.line(cleared_year, x=year_dimension, y=metric, markers=True)
+            st.plotly_chart(chart_layout(fig), width="stretch")
+        else:
+            st.caption("No application-year lifecycle breakdown is available.")
+
+    with st.expander("Semantic models and metric definitions"):
+        st.markdown(
+            "**Active permit revisions** — one row per current logical permit revision. "
+            "Age metrics include only eligible revisions; active age is right-censored "
+            "and is not a completed lifecycle duration."
+        )
+        st.markdown(
+            "- `active_permit_revision_count`: current logical Active revisions.\n"
+            "- `eligible_active_permit_revision_count`: revisions with a usable age.\n"
+            "- `median_active_permit_age_days` and `p90_active_permit_age_days`: distribution of current eligible permit age."
+        )
+        st.markdown(
+            "**Cleared permit revisions** — one row per current logical Cleared revision. "
+            "Lifecycle duration metrics are restricted to records marked Closed; "
+            "negative or unavailable durations are excluded by the dbt fact model."
+        )
+        st.markdown(
+            "- `cleared_permit_revision_count`: current logical Cleared revisions.\n"
+            "- Median and 90th-percentile application-to-issue, application-to-completion, and issue-to-completion days."
+        )
+        st.caption(
+            "The definitions live with the dbt model properties in "
+            "`dbt/models/marts/schema.yml`; MetricFlow compiles them into SQL."
+        )
+
+
 def main() -> None:
     try:
         backend = selected_dashboard_backend()
@@ -1856,6 +2112,14 @@ def main() -> None:
         backend, local_duckdb=bool(duckdb_path)
     )
     force_refresh = bool(st.session_state.pop("refresh_published_data", False))
+    if page == "Metrics & semantic layer":
+        metricflow_page()
+        st.divider()
+        st.caption(
+            "Toronto Housing Bottleneck Analytics · Metric definitions are maintained "
+            "in dbt and evaluated by open-source MetricFlow"
+        )
+        return
     last_loaded_at = float(st.session_state.get("_dashboard_loaded_at", 0.0))
     cache_may_have_expired = (time() - last_loaded_at) >= CACHE_TTL_SECONDS
     backend_key = (backend, config_fingerprint, duckdb_path)
