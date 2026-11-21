@@ -1,0 +1,215 @@
+name: MetricFlow Semantic Metrics
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_run:
+    workflows:
+      - Mode 1 Incremental Loader (Validated Staging)
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Mode 1 workflow run ID containing a successful DuckDB job
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: toronto-metricflow-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  validate_pr:
+    if: github.event_name == 'pull_request'
+    name: Validate MetricFlow against the published DuckDB warehouse
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: metricflow/requirements.txt
+      - name: Install isolated MetricFlow dependencies
+        run: python -m pip install -r metricflow/requirements.txt
+      - name: Restore the published DuckDB warehouse to a disposable file
+        run: |
+          python -m scripts.restore_duckdb_production \
+            --repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/toronto.duckdb"
+      - name: Configure the dbt DuckDB profile
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+      - name: Validate semantic definitions and execute sample metric queries
+        env:
+          DBT_DUCKDB_PATH: ${{ runner.temp }}/toronto.duckdb
+        run: |
+          python metricflow/run_metrics.py \
+            --database "$DBT_DUCKDB_PATH" \
+            --output "$RUNNER_TEMP/metricflow-pr-validation"
+
+  publish:
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.head_branch == 'main')
+    name: Validate semantic metrics and publish dashboard results
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.source_run_id }}
+
+    steps:
+      - name: Verify the successful Mode 1 DuckDB run
+        id: source
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "MetricFlow publication must be dispatched from main." >&2
+            exit 1
+          fi
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          run_id = os.environ["SOURCE_RUN_ID"].strip()
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("source_run_id must contain digits only.")
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run = json.loads(subprocess.check_output(
+              ["gh", "api", f"repos/{repository}/actions/runs/{run_id}"], text=True
+          ))
+          if (
+              run.get("path") != ".github/workflows/mode1-incremental-loader.yml"
+              or run.get("name") != "Mode 1 Incremental Loader (Validated Staging)"
+              or run.get("head_branch") != "main"
+              or run.get("status") != "completed"
+          ):
+              raise SystemExit("The selected run is not a completed Mode 1 run on main.")
+
+          attempt = int(run.get("run_attempt", 1))
+          jobs = json.loads(subprocess.check_output(
+              [
+                  "gh", "api",
+                  f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+              ], text=True
+          ))
+          duckdb = next(
+              (
+                  job for job in jobs.get("jobs", [])
+                  if job.get("name") == "Stage Mode 1 DuckDB changes"
+              ),
+              None,
+          )
+          if not duckdb or duckdb.get("conclusion") != "success":
+              if os.environ.get("GITHUB_EVENT_NAME") == "workflow_run":
+                  print("should_run=false")
+                  print("Mode 1 completed without a successful DuckDB job; skipping MetricFlow.", file=sys.stderr)
+                  raise SystemExit(0)
+              raise SystemExit("The selected Mode 1 run has no successful DuckDB job.")
+
+          publication_succeeded = any(
+              step.get("name") == "Publish the four verified DuckDB production assets"
+              and step.get("conclusion") == "success"
+              for step in duckdb.get("steps", [])
+          )
+          if not publication_succeeded:
+              if os.environ.get("GITHUB_EVENT_NAME") == "workflow_run":
+                  print("should_run=false")
+                  print("DuckDB had no new production publication; the existing metrics remain current.", file=sys.stderr)
+                  raise SystemExit(0)
+              raise SystemExit("The selected Mode 1 run did not publish a new DuckDB warehouse.")
+
+          print("should_run=true")
+          print(f"source_run_head_sha={run['head_sha']}")
+          print(
+              f"Verified Mode 1 run {run_id}, attempt {attempt}, "
+              f"DuckDB job {duckdb['id']}.",
+              file=sys.stderr,
+          )
+          PY
+
+      - name: Check out the exact Mode 1 source commit
+        if: steps.source.outputs.should_run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.source.outputs.source_run_head_sha }}
+
+      - name: Set up Python
+        if: steps.source.outputs.should_run == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: metricflow/requirements.txt
+
+      - name: Install isolated MetricFlow dependencies
+        if: steps.source.outputs.should_run == 'true'
+        run: python -m pip install -r metricflow/requirements.txt
+
+      - name: Restore the published DuckDB production warehouse
+        if: steps.source.outputs.should_run == 'true'
+        run: |
+          python -m scripts.restore_duckdb_production \
+            --repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/toronto.duckdb"
+
+      - name: Configure the existing dbt project for MetricFlow
+        if: steps.source.outputs.should_run == 'true'
+        working-directory: dbt
+        env:
+          DBT_DUCKDB_PATH: ${{ runner.temp }}/toronto.duckdb
+        run: cp profiles.yml.example profiles.yml
+
+      - name: Validate and execute the semantic metrics
+        if: steps.source.outputs.should_run == 'true'
+        env:
+          DBT_DUCKDB_PATH: ${{ runner.temp }}/toronto.duckdb
+          SOURCE_MODE1_RUN_ID: ${{ env.SOURCE_RUN_ID }}
+          SOURCE_MODE1_COMMIT: ${{ steps.source.outputs.source_run_head_sha }}
+        run: |
+          python metricflow/run_metrics.py \
+            --database "$DBT_DUCKDB_PATH" \
+            --trigger-run-id "$SOURCE_MODE1_RUN_ID" \
+            --source-commit "$SOURCE_MODE1_COMMIT" \
+            --output "$RUNNER_TEMP/metricflow-results"
+
+      - name: Publish the latest MetricFlow results
+        if: steps.source.outputs.should_run == 'true'
+        env:
+          METRICFLOW_RESULTS: ${{ runner.temp }}/metricflow-results/toronto-metricflow-results.json
+        run: |
+          test -s "$METRICFLOW_RESULTS"
+          if gh release view metrics-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload metrics-latest "$METRICFLOW_RESULTS" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create metrics-latest "$METRICFLOW_RESULTS" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest MetricFlow Metrics" \
+              --notes "Precomputed open-source MetricFlow results for the Toronto Housing Bottleneck Analytics dashboard." \
+              --prerelease
+          fi
+
+      - name: Report a successful MetricFlow publication
+        if: steps.source.outputs.should_run == 'true'
+        run: echo "MetricFlow validation, metric queries, and release publication passed."

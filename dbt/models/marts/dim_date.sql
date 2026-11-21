@@ -2,6 +2,16 @@
 
 {% set lifecycle_dates_sql %}
     SELECT application_date AS lifecycle_date
+    FROM {{ ref('fct_active_permit_revision') }}
+
+    UNION ALL
+
+    SELECT issued_date AS lifecycle_date
+    FROM {{ ref('fct_active_permit_revision') }}
+
+    UNION ALL
+
+    SELECT application_date AS lifecycle_date
     FROM {{ ref('fct_cleared_permit_revision') }}
 
     UNION ALL
@@ -13,6 +23,10 @@
 
     SELECT completed_date AS lifecycle_date
     FROM {{ ref('fct_cleared_permit_revision') }}
+
+    UNION ALL
+
+    SELECT CURRENT_DATE AS lifecycle_date
 {% endset %}
 
 {% set min_date_sql %}
