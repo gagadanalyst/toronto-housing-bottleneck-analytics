@@ -537,6 +537,7 @@ jobs:
             --candidate data/warehouse/loading-candidate/toronto.duckdb \
             --production data/warehouse/toronto.duckdb \
             --summary data/recovery/snapshot-replay/duckdb-summary.json \
+            --source-policy source_replay_policy.json \
             --source-run-id "$SOURCE_RUN_ID" \
             --confirm-full-history
       - name: Recheck and materialize the authorized archive set before publication
@@ -685,6 +686,7 @@ jobs:
             --source-run-id "${{ inputs.source_run_id }}" \
             --expected-snapshots "${{ needs.verify.outputs.snapshot_count }}" \
             --summary data/recovery/snapshot-replay/snowflake-summary.json \
+            --source-policy source_replay_policy.json \
             --confirm-full-history
       - name: Record the independent backend promotion boundary
         run: |

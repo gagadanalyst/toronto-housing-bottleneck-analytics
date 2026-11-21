@@ -25,11 +25,13 @@ def _report(tmp_path: Path, run_id: str = "123") -> Path:
         "snapshot_count_selected": 1,
         "candidate": str(candidate),
         "snapshots": [{"snapshot_id": "123:1", "run_id": run_id}],
+        "source_exclusions": [],
         "ledger_entries": [
             {
                 "snapshot_id": "123:1",
                 "source_name": source,
                 "status": "succeeded",
+                "warehouse_status": "succeeded",
                 "format_version": 1,
                 "run_id": run_id,
                 "run_attempt": 1,
@@ -73,6 +75,64 @@ def test_read_report_rejects_archive_provenance_gap(tmp_path):
         promote._read_report(path, "123")
 
 
+def test_read_report_accepts_only_policy_bound_source_exclusion(tmp_path):
+    path = _report(tmp_path)
+    report = json.loads(path.read_text())
+    active = next(
+        item
+        for item in report["ledger_entries"]
+        if item["source_name"] == "active_permits"
+    )
+    active["warehouse_status"] = "excluded"
+
+    exclusion = {
+        "snapshot_id": "123:1",
+        "source_name": "active_permits",
+        "archive_sha256": "b" * 64,
+        "reason": "Test source undercount",
+    }
+    report["source_exclusions"] = [exclusion]
+    path.write_text(json.dumps(report), encoding="utf-8")
+    policy = {("123:1", "active_permits"): exclusion}
+
+    with pytest.raises(ValueError, match="undeclared or mismatched exclusion"):
+        promote._read_report(path, "123")
+
+    _, expected = promote._read_report(
+        path,
+        "123",
+        source_exclusions=policy,
+    )
+    assert expected["123:1|active_permits"]["warehouse_status"] == "excluded"
+    assert expected["123:1|cleared_permits"]["warehouse_status"] == "succeeded"
+
+
+def test_read_report_rejects_exclusion_checksum_mismatch(tmp_path):
+    path = _report(tmp_path)
+    report = json.loads(path.read_text())
+    active = next(
+        item
+        for item in report["ledger_entries"]
+        if item["source_name"] == "active_permits"
+    )
+    active["warehouse_status"] = "excluded"
+    exclusion = {
+        "snapshot_id": "123:1",
+        "source_name": "active_permits",
+        "archive_sha256": "c" * 64,
+        "reason": "Test source undercount",
+    }
+    report["source_exclusions"] = [exclusion]
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checksum"):
+        promote._read_report(
+            path,
+            "123",
+            source_exclusions={("123:1", "active_permits"): exclusion},
+        )
+
+
 def test_promote_requires_human_confirmation_before_any_file_access(tmp_path):
     with pytest.raises(PermissionError, match="confirmation"):
         promote.promote(
@@ -87,6 +147,11 @@ def test_promote_requires_human_confirmation_before_any_file_access(tmp_path):
 
 def test_promote_binds_candidate_to_run_evidence(tmp_path):
     summary = _report(tmp_path)
+    policy_path = tmp_path / "source_replay_policy.json"
+    policy_path.write_text(
+        json.dumps({"policy_version": 1, "exclusions": []}),
+        encoding="utf-8",
+    )
     with pytest.raises(ValueError, match="source candidate path"):
         promote.promote(
             source_candidate=tmp_path / "wrong.duckdb",
@@ -95,4 +160,5 @@ def test_promote_binds_candidate_to_run_evidence(tmp_path):
             summary_path=summary,
             run_id="123",
             confirmed=True,
+            source_policy_path=policy_path,
         )

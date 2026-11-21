@@ -27,11 +27,13 @@ def _summary(tmp_path):
         "snapshot_count_selected": 1,
         "selection": {"from_date": None, "to_date": None, "limit": None},
         "snapshots": [{"snapshot_id": "123:1"}],
+        "source_exclusions": [],
         "ledger_entries": [
             {
                 "snapshot_id": "123:1",
                 "source_name": source,
                 "status": "succeeded",
+                "warehouse_status": "succeeded",
                 "run_id": "123",
                 "run_attempt": 1,
                 "source_commit": "a" * 40,
@@ -62,6 +64,38 @@ def test_expected_snowflake_ledger_requires_full_rebuild_evidence(tmp_path):
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="full-history candidate"):
         promote._expected_ledger_from_summary(path, "123")
+
+
+def test_expected_snowflake_ledger_accepts_policy_bound_exclusion(tmp_path):
+    path = _summary(tmp_path)
+    report = json.loads(path.read_text())
+    active = next(
+        item
+        for item in report["ledger_entries"]
+        if item["source_name"] == "active_permits"
+    )
+    active["warehouse_status"] = "excluded"
+
+    exclusion = {
+        "snapshot_id": "123:1",
+        "source_name": "active_permits",
+        "archive_sha256": "b" * 64,
+        "reason": "Test source undercount",
+    }
+    report["source_exclusions"] = [exclusion]
+    path.write_text(json.dumps(report), encoding="utf-8")
+    policy = {("123:1", "active_permits"): exclusion}
+
+    with pytest.raises(ValueError, match="undeclared or mismatched exclusion"):
+        promote._expected_ledger_from_summary(path, "123")
+
+    expected = promote._expected_ledger_from_summary(
+        path,
+        "123",
+        source_exclusions=policy,
+    )
+    assert expected["123:1|active_permits"]["warehouse_status"] == "excluded"
+    assert expected["123:1|cleared_permits"]["warehouse_status"] == "succeeded"
 
 
 def test_quarantine_reconciliation_accepts_verified_empty_history():

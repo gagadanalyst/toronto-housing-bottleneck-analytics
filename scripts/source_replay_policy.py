@@ -111,3 +111,112 @@ def validate_source_replay_policy(
                 "Full-history inventory is missing policy exclusions: "
                 f"{sorted(missing)}"
             )
+
+
+def validate_report_source_exclusions(
+    report: dict[str, Any],
+    exclusions: dict[tuple[str, str], dict[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Validate summary warehouse statuses against checksum-bound exclusions."""
+    snapshots = report.get("snapshots")
+    ledger_entries = report.get("ledger_entries")
+    if not isinstance(snapshots, list) or not isinstance(ledger_entries, list):
+        raise ValueError("Replay summary is missing snapshot or ledger evidence.")
+
+    selected_ids = set()
+    for item in snapshots:
+        if not isinstance(item, dict):
+            raise ValueError("Replay summary contains an invalid snapshot record.")
+        snapshot_id = item.get("snapshot_id")
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            raise ValueError("Replay summary contains an invalid snapshot ID.")
+        if snapshot_id in selected_ids:
+            raise ValueError(
+                f"Replay summary contains duplicate snapshot: {snapshot_id}."
+            )
+        selected_ids.add(snapshot_id)
+
+    expected_policy_keys = {key for key in exclusions if key[0] in selected_ids}
+    if report.get("history_scope") == "full" and expected_policy_keys != set(
+        exclusions
+    ):
+        raise ValueError(
+            "Full-history summary does not cover every source policy exclusion: "
+            f"{sorted(set(exclusions) - expected_policy_keys)}."
+        )
+
+    reported = report.get("source_exclusions")
+    if not isinstance(reported, list):
+        raise ValueError("Replay summary source_exclusions evidence must be a list.")
+
+    reported_keys: set[tuple[str, str]] = set()
+    for item in reported:
+        if not isinstance(item, dict):
+            raise ValueError("Replay summary contains an invalid source exclusion.")
+        key = (item.get("snapshot_id"), item.get("source_name"))
+        expected = exclusions.get(key)
+        if (
+            expected is None
+            or key[0] not in selected_ids
+            or item.get("archive_sha256") != expected["archive_sha256"]
+            or item.get("reason") != expected["reason"]
+        ):
+            raise ValueError(
+                f"Replay summary contains an undeclared or mismatched exclusion: {key}."
+            )
+        if key in reported_keys:
+            raise ValueError(f"Replay summary contains duplicate exclusion: {key}.")
+        reported_keys.add(key)
+
+    if reported_keys != expected_policy_keys:
+        raise ValueError(
+            "Replay summary source exclusions do not exactly match the policy: "
+            f"missing={sorted(expected_policy_keys - reported_keys)}, "
+            f"unexpected={sorted(reported_keys - expected_policy_keys)}."
+        )
+
+    warehouse_statuses: dict[tuple[str, str], str] = {}
+    for item in ledger_entries:
+        if not isinstance(item, dict):
+            raise ValueError("Replay summary ledger entry is invalid.")
+        key = (item.get("snapshot_id"), item.get("source_name"))
+        if (
+            key[0] not in selected_ids
+            or key[1] not in SOURCE_NAMES
+            or key in warehouse_statuses
+        ):
+            raise ValueError(
+                f"Replay summary has an invalid or duplicate ledger key: {key}."
+            )
+
+        expected_status = "excluded" if key in expected_policy_keys else "succeeded"
+        observed_status = item.get("warehouse_status")
+        if observed_status != expected_status:
+            raise ValueError(
+                f"Replay summary warehouse status for {key} must be "
+                f"{expected_status!r}; observed={observed_status!r}."
+            )
+
+        if expected_status == "excluded":
+            exclusion = exclusions[key]
+            if item.get("archive_sha256") != exclusion["archive_sha256"]:
+                raise ValueError(
+                    f"Replay summary exclusion checksum differs from policy for {key}."
+                )
+
+        warehouse_statuses[key] = expected_status
+
+    wanted_keys = {
+        (snapshot_id, source_name)
+        for snapshot_id in selected_ids
+        for source_name in SOURCE_NAMES
+    }
+    if set(warehouse_statuses) != wanted_keys:
+        raise ValueError(
+            "Replay summary native ledger statuses do not cover both sources "
+            "for every selected snapshot: "
+            f"missing={sorted(wanted_keys - set(warehouse_statuses))}, "
+            f"unexpected={sorted(set(warehouse_statuses) - wanted_keys)}."
+        )
+
+    return warehouse_statuses

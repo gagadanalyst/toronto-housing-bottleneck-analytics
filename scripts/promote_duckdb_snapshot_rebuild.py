@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from scripts.replay_targets import validation_queries
+from scripts.source_replay_policy import (
+    load_source_replay_policy,
+    validate_report_source_exclusions,
+)
 
 SOURCE_TABLES = {
     "active_permits": (
@@ -42,7 +46,10 @@ REQUIRED_RAW_TABLES = {
 
 
 def _read_report(
-    path: Path, run_id: str
+    path: Path,
+    run_id: str,
+    *,
+    source_exclusions: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     report = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(report, dict):
@@ -85,6 +92,10 @@ def _read_report(
         raise ValueError(
             "DuckDB replay summary must contain two source ledger entries per archive."
         )
+    warehouse_statuses = validate_report_source_exclusions(
+        report,
+        source_exclusions or {},
+    )
     expected: dict[str, dict[str, Any]] = {}
     for item in entries:
         if not isinstance(item, dict):
@@ -133,7 +144,10 @@ def _read_report(
             raise ValueError(
                 f"DuckDB ledger run ID disagrees with selected archive {snapshot_id}."
             )
-        expected[key] = item
+        expected[key] = {
+            **item,
+            "warehouse_status": warehouse_statuses[(snapshot_id, source)],
+        }
     wanted = {
         f"{s.get('snapshot_id')}|{source}"
         for s in snapshots
@@ -252,7 +266,7 @@ def _validate_database(
             comparisons = (
                 (run_id, str(item["run_id"])),
                 (attempt, int(item["run_attempt"])),
-                (str(row[4]).lower(), "succeeded"),
+                (str(row[4]).lower(), str(item["warehouse_status"])),
                 (str(row[5]), str(item["source_commit"])),
                 (str(row[6]), str(item["release_tag"])),
                 (str(row[7]), str(item["asset_name"])),
@@ -433,6 +447,7 @@ def promote(
     summary_path: Path,
     run_id: str,
     confirmed: bool,
+    source_policy_path: Path = Path("source_replay_policy.json"),
 ) -> dict[str, Any]:
     if not run_id.isdecimal() or int(run_id) < 1:
         raise ValueError("Source workflow run ID must contain digits only.")
@@ -440,7 +455,12 @@ def promote(
         raise PermissionError(
             "Explicit full-history promotion confirmation is required."
         )
-    report, expected = _read_report(summary_path, run_id)
+    source_exclusions = load_source_replay_policy(source_policy_path)
+    report, expected = _read_report(
+        summary_path,
+        run_id,
+        source_exclusions=source_exclusions,
+    )
     expected_source = Path(report["candidate"]).resolve()
     if source_candidate.resolve() != expected_source:
         raise ValueError("source candidate path does not match the replay evidence.")
@@ -502,6 +522,11 @@ def main() -> int:
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--production", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument(
+        "--source-policy",
+        type=Path,
+        default=Path("source_replay_policy.json"),
+    )
     parser.add_argument("--source-run-id", required=True)
     parser.add_argument("--confirm-full-history", action="store_true")
     args = parser.parse_args()
@@ -513,6 +538,7 @@ def main() -> int:
             summary_path=args.summary,
             run_id=args.source_run_id,
             confirmed=args.confirm_full_history,
+            source_policy_path=args.source_policy,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
