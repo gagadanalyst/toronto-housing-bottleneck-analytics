@@ -25,6 +25,7 @@ on:
       - scripts/restore_duckdb_production.py
       - scripts/publish_loading_assets.py
       - scripts/seed_loading_release.py
+      - scripts/workflow_push_routing.py
   workflow_dispatch:
     inputs:
       backends:
@@ -72,31 +73,34 @@ jobs:
           exit 1
 
   route:
-    name: Route Extraction completion and Loading code changes
+    name: Determine whether Loading is required
     runs-on: ubuntu-latest
     outputs:
       should_load: ${{ steps.route.outputs.should_load }}
     steps:
+      - name: Check out full history for push routing
+        if: github.event_name == 'push'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - id: route
         env:
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          event = os.environ["EVENT_NAME"]
-          should = True
-          if event == "workflow_run":
-              should = os.environ.get("SOURCE_BRANCH") == "main"
-          elif event == "push":
-              commits = json.loads(os.environ.get("COMMITS_JSON") or "[]") or []
-              changed = {p for c in commits for k in ("added", "modified", "removed") for p in c.get(k, [])}
-              extraction_paths = ("extraction/", ".github/workflows/v2-snapshot-archive.yml")
-              should = not any(p.startswith(prefix) for p in changed for prefix in extraction_paths)
-          print(f"should_load={str(should).lower()}")
-          PY
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            should_run=false
+            if [ "$SOURCE_BRANCH" = "main" ]; then
+              should_run=true
+            fi
+            echo "should_load=$should_run" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "push" ]; then
+          python scripts/workflow_push_routing.py --mode loading --repo "$GITHUB_WORKSPACE" --before "$BEFORE_SHA" --after "$AFTER_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_load=true" >> "$GITHUB_OUTPUT"
+          fi
 
   duckdb:
     needs: route
