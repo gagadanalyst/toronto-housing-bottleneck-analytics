@@ -346,7 +346,7 @@ jobs:
 
       - name: Validate archive provenance, ledger completeness and SCD2 integrity
         run: |
-          python scripts/validate_snapshot_replay.py \
+          python -m scripts.validate_snapshot_replay \
             --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
             --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
             --output data/recovery/snapshot-replay/joint-validation.json
@@ -454,7 +454,7 @@ jobs:
 
       - name: Validate archive provenance, ledger completeness and SCD2 integrity
         run: |
-          python scripts/validate_snapshot_replay.py \
+          python -m scripts.validate_snapshot_replay \
             --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
             --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
             --output data/recovery/snapshot-replay/joint-validation.json
