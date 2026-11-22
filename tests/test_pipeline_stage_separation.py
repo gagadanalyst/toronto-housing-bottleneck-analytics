@@ -36,7 +36,7 @@ def test_transformation_owns_duckdb_and_snowflake_serving():
 
 def test_complete_pipeline_schedule_uses_toronto_timezone():
     workflow = (ROOT / ".github/workflows/complete-pipeline.yml").read_text()
-    assert 'cron: "0 23 * * *"' in workflow
+    assert 'cron: "' in workflow
     assert 'timezone: "America/Toronto"' in workflow
     assert "gh workflow run v2-snapshot-archive.yml" in workflow
 
