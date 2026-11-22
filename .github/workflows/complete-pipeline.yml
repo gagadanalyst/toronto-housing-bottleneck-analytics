@@ -2,7 +2,7 @@ name: Complete Pipeline / Extraction + Loading + Transformation
 
 on:
   schedule:
-    - cron: "59 3 * * *"
+    - cron: "17 4 * * *"
       timezone: "America/Toronto"
   workflow_dispatch:
     inputs:
