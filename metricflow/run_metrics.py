@@ -64,8 +64,22 @@ def warehouse_refresh_metadata(database: Path) -> dict[str, str | None]:
             raise RuntimeError(
                 "The published DuckDB warehouse has no dashboard refresh metadata."
             )
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'metadata' "
+                "AND table_name = 'dashboard_refresh_metadata'"
+            ).fetchall()
+        }
+        mode1_run_column = (
+            "source_mode1_run_id"
+            if "source_mode1_run_id" in columns
+            else "NULL AS source_mode1_run_id"
+        )
         row = connection.execute(
-            "SELECT last_successful_refresh_utc, source_commit, workflow_run_id "
+            "SELECT last_successful_refresh_utc, source_commit, workflow_run_id, "
+            f"{mode1_run_column} "
             "FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
         ).fetchone()
     if not row or not row[2]:
@@ -76,6 +90,7 @@ def warehouse_refresh_metadata(database: Path) -> dict[str, str | None]:
         "warehouse_refresh_timestamp_utc": timestamp_text(row[0]),
         "warehouse_source_commit": str(row[1]) if row[1] is not None else None,
         "warehouse_refresh_run_id": str(row[2]),
+        "warehouse_source_mode1_run_id": str(row[3]) if row[3] is not None else None,
     }
 
 
@@ -142,20 +157,65 @@ def normalize_metric_rows(
 
 
 def validate_warehouse_identity(
-    metadata: dict[str, str | None], trigger_run_id: str, source_commit: str
+    metadata: dict[str, str | None], trigger_run_id: str
 ) -> None:
-    """Reject a stale or mismatched warehouse-latest asset."""
+    """Verify the serving publication and its actual upstream source run."""
     if metadata.get("warehouse_refresh_run_id") != trigger_run_id:
         raise RuntimeError(
-            "warehouse-latest does not belong to the triggering Mode 1 run: "
+            "warehouse-latest does not belong to the triggering Transformation run: "
             f"expected {trigger_run_id}, observed "
             f"{metadata.get('warehouse_refresh_run_id')!r}."
         )
-    if metadata.get("warehouse_source_commit") != source_commit:
+
+    source_commit = metadata.get("warehouse_source_commit")
+    if not source_commit:
+        raise RuntimeError("warehouse-latest has no source commit identity.")
+
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not repository:
+        raise RuntimeError("GITHUB_REPOSITORY is required for provenance validation.")
+
+    mode1_run_id = metadata.get("warehouse_source_mode1_run_id")
+    verified_run_id = mode1_run_id or trigger_run_id
+    run = json.loads(
+        subprocess.check_output(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/actions/runs/{verified_run_id}",
+            ],
+            text=True,
+        )
+    )
+
+    expected_path = (
+        ".github/workflows/mode1-incremental-loader.yml"
+        if mode1_run_id
+        else ".github/workflows/transformation-dbt-serving.yml"
+    )
+    expected_name = (
+        "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)"
+        if mode1_run_id
+        else "Transformation / dbt Serving Refresh"
+    )
+
+    if (
+        run.get("path") != expected_path
+        or run.get("name") != expected_name
+        or run.get("head_branch") != "main"
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "success"
+    ):
         raise RuntimeError(
-            "warehouse-latest source commit does not match the triggering Mode 1 run: "
-            f"expected {source_commit}, observed "
-            f"{metadata.get('warehouse_source_commit')!r}."
+            f"Source run {verified_run_id} is not a successful completed "
+            f"{expected_name} run on main."
+        )
+
+    if run.get("head_sha") != source_commit:
+        raise RuntimeError(
+            "warehouse-latest source commit does not match its verified upstream run: "
+            f"expected {run.get('head_sha')!r}, "
+            f"observed {source_commit!r}."
         )
 
 
@@ -180,23 +240,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--trigger-run-id")
-    parser.add_argument("--source-commit")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     database = args.database.expanduser().resolve()
     if not database.is_file():
         parser.error(f"DuckDB database does not exist: {database}")
-    if bool(args.trigger_run_id) != bool(args.source_commit):
-        parser.error("--trigger-run-id and --source-commit must be supplied together")
     if args.trigger_run_id and not str(args.trigger_run_id).isdecimal():
         parser.error("--trigger-run-id must contain digits only")
 
     metadata = warehouse_refresh_metadata(database)
     if args.trigger_run_id:
-        validate_warehouse_identity(
-            metadata, str(args.trigger_run_id), str(args.source_commit)
-        )
+        validate_warehouse_identity(metadata, str(args.trigger_run_id))
     env = os.environ.copy()
     env["DBT_DUCKDB_PATH"] = str(database)
     env["DBT_PROFILES_DIR"] = str(DBT_PROJECT)

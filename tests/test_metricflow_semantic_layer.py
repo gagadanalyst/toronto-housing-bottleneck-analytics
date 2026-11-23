@@ -122,26 +122,42 @@ def test_metric_csv_reader_normalizes_headers_and_parses_numbers(tmp_path):
     assert normalized[0]["active_permit_revision__permit_type"] == "Apartment"
 
 
-def test_warehouse_result_must_match_triggering_mode1_run_and_commit():
+def test_warehouse_identity_verifies_the_actual_mode1_run(monkeypatch):
+    import json
+
     module = _runner_module()
+    source_sha = "a" * 40
     metadata = {
         "warehouse_refresh_run_id": "123456789",
-        "warehouse_source_commit": "a" * 40,
+        "warehouse_source_commit": source_sha,
+        "warehouse_source_mode1_run_id": "987654321",
     }
-    module.validate_warehouse_identity(metadata, "123456789", "a" * 40)
-    try:
-        module.validate_warehouse_identity(metadata, "987654321", "a" * 40)
-    except RuntimeError as exc:
-        assert "does not belong" in str(exc)
-    else:
-        raise AssertionError("A stale warehouse run ID was accepted.")
+    monkeypatch.setenv(
+        "GITHUB_REPOSITORY", "gagadanalyst/toronto-housing-bottleneck-analytics"
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "check_output",
+        lambda *args, **kwargs: json.dumps(
+            {
+                "path": ".github/workflows/mode1-incremental-loader.yml",
+                "name": "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)",
+                "head_branch": "main",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": source_sha,
+            }
+        ),
+    )
+
+    module.validate_warehouse_identity(metadata, "123456789")
 
     try:
-        module.validate_warehouse_identity(metadata, "123456789", "b" * 40)
+        module.validate_warehouse_identity(metadata, "111111111")
     except RuntimeError as exc:
-        assert "source commit" in str(exc)
+        assert "Transformation run" in str(exc)
     else:
-        raise AssertionError("A mismatched warehouse source commit was accepted.")
+        raise AssertionError("A mismatched Transformation run ID was accepted.")
 
 
 def test_separate_workflow_is_triggered_by_mode1_and_publishes_results():
@@ -151,12 +167,9 @@ def test_separate_workflow_is_triggered_by_mode1_and_publishes_results():
     assert "workflow_run:" in workflow
     assert "Transformation / dbt Serving Refresh" in workflow
     assert "Build and publish DuckDB serving warehouse" in workflow
-    assert "source_run_head_sha" in workflow
-    assert (
-        "ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.source.outputs.source_run_head_sha }}"
-        in workflow
-    )
-    assert "--source-commit" in workflow
+    assert "source_mode1_run_id" not in workflow
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "--source-commit" not in workflow
     assert "Publish the four verified DuckDB production assets" in workflow
     assert "metrics-latest" in workflow
     assert "transformation-dbt-serving.yml" in workflow
