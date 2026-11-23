@@ -212,9 +212,11 @@ def _assert_quarantine_ledger(
         digest,
         status,
     ) in ledger_rows:
-        if str(status).lower() != "succeeded":
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"succeeded", "excluded"}:
             raise RuntimeError(
-                f"Candidate ledger contains unfinished source {snapshot_id}/{source_name}: {status}."
+                "Candidate ledger contains an unfinished or unsupported source "
+                f"{snapshot_id}/{source_name}: {status}."
             )
         rows = grouped.get((str(snapshot_id), str(source_name)), [])
         observed_bad_count = sum(
@@ -506,7 +508,9 @@ def promote(
                         cursor, "RAW", baseline_counts, baseline_snapshot_ids
                     )
                     cursor.execute(
-                        "SELECT COUNT_IF(LOWER(STATUS) != 'succeeded') "
+                        "SELECT COUNT_IF("
+                        "STATUS IS NULL OR LOWER(TRIM(STATUS)) "
+                        "NOT IN ('succeeded', 'excluded')) "
                         "FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
                     )
                     if int(cursor.fetchone()[0] or 0):
@@ -557,7 +561,9 @@ def promote(
             for _source_name, (table, keys) in SOURCES.items():
                 _assert_scd2(cursor, "RAW", table, keys)
             cursor.execute(
-                "SELECT COUNT_IF(LOWER(STATUS) != 'succeeded') "
+                "SELECT COUNT_IF("
+                "STATUS IS NULL OR LOWER(TRIM(STATUS)) "
+                "NOT IN ('succeeded', 'excluded')) "
                 "FROM TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER"
             )
             unfinished = int(cursor.fetchone()[0] or 0)

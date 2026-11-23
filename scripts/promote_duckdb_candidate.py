@@ -203,12 +203,15 @@ def validate_candidate(
             )
 
         ledger = connection.execute(
-            "SELECT COUNT(*), COUNT_IF(LOWER(status) != 'succeeded') "
+            "SELECT COUNT(*), COUNT_IF("
+            "status IS NULL OR LOWER(TRIM(status)) "
+            "NOT IN ('succeeded', 'excluded')) "
             "FROM raw.toronto_snapshot_ledger"
         ).fetchone()
         if not ledger or int(ledger[0] or 0) == 0 or int(ledger[1] or 0) != 0:
             raise RuntimeError(
-                "DuckDB candidate contains an empty or incomplete snapshot ledger: "
+                "DuckDB candidate contains an empty or incomplete snapshot ledger "
+                "(only succeeded or excluded statuses are terminal): "
                 f"{ledger}."
             )
         _validate_quarantine_reconciliation(

@@ -353,3 +353,63 @@ def test_failed_candidate_preparation_drops_only_its_new_owned_clone(monkeypatch
     assert connection.commits == 1
     assert connection.rollbacks == 1
     assert connection.closed
+
+
+@pytest.mark.parametrize("status", ["succeeded", "excluded"])
+def test_quarantine_ledger_accepts_excluded_status(status) -> None:
+    class Cursor:
+        def __init__(self):
+            self.statement = ""
+            self.ledger_rows = [
+                ("snapshot-1", "active_permits", 0, 0, 0, None, status),
+                ("snapshot-1", "cleared_permits", 0, 0, 0, None, "succeeded"),
+            ]
+
+        def execute(self, statement, params=None):
+            self.statement = statement
+
+        def fetchall(self):
+            if "TORONTO_SCD2_QUARANTINE" in self.statement:
+                return []
+            if "TORONTO_SNAPSHOT_LEDGER" in self.statement:
+                return self.ledger_rows
+            raise AssertionError(f"Unexpected query: {self.statement}")
+
+    promotion._assert_quarantine_ledger(
+        Cursor(),
+        "RAW_STAGE_123_2",
+        {"active_permits": 100, "cleared_permits": 100},
+        {"snapshot-1"},
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "loading", "failed", None, "unknown"],
+)
+def test_quarantine_ledger_rejects_nonterminal_status(status) -> None:
+    class Cursor:
+        def __init__(self):
+            self.statement = ""
+            self.ledger_rows = [
+                ("snapshot-1", "active_permits", 0, 0, 0, None, status),
+                ("snapshot-1", "cleared_permits", 0, 0, 0, None, "succeeded"),
+            ]
+
+        def execute(self, statement, params=None):
+            self.statement = statement
+
+        def fetchall(self):
+            if "TORONTO_SCD2_QUARANTINE" in self.statement:
+                return []
+            if "TORONTO_SNAPSHOT_LEDGER" in self.statement:
+                return self.ledger_rows
+            raise AssertionError(f"Unexpected query: {self.statement}")
+
+    with pytest.raises(RuntimeError, match="unfinished or unsupported source"):
+        promotion._assert_quarantine_ledger(
+            Cursor(),
+            "RAW_STAGE_123_2",
+            {"active_permits": 100, "cleared_permits": 100},
+            {"snapshot-1"},
+        )
