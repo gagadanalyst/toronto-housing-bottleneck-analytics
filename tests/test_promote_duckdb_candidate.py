@@ -93,9 +93,9 @@ def test_candidate_ledger_accepts_terminal_statuses(monkeypatch, status) -> None
 
             if "FROM raw.toronto_snapshot_ledger" in sql:
                 assert "NOT IN ('succeeded', 'excluded')" in sql
-                return FakeResult(row=(1, 0 if status in {
-                    "succeeded", "excluded"
-                } else 1))
+                return FakeResult(
+                    row=(1, 0 if status in {"succeeded", "excluded"} else 1)
+                )
 
             return FakeResult(row=(0,))
 
