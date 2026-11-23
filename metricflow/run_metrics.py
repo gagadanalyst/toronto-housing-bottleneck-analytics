@@ -64,9 +64,22 @@ def warehouse_refresh_metadata(database: Path) -> dict[str, str | None]:
             raise RuntimeError(
                 "The published DuckDB warehouse has no dashboard refresh metadata."
             )
+        columns = {
+            row[0]
+            for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'metadata' "
+                "AND table_name = 'dashboard_refresh_metadata'"
+            ).fetchall()
+        }
+        mode1_run_column = (
+            "source_mode1_run_id"
+            if "source_mode1_run_id" in columns
+            else "NULL AS source_mode1_run_id"
+        )
         row = connection.execute(
             "SELECT last_successful_refresh_utc, source_commit, workflow_run_id, "
-            "source_mode1_run_id "
+            f"{mode1_run_column} "
             "FROM metadata.dashboard_refresh_metadata WHERE refresh_id = 1"
         ).fetchone()
     if not row or not row[2]:
