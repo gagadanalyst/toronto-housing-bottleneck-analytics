@@ -140,7 +140,6 @@ jobs:
               raise SystemExit("The selected Transformation run did not publish a new DuckDB warehouse.")
 
           print("should_run=true")
-          print(f"source_run_head_sha={run['head_sha']}")
           print(
               f"Verified Transformation run {run_id}, attempt {attempt}, "
               f"DuckDB job {duckdb['id']}.",
@@ -152,7 +151,7 @@ jobs:
         if: steps.source.outputs.should_run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.source.outputs.source_run_head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Set up Python
         if: steps.source.outputs.should_run == 'true'
@@ -185,12 +184,10 @@ jobs:
         env:
           DBT_DUCKDB_PATH: ${{ runner.temp }}/toronto.duckdb
           SOURCE_TRANSFORMATION_RUN_ID: ${{ env.SOURCE_RUN_ID }}
-          SOURCE_MODE1_COMMIT: ${{ steps.source.outputs.source_run_head_sha }}
         run: |
           python metricflow/run_metrics.py \
             --database "$DBT_DUCKDB_PATH" \
             --trigger-run-id "$SOURCE_TRANSFORMATION_RUN_ID" \
-            --source-commit "$SOURCE_MODE1_COMMIT" \
             --output "$RUNNER_TEMP/metricflow-results"
 
       - name: Publish the latest MetricFlow results

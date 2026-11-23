@@ -103,15 +103,15 @@ export DBT_DUCKDB_PATH=/tmp/toronto-metricflow.duckdb
 python metricflow/run_metrics.py \
   --database "$DBT_DUCKDB_PATH" \
   --trigger-run-id 123456789 \
-  --source-commit 0123456789abcdef0123456789abcdef01234567 \
   --output /tmp/toronto-metricflow-results
 ```
 
-Replace the sample run ID and commit with the successful Transformation run identity
-recorded in `metadata.dashboard_refresh_metadata`. When both arguments are
-supplied, the runner checks them against the warehouse metadata before querying.
-They must be supplied together. Pull-request validation omits both arguments;
-the workflow restores the published warehouse to its own disposable file.
+Replace the sample run ID with the successful Transformation run ID
+recorded in `metadata.dashboard_refresh_metadata`. When `--trigger-run-id`
+is supplied, the runner verifies the Transformation publication and its recorded
+upstream Mode 1 run and source commit through the GitHub API. Pull-request
+validation omits this argument; the workflow restores the published warehouse
+to its own disposable file.
 
 The runner executes `dbt deps`, rebuilds only the `dim_date` time spine, runs
 `dbt parse`, `mf validate-configs`, `mf list metrics`, and the six configured

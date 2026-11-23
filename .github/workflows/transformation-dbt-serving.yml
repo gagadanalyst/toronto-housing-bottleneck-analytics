@@ -250,6 +250,7 @@ jobs:
         if: steps.source.outputs.should_run == 'true'
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_MODE1_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
@@ -262,14 +263,25 @@ jobs:
                   refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
                   last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
                   source_commit VARCHAR NOT NULL,
-                  workflow_run_id VARCHAR NOT NULL
+                  workflow_run_id VARCHAR NOT NULL,
+                  source_mode1_run_id VARCHAR
               )""")
+              connection.execute(
+                  "ALTER TABLE metadata.dashboard_refresh_metadata "
+                  "ADD COLUMN IF NOT EXISTS source_mode1_run_id VARCHAR"
+              )
               connection.execute("DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1")
               connection.execute(
                   "INSERT INTO metadata.dashboard_refresh_metadata "
-                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id) "
-                  "VALUES (?, ?, ?, ?)",
-                  (1, datetime.now(timezone.utc), os.environ["SOURCE_COMMIT"], os.environ["WORKFLOW_RUN_ID"]),
+                  "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id, source_mode1_run_id) "
+                  "VALUES (?, ?, ?, ?, ?)",
+                  (
+                      1,
+                      datetime.now(timezone.utc),
+                      os.environ["SOURCE_COMMIT"],
+                      os.environ["WORKFLOW_RUN_ID"],
+                      os.environ.get("SOURCE_MODE1_RUN_ID") or None,
+                  ),
               )
           PY
 
