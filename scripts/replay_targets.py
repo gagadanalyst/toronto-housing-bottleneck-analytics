@@ -216,7 +216,7 @@ def _analyse_mode1_snapshot(
         "identical_duplicate_rows": int(analysis.duplicate_row_count),
         "quarantined_bad_rows": int(analysis.bad_row_count),
         "quarantined_total_rows": total_quarantined,
-        "key_handling": "quarantine_before_scd2",
+        "identity_policy": "preflight",
     }
 
 
