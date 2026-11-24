@@ -549,7 +549,7 @@ def test_mode1_preflight_uses_canonical_key_analysis_and_reports_quarantine(
         "identical_duplicate_rows": 2,
         "quarantined_bad_rows": 3,
         "quarantined_total_rows": 5,
-        "key_handling": "quarantine_before_scd2",
+        "identity_policy": "preflight",
     }
 
 
