@@ -757,9 +757,7 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
         / ".github/workflows/mode1-incremental-loader.yml"
     )
     workflow = workflow_path.read_text(encoding="utf-8")
-    workflow = workflow.split(
-        "# BEGIN RETIRED HISTORICAL WORKFLOW", 1
-    )[0]
+    workflow = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
     assert "reject_noncanonical_manual_dispatch" in workflow
     assert "github.ref != 'refs/heads/main'" in workflow
     assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 2

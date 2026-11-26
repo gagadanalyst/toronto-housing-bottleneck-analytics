@@ -231,9 +231,11 @@ def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():
     ):
         assert marker not in active
 
-    promotion = (root / ".github/workflows/promote-snapshot-rebuild.yml").read_text(
-        encoding="utf-8"
-    ).split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    promotion = (
+        (root / ".github/workflows/promote-snapshot-rebuild.yml")
+        .read_text(encoding="utf-8")
+        .split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    )
     assert '"Snapshot Loader (DuckDB Full-History Rebuild)"' in promotion
 
 

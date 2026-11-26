@@ -33,7 +33,9 @@ def test_transformation_owns_duckdb_dbt_serving():
 
 
 def test_serving_workflow_verifies_loading_job():
-    workflow = (ROOT / "docs/retired-workflows/snowflake-serving-schema.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / "docs/retired-workflows/snowflake-serving-schema.yml").read_text(
+        encoding="utf-8"
+    )
     assert "snapshot_loader_run_id:" in workflow
     assert "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)" in workflow
     assert "Stage Mode 1 Snowflake changes" in workflow

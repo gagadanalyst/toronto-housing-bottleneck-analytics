@@ -399,9 +399,7 @@ def test_promotion_workflow_is_duckdb_only():
         / "promote-snapshot-rebuild.yml"
     ).read_text(encoding="utf-8")
 
-    active = workflow.split(
-        "# BEGIN RETIRED HISTORICAL WORKFLOW", 1
-    )[0]
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
 
     assert "  verify:" in active
     assert "  promote-duckdb:" in active
@@ -410,6 +408,7 @@ def test_promotion_workflow_is_duckdb_only():
     assert "SNOWFLAKE_OPERATIONS_ENABLED" not in active
     assert "python -m scripts.validate_full_rebuild_promotion" in active
     assert "needs: verify" in active
+
 
 def test_duckdb_promotion_summary_requires_quarantine_counts(tmp_path):
     report = _complete_duckdb_report()

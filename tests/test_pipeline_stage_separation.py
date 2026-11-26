@@ -33,12 +33,12 @@ def test_transformation_owns_duckdb_serving_and_snowflake_is_archived():
         "Publish the four verified DuckDB production assets"
     ) < workflow.index("Preserve the immutable DuckDB serving recovery checkpoint")
     active_lines = [
-        line for line in workflow.splitlines()
+        line
+        for line in workflow.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
     assert not any(
-        "gh workflow run snowflake-serving-schema.yml" in line
-        for line in active_lines
+        "gh workflow run snowflake-serving-schema.yml" in line for line in active_lines
     )
     assert not (ROOT / ".github/workflows/snowflake-serving-schema.yml").exists()
     assert archived.is_file()
@@ -66,12 +66,12 @@ def test_mode2_promotion_updates_loading_baseline_not_dashboard_warehouse():
     assert "publish_duckdb_recovery.py" not in workflow
     assert "dbt build" not in workflow
     active_lines = [
-        line for line in workflow.splitlines()
+        line
+        for line in workflow.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
     assert not any(
-        "gh workflow run snowflake-serving-schema.yml" in line
-        for line in active_lines
+        "gh workflow run snowflake-serving-schema.yml" in line for line in active_lines
     )
     assert "rebootstrap-loading-duckdb:" in workflow
     active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
@@ -155,12 +155,12 @@ def test_snowflake_serving_workflow_is_archived_and_not_executable():
     assert "snapshot_rebuild_promotion_run_id" not in transformation
     assert "Promote validated full-history SCD2 rebuild" not in transformation
     active_lines = [
-        line for line in transformation.splitlines()
+        line
+        for line in transformation.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
     assert not any(
-        "gh workflow run snowflake-serving-schema.yml" in line
-        for line in active_lines
+        "gh workflow run snowflake-serving-schema.yml" in line for line in active_lines
     )
 
 
