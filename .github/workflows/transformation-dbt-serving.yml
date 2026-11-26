@@ -9,13 +9,10 @@ on:
     branches: [main]
     paths:
       - .github/workflows/transformation-dbt-serving.yml
-      - .github/workflows/snowflake-serving-schema.yml
       - dbt/**
       - dbt_project.yml
       - scripts/publish_release_assets.py
       - scripts/publish_duckdb_recovery.py
-      - scripts/prepare_snowflake_serving_candidate.py
-      - scripts/promote_snowflake_serving_candidate.py
       - scripts/restore_duckdb_production.py
       - scripts/workflow_push_routing.py
   workflow_dispatch:
@@ -24,8 +21,8 @@ on:
         description: Serving backends to refresh
         required: true
         type: choice
-        options: [duckdb, snowflake, both]
-        default: both
+        options: [duckdb]
+        default: duckdb
 
 permissions:
   actions: read
@@ -81,7 +78,7 @@ jobs:
     if: >-
       needs.route.outputs.should_transform == 'true' &&
       (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') &&
-      (github.event_name != 'workflow_dispatch' || inputs.backends == 'duckdb' || inputs.backends == 'both')
+      (github.event_name != 'workflow_dispatch' || inputs.backends == 'duckdb')
     name: Build and publish DuckDB serving warehouse
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -360,84 +357,6 @@ jobs:
         with:
           path: dbt/docs-site
 
-  snowflake:
-    needs: route
-    if: >-
-      needs.route.outputs.should_transform == 'true' &&
-      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') &&
-      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
-      (github.event_name != 'workflow_dispatch' || inputs.backends == 'snowflake' || inputs.backends == 'both')
-    name: Dispatch Snowflake serving refresh
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      actions: write
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
-      EVENT_NAME: ${{ github.event_name }}
-
-    steps:
-      - name: Verify successful RAW promotion when workflow-triggered
-        id: source
-        run: |
-          if [ "$EVENT_NAME" != "workflow_run" ]; then
-            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
-          import subprocess
-
-          repository = os.environ["GITHUB_REPOSITORY"]
-          run_id = os.environ["SOURCE_RUN_ID"]
-          run = json.loads(subprocess.check_output(
-              ["gh", "api", f"repos/{repository}/actions/runs/{run_id}"], text=True
-          ))
-          if run.get("status") != "completed" or run.get("head_branch") != "main":
-              print("should_dispatch=false")
-              raise SystemExit(0)
-
-          path = run.get("path")
-          name = run.get("name")
-          attempt = int(run.get("run_attempt", 1))
-          jobs = json.loads(subprocess.check_output([
-              "gh", "api",
-              f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
-          ], text=True))
-          if path == ".github/workflows/mode1-incremental-loader.yml" and name == "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)":
-              job_name = "Stage Mode 1 Snowflake changes"
-              promotion_step = "Promote the validated Snowflake RAW candidate"
-          else:
-              print("should_dispatch=false")
-              raise SystemExit(0)
-
-          job = next((item for item in jobs.get("jobs", []) if item.get("name") == job_name), None)
-          successful_raw_handoff_steps = {
-              promotion_step,
-              "Persist initial Snowflake baseline when no archives are pending",
-          }
-          promoted = bool(job) and job.get("conclusion") == "success" and any(
-              step.get("name") in successful_raw_handoff_steps and step.get("conclusion") == "success"
-              for step in job.get("steps", [])
-          )
-          print(f"should_dispatch={'true' if promoted else 'false'}")
-          PY
-
-      - name: Dispatch the isolated Snowflake serving build
-        if: steps.source.outputs.should_dispatch == 'true'
-        run: |
-          if [ "$EVENT_NAME" = "workflow_run" ]; then
-            gh workflow run snowflake-serving-schema.yml --repo "$GITHUB_REPOSITORY" --ref main \
-              -f confirm_serving_schema=true -f snapshot_loader_run_id="$SOURCE_RUN_ID"
-          else
-            gh workflow run snowflake-serving-schema.yml --repo "$GITHUB_REPOSITORY" --ref main \
-              -f confirm_serving_schema=true
-          fi
-
-
   deploy-dbt-docs:
     name: Deploy dbt documentation to GitHub Pages
     if: needs.duckdb.outputs.warehouse_published == 'true' && needs.duckdb.result == 'success'
@@ -454,3 +373,464 @@ jobs:
       - name: Deploy dbt documentation
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+# BEGIN RETIRED HISTORICAL WORKFLOW — .github/workflows/transformation-dbt-serving.yml
+# Complete pre-retirement workflow preserved for historical reference.
+# This block is commented out and cannot be executed by GitHub Actions.
+# name: Transformation / dbt Serving Refresh
+#
+# on:
+#   workflow_run:
+#     workflows:
+#       - Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)
+#     types: [completed]
+#   push:
+#     branches: [main]
+#     paths:
+#       - .github/workflows/transformation-dbt-serving.yml
+#       - .github/workflows/snowflake-serving-schema.yml
+#       - dbt/**
+#       - dbt_project.yml
+#       - scripts/publish_release_assets.py
+#       - scripts/publish_duckdb_recovery.py
+#       - scripts/prepare_snowflake_serving_candidate.py
+#       - scripts/promote_snowflake_serving_candidate.py
+#       - scripts/restore_duckdb_production.py
+#       - scripts/workflow_push_routing.py
+#   workflow_dispatch:
+#     inputs:
+#       backends:
+#         description: Serving backends to refresh
+#         required: true
+#         type: choice
+#         options: [duckdb, snowflake, both]
+#         default: both
+#
+# permissions:
+#   actions: read
+#   contents: write
+#
+# concurrency:
+#   group: toronto-housing-data-publication
+#   cancel-in-progress: false
+#   queue: max
+#
+# jobs:
+#   reject_noncanonical_manual_dispatch:
+#     if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+#     name: Reject non-main production Transformation dispatch
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: |
+#           echo "Production Transformation must be dispatched from main." >&2
+#           exit 1
+#
+#   route:
+#     name: Determine whether Transformation is required
+#     runs-on: ubuntu-latest
+#     outputs:
+#       should_transform: ${{ steps.route.outputs.should_transform }}
+#     steps:
+#       - name: Check out full history for push routing
+#         if: github.event_name == 'push'
+#         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         with:
+#           fetch-depth: 0
+#       - id: route
+#         env:
+#           EVENT_NAME: ${{ github.event_name }}
+#           SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+#           BEFORE_SHA: ${{ github.event.before }}
+#           AFTER_SHA: ${{ github.sha }}
+#         run: |
+#           if [ "$EVENT_NAME" = "workflow_run" ]; then
+#             should_run=false
+#             if [ "$SOURCE_BRANCH" = "main" ]; then
+#               should_run=true
+#             fi
+#             echo "should_transform=$should_run" >> "$GITHUB_OUTPUT"
+#           elif [ "$EVENT_NAME" = "push" ]; then
+#           python scripts/workflow_push_routing.py --mode transformation --repo "$GITHUB_WORKSPACE" --before "$BEFORE_SHA" --after "$AFTER_SHA" >> "$GITHUB_OUTPUT"
+#           else
+#             echo "should_transform=true" >> "$GITHUB_OUTPUT"
+#           fi
+#
+#   duckdb:
+#     needs: route
+#     if: >-
+#       needs.route.outputs.should_transform == 'true' &&
+#       (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') &&
+#       (github.event_name != 'workflow_dispatch' || inputs.backends == 'duckdb' || inputs.backends == 'both')
+#     name: Build and publish DuckDB serving warehouse
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 120
+#     outputs:
+#       warehouse_published: ${{ steps.publish_warehouse.outcome == 'success' }}
+#     permissions:
+#       actions: read
+#       contents: write
+#       pages: write
+#       id-token: write
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       DBT_DUCKDB_PATH: ${{ github.workspace }}/data/warehouse/toronto.duckdb
+#       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+#       DO_NOT_TRACK: "1"
+#
+#     steps:
+#       - name: Verify the upstream SCD2 loading publication
+#         id: source
+#         env:
+#           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+#           EVENT_NAME: ${{ github.event_name }}
+#         run: |
+#           if [ "$EVENT_NAME" != "workflow_run" ]; then
+#             echo "should_run=true" >> "$GITHUB_OUTPUT"
+#             echo "source_commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+#             exit 0
+#           fi
+#           python - <<'PY' >> "$GITHUB_OUTPUT"
+#           import json
+#           import os
+#           import subprocess
+#           import sys
+#
+#           repository = os.environ["GITHUB_REPOSITORY"]
+#           run_id = os.environ["SOURCE_RUN_ID"]
+#           run = json.loads(subprocess.check_output(
+#               ["gh", "api", f"repos/{repository}/actions/runs/{run_id}"], text=True
+#           ))
+#           if run.get("status") != "completed" or run.get("head_branch") != "main":
+#               print("should_run=false")
+#               raise SystemExit(0)
+#
+#           path = run.get("path")
+#           name = run.get("name")
+#           attempt = int(run.get("run_attempt", 1))
+#           jobs = json.loads(subprocess.check_output([
+#               "gh", "api",
+#               f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+#           ], text=True))
+#
+#           if path == ".github/workflows/mode1-incremental-loader.yml" and name == "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)":
+#               job_name = "Stage Mode 1 DuckDB changes"
+#               publish_step = "Publish validated DuckDB loading assets"
+#           else:
+#               print("should_run=false")
+#               raise SystemExit(0)
+#
+#           job = next((item for item in jobs.get("jobs", []) if item.get("name") == job_name), None)
+#           successful_handoff_steps = {
+#               publish_step,
+#               "Persist initial DuckDB baseline when no archives are pending",
+#           }
+#           published = bool(job) and job.get("conclusion") == "success" and any(
+#               step.get("name") in successful_handoff_steps and step.get("conclusion") == "success"
+#               for step in job.get("steps", [])
+#           )
+#           print(f"should_run={'true' if published else 'false'}")
+#           print(f"source_commit={run['head_sha']}")
+#           if not published:
+#               print("No new validated DuckDB loading baseline; Transformation skipped.", file=sys.stderr)
+#           PY
+#
+#       - name: Check out the upstream SCD2 promotion source commit
+#         if: steps.source.outputs.should_run == 'true'
+#         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         with:
+#           ref: ${{ steps.source.outputs.source_commit }}
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         if: steps.source.outputs.should_run == 'true'
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Install DuckDB and validation dependencies
+#         if: steps.source.outputs.should_run == 'true'
+#         run: python -m pip install -e ".[dev]"
+#
+#       - name: Restore the exact promoted Loading generation and Parquet assets
+#         if: steps.source.outputs.should_run == 'true'
+#         run: |
+#           mkdir -p data/warehouse data-assets
+#           python -m scripts.restore_duckdb_production \
+#             --release-tag loading-latest \
+#             --database-asset toronto-loading.duckdb \
+#             --output data/warehouse/toronto.duckdb
+#           gh release download loading-latest --repo "$GITHUB_REPOSITORY" \
+#             --pattern toronto-active-permits.parquet --dir data-assets
+#           gh release download loading-latest --repo "$GITHUB_REPOSITORY" \
+#             --pattern toronto-cleared-permits.parquet --dir data-assets
+#
+#       - name: Create isolated dbt environment
+#         if: steps.source.outputs.should_run == 'true'
+#         run: |
+#           python -m venv "$RUNNER_TEMP/dbt-venv"
+#           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+#           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+#
+#       - name: Configure dbt profile
+#         if: steps.source.outputs.should_run == 'true'
+#         working-directory: dbt
+#         run: cp profiles.yml.example profiles.yml
+#
+#       - name: Install dbt packages and validate source freshness
+#         if: steps.source.outputs.should_run == 'true'
+#         working-directory: dbt
+#         run: |
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" deps --profiles-dir .
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" freshness --profiles-dir .
+#
+#       - name: Build dbt serving models and run tests
+#         if: steps.source.outputs.should_run == 'true'
+#         working-directory: dbt
+#         run: |
+#           AS_OF_DATE="$(date -u +%F)"
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" build --profiles-dir . \
+#             --vars "{\"as_of_date\": \"${AS_OF_DATE}\"}"
+#
+#       - name: Generate dbt documentation
+#         if: steps.source.outputs.should_run == 'true'
+#         working-directory: dbt
+#         run: |
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" docs generate --profiles-dir . --output-dir docs-site
+#
+#       - name: Inject Google Analytics into generated dbt docs
+#         if: steps.source.outputs.should_run == 'true'
+#         run: |
+#           python - <<'PY'
+#           from pathlib import Path
+#           measurement_id = "G-7F7JW7LG51"
+#           script_url = "https://www.googletagmanager.com/gtag/js?id=" + measurement_id
+#           index = Path("dbt/docs-site/index.html")
+#           html = index.read_text(encoding="utf-8")
+#           if script_url not in html:
+#               if html.count("</head>") != 1:
+#                   raise SystemExit("Expected exactly one </head> in generated dbt docs")
+#               tag = (
+#                   '    <!-- Google tag (gtag.js) -->\n'
+#                   f'    <script async src="{script_url}"></script>\n'
+#                   '    <script>\n'
+#                   '      window.dataLayer = window.dataLayer || [];\n'
+#                   '      function gtag() { window.dataLayer.push(arguments); }\n'
+#                   '      gtag("js", new Date());\n'
+#                   f'      gtag("config", "{measurement_id}");\n'
+#                   '    </script>\n'
+#               )
+#               index.write_text(html.replace("</head>", tag + "</head>", 1), encoding="utf-8")
+#           html = index.read_text(encoding="utf-8")
+#           if script_url not in html or f'gtag("config", "{measurement_id}")' not in html:
+#               raise SystemExit("Google Analytics tag injection failed")
+#           PY
+#
+#       - name: Record successful DuckDB dashboard refresh metadata
+#         if: steps.source.outputs.should_run == 'true'
+#         env:
+#           SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+#           SOURCE_MODE1_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+#           WORKFLOW_RUN_ID: ${{ github.run_id }}
+#         run: |
+#           python - <<'PY'
+#           from datetime import datetime, timezone
+#           import os
+#           import duckdb
+#           with duckdb.connect(os.environ["DBT_DUCKDB_PATH"]) as connection:
+#               connection.execute("CREATE SCHEMA IF NOT EXISTS metadata")
+#               connection.execute("""CREATE TABLE IF NOT EXISTS metadata.dashboard_refresh_metadata (
+#                   refresh_id INTEGER PRIMARY KEY CHECK (refresh_id = 1),
+#                   last_successful_refresh_utc TIMESTAMPTZ NOT NULL,
+#                   source_commit VARCHAR NOT NULL,
+#                   workflow_run_id VARCHAR NOT NULL,
+#                   source_mode1_run_id VARCHAR
+#               )""")
+#               connection.execute(
+#                   "ALTER TABLE metadata.dashboard_refresh_metadata "
+#                   "ADD COLUMN IF NOT EXISTS source_mode1_run_id VARCHAR"
+#               )
+#               connection.execute("DELETE FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1")
+#               connection.execute(
+#                   "INSERT INTO metadata.dashboard_refresh_metadata "
+#                   "(refresh_id, last_successful_refresh_utc, source_commit, workflow_run_id, source_mode1_run_id) "
+#                   "VALUES (?, ?, ?, ?, ?)",
+#                   (
+#                       1,
+#                       datetime.now(timezone.utc),
+#                       os.environ["SOURCE_COMMIT"],
+#                       os.environ["WORKFLOW_RUN_ID"],
+#                       os.environ.get("SOURCE_MODE1_RUN_ID") or None,
+#                   ),
+#               )
+#           PY
+#
+#       - name: Validate dashboard-facing DuckDB serving relations
+#         if: steps.source.outputs.should_run == 'true'
+#         run: |
+#           python - <<'PY'
+#           import os
+#           import duckdb
+#           required = (
+#               "mart_active_permit_age", "fct_active_permit_revision",
+#               "mart_active_backlog_summary", "mart_active_backlog_by_year_type",
+#               "mart_cleared_lifecycle_by_year_type", "mart_cleared_lifecycle_matched_by_year_type",
+#               "mart_cleared_lifecycle_pooled", "mart_data_quality_summary",
+#               "fct_cleared_permit_revision",
+#           )
+#           with duckdb.connect(os.environ["DBT_DUCKDB_PATH"], read_only=True) as connection:
+#               available = {str(row[0]).lower() for row in connection.execute(
+#                   "SELECT table_name FROM information_schema.tables WHERE table_schema='analytics'"
+#               ).fetchall()}
+#               missing = sorted(set(required) - available)
+#               if missing:
+#                   raise RuntimeError(f"Dashboard serving relations are missing: {missing}")
+#               for table in required:
+#                   count = int(connection.execute(f"SELECT COUNT(*) FROM analytics.{table}").fetchone()[0] or 0)
+#                   if count <= 0:
+#                       raise RuntimeError(f"Dashboard serving relation is empty: {table}")
+#                   print(f"analytics.{table}: {count:,} rows")
+#               metadata = int(connection.execute(
+#                   "SELECT COUNT(*) FROM metadata.dashboard_refresh_metadata WHERE refresh_id=1"
+#               ).fetchone()[0])
+#               if metadata != 1:
+#                   raise RuntimeError("Dashboard refresh metadata is missing or duplicated")
+#           PY
+#
+#       - name: Package the dbt documentation archive
+#         if: steps.source.outputs.should_run == 'true'
+#         run: |
+#           test -s dbt/docs-site/index.html
+#           mkdir -p data-assets/dbt-docs
+#           cp -R dbt/docs-site/. data-assets/dbt-docs/
+#           printf '%s\n' \
+#             "Toronto Housing Analytics — dbt documentation" \
+#             "Extract toronto-dbt-docs.zip and run: python3 -m http.server 8000" \
+#             > data-assets/dbt-docs/README.txt
+#           python - <<'PY'
+#           from pathlib import Path
+#           from zipfile import ZIP_DEFLATED, ZipFile
+#           source = Path("data-assets/dbt-docs")
+#           archive = Path("data-assets/toronto-dbt-docs.zip")
+#           with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+#               for path in sorted(item for item in source.rglob("*") if item.is_file()):
+#                   zipped.write(path, path.relative_to(source).as_posix())
+#           with ZipFile(archive) as zipped:
+#               if zipped.testzip() is not None or "index.html" not in zipped.namelist():
+#                   raise SystemExit("dbt documentation ZIP failed verification")
+#           PY
+#
+#       - name: Publish the four verified DuckDB production assets
+#         id: publish_warehouse
+#         if: steps.source.outputs.should_run == 'true'
+#         env:
+#           WAREHOUSE_LATEST_BACKUP_DIR: ${{ runner.temp }}/warehouse-latest-recovery-${{ github.run_id }}
+#           WAREHOUSE_LATEST_TARGET_SHA: ${{ steps.source.outputs.source_commit }}
+#         run: python scripts/publish_release_assets.py
+#
+#       - name: Preserve the immutable DuckDB serving recovery checkpoint
+#         if: steps.publish_warehouse.outcome == 'success'
+#         env:
+#           GH_TOKEN: ${{ github.token }}
+#         run: python scripts/publish_duckdb_recovery.py
+#
+#       - name: Upload dbt documentation for GitHub Pages
+#         if: steps.publish_warehouse.outcome == 'success'
+#         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+#         with:
+#           path: dbt/docs-site
+#
+#   snowflake:
+#     needs: route
+#     if: >-
+#       needs.route.outputs.should_transform == 'true' &&
+#       (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') &&
+#       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+#       (github.event_name != 'workflow_dispatch' || inputs.backends == 'snowflake' || inputs.backends == 'both')
+#     name: Dispatch Snowflake serving refresh
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 15
+#     permissions:
+#       actions: write
+#       contents: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+#       EVENT_NAME: ${{ github.event_name }}
+#
+#     steps:
+#       - name: Verify successful RAW promotion when workflow-triggered
+#         id: source
+#         run: |
+#           if [ "$EVENT_NAME" != "workflow_run" ]; then
+#             echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+#             exit 0
+#           fi
+#           python - <<'PY' >> "$GITHUB_OUTPUT"
+#           import json
+#           import os
+#           import subprocess
+#
+#           repository = os.environ["GITHUB_REPOSITORY"]
+#           run_id = os.environ["SOURCE_RUN_ID"]
+#           run = json.loads(subprocess.check_output(
+#               ["gh", "api", f"repos/{repository}/actions/runs/{run_id}"], text=True
+#           ))
+#           if run.get("status") != "completed" or run.get("head_branch") != "main":
+#               print("should_dispatch=false")
+#               raise SystemExit(0)
+#
+#           path = run.get("path")
+#           name = run.get("name")
+#           attempt = int(run.get("run_attempt", 1))
+#           jobs = json.loads(subprocess.check_output([
+#               "gh", "api",
+#               f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+#           ], text=True))
+#           if path == ".github/workflows/mode1-incremental-loader.yml" and name == "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)":
+#               job_name = "Stage Mode 1 Snowflake changes"
+#               promotion_step = "Promote the validated Snowflake RAW candidate"
+#           else:
+#               print("should_dispatch=false")
+#               raise SystemExit(0)
+#
+#           job = next((item for item in jobs.get("jobs", []) if item.get("name") == job_name), None)
+#           successful_raw_handoff_steps = {
+#               promotion_step,
+#               "Persist initial Snowflake baseline when no archives are pending",
+#           }
+#           promoted = bool(job) and job.get("conclusion") == "success" and any(
+#               step.get("name") in successful_raw_handoff_steps and step.get("conclusion") == "success"
+#               for step in job.get("steps", [])
+#           )
+#           print(f"should_dispatch={'true' if promoted else 'false'}")
+#           PY
+#
+#       - name: Dispatch the isolated Snowflake serving build
+#         if: steps.source.outputs.should_dispatch == 'true'
+#         run: |
+#           if [ "$EVENT_NAME" = "workflow_run" ]; then
+#             gh workflow run snowflake-serving-schema.yml --repo "$GITHUB_REPOSITORY" --ref main \
+#               -f confirm_serving_schema=true -f snapshot_loader_run_id="$SOURCE_RUN_ID"
+#           else
+#             gh workflow run snowflake-serving-schema.yml --repo "$GITHUB_REPOSITORY" --ref main \
+#               -f confirm_serving_schema=true
+#           fi
+#
+#
+#   deploy-dbt-docs:
+#     name: Deploy dbt documentation to GitHub Pages
+#     if: needs.duckdb.outputs.warehouse_published == 'true' && needs.duckdb.result == 'success'
+#     needs: [route, duckdb]
+#     permissions:
+#       pages: write
+#       id-token: write
+#     environment:
+#       name: github-pages
+#       url: ${{ steps.deployment.outputs.page_url }}
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 10
+#     steps:
+#       - name: Deploy dbt documentation
+#         id: deployment
+#         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+# END RETIRED HISTORICAL WORKFLOW

@@ -391,7 +391,7 @@ def test_snowflake_snapshot_promotion_requires_enabled_gate(monkeypatch):
         )
 
 
-def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
+def test_promotion_workflow_is_duckdb_only():
     workflow = (
         Path(__file__).resolve().parents[1]
         / ".github"
@@ -399,20 +399,15 @@ def test_promotion_workflow_keeps_duckdb_and_snowflake_promotion_independent():
         / "promote-snapshot-rebuild.yml"
     ).read_text(encoding="utf-8")
 
-    verify_job = workflow.split("  verify:", 1)[1].split("  promote-duckdb:", 1)[0]
-    duckdb_job = workflow.split("  promote-duckdb:", 1)[1].split(
-        "  promote-snowflake:", 1
-    )[0]
-    snowflake_job = workflow.split("  promote-snowflake:", 1)[1]
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
 
-    assert "backend_policy: ${{ steps.policy.outputs.backend_policy }}" in workflow
-    assert 'echo "backend_policy=duckdb-only"' in verify_job
-    assert 'echo "backend_policy=both"' in verify_job
-    assert "python -m scripts.validate_full_rebuild_promotion" in verify_job
-    assert "needs: verify" in duckdb_job
-    assert "SNOWFLAKE_OPERATIONS_ENABLED" not in duckdb_job
-    assert "needs.verify.outputs.backend_policy == 'both'" in snowflake_job
-    assert "vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'" in snowflake_job
+    assert "  verify:" in active
+    assert "  promote-duckdb:" in active
+    assert "promote-snowflake:" not in active
+    assert "backend_policy=both" not in active
+    assert "SNOWFLAKE_OPERATIONS_ENABLED" not in active
+    assert "python -m scripts.validate_full_rebuild_promotion" in active
+    assert "needs: verify" in active
 
 
 def test_duckdb_promotion_summary_requires_quarantine_counts(tmp_path):

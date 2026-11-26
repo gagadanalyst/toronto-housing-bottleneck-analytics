@@ -1,14 +1,16 @@
 # Snowflake operations guide
 
+> **Historical reference — Snowflake workflows retired (November 2026).** The Snowflake trial has expired, and Snowflake-specific GitHub Actions workflow files and jobs have been removed from active automation. This guide preserves the former integration, account setup, roles, cost safeguards, serving-schema access, validation, and recovery design. Its workflow commands are historical examples, not current operating instructions. DuckDB is the active publication and recovery backend. The optional dashboard reader code is retained separately.
+
 This guide covers the optional Snowflake warehouse backend for Toronto Housing
 Bottleneck Analytics: account setup, roles and cost safeguards, Mode 1 incremental
 loading, Mode 2 historical reconstruction and promotion, serving-schema access,
 and the procedure for disabling Snowflake operations.
 
-DuckDB remains the independent default publication backend. Snowflake Mode 1
-loading, full-history replay/promotion, and serving are separately gated by
-`SNOWFLAKE_OPERATIONS_ENABLED`; disabling that gate does not disable immutable
-source archive publication or the DuckDB Mode 1 path.
+DuckDB remains the active publication backend. Historically, Snowflake Mode 1
+loading, full-history replay/promotion, and serving were separately gated by
+`SNOWFLAKE_OPERATIONS_ENABLED`. That gate no longer controls an active
+GitHub Actions workflow; the former procedures remain documented below.
 
 ## Configuration at a glance
 

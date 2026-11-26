@@ -22,16 +22,20 @@ def test_loading_does_not_build_or_dispatch_serving():
     assert "Dispatch the Snowflake serving-schema refresh" not in workflow
 
 
-def test_transformation_owns_dbt_and_snowflake_serving():
+def test_transformation_owns_duckdb_dbt_serving():
     workflow = (ROOT / ".github/workflows/transformation-dbt-serving.yml").read_text()
-    assert "loading-latest" in workflow
-    assert 'bin/dbt" build --profiles-dir .' in workflow
-    assert "warehouse-latest" in workflow
-    assert "gh workflow run snowflake-serving-schema.yml" in workflow
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+
+    assert "loading-latest" in active
+    assert 'bin/dbt" build --profiles-dir .' in active
+    assert "warehouse-latest" in active
+    assert "gh workflow run snowflake-serving-schema.yml" not in active
 
 
 def test_serving_workflow_verifies_loading_job():
-    workflow = (ROOT / ".github/workflows/snowflake-serving-schema.yml").read_text()
+    workflow = (ROOT / "docs/retired-workflows/snowflake-serving-schema.yml").read_text(
+        encoding="utf-8"
+    )
     assert "snapshot_loader_run_id:" in workflow
     assert "Loading SCD2 / Mode 1 Incremental Loader (Validated Staging)" in workflow
     assert "Stage Mode 1 Snowflake changes" in workflow
