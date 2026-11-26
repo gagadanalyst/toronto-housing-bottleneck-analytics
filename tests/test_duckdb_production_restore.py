@@ -129,6 +129,10 @@ def test_mode1_mode2_and_promotion_use_the_same_restore_helper():
         encoding="utf-8"
     )
 
+    mode1 = mode1.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    promotion = promotion.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    mode2 = mode2.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+
     command = "python -m scripts.restore_duckdb_production"
 
     assert mode1.count(command) == 1

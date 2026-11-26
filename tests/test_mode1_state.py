@@ -757,34 +757,27 @@ def test_mode1_workflow_guards_replay_outputs_and_dispatch_ref():
         / ".github/workflows/mode1-incremental-loader.yml"
     )
     workflow = workflow_path.read_text(encoding="utf-8")
+    workflow = workflow.split(
+        "# BEGIN RETIRED HISTORICAL WORKFLOW", 1
+    )[0]
     assert "reject_noncanonical_manual_dispatch" in workflow
     assert "github.ref != 'refs/heads/main'" in workflow
-    assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 3
-    assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 5
+    assert workflow.count('case "$HAS_PENDING_ARCHIVES" in') == 2
+    assert workflow.count("steps.replay.outputs.has_pending_archives == 'false'") == 2
     assert "persist_validated_duckdb_candidate" in workflow
-    assert "persist_validated_snowflake_candidate" in workflow
     assert "CANDIDATE_DATABASE" in workflow
     assert "persist_validated_duckdb_candidate.outcome == 'success'" in workflow
-    assert "persist_validated_snowflake_candidate.outcome == 'success'" in workflow
     assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2))"' in workflow
     assert '--asset-run-attempt "$((GITHUB_RUN_ATTEMPT * 2 + 1))"' in workflow
     assert "Dispatch the Snowflake serving-schema refresh" not in workflow
-    assert (
-        "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
-        in workflow
-    )
-    assert (
-        "if: always() && steps.promote_snowflake_candidate.outcome == 'success'"
-        in workflow
-    )
-    assert workflow.count("steps.replay.outputs.has_pending_archives != 'true'") == 2
+    assert workflow.count("steps.replay.outputs.has_pending_archives != 'true'") == 1
     assert "rebootstrap_from_mode2:" in workflow
     assert "default: false" in workflow
     assert (
         workflow.count("REBOOTSTRAP_FROM_MODE2: ${{ inputs.rebootstrap_from_mode2 }}")
-        == 2
+        == 1
     )
-    assert workflow.count("prepare_args+=(--rebootstrap-from-mode2)") == 2
+    assert workflow.count("prepare_args+=(--rebootstrap-from-mode2)") == 1
 
 
 @pytest.mark.parametrize("backend", ("duckdb", "snowflake"))

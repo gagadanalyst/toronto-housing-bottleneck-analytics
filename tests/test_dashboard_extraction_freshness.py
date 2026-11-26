@@ -82,27 +82,15 @@ def test_missing_ledger_returns_none() -> None:
 def test_snowflake_serving_workflow_records_source_and_refresh_timestamps() -> None:
     workflow_path = (
         Path(__file__).resolve().parents[1]
-        / ".github/workflows/snowflake-serving-schema.yml"
+        / "docs/retired-workflows/snowflake-serving-schema.yml"
     )
-    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["build"]["steps"]
-    metadata_step = next(
-        step
-        for step in steps
-        if step.get("name") == "Ensure dashboard refresh metadata table exists"
-    )
-    refresh_step = next(
-        step
-        for step in steps
-        if step.get("name") == "Record successful dashboard refresh timestamp"
-    )
+    workflow = workflow_path.read_text(encoding="utf-8")
 
-    assert "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC TIMESTAMP_TZ" in metadata_step["run"]
-    assert (
-        "ADD COLUMN IF NOT EXISTS LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC"
-        in metadata_step["run"]
-    )
-    assert "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER" in refresh_step["run"]
-    assert "EXTRACTION_COMPLETED_AT_UTC" in refresh_step["run"]
-    assert "COUNT_IF(LOWER(STATUS) = 'succeeded') = 2" in refresh_step["run"]
-    assert "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC" in refresh_step["run"]
+    assert "Ensure dashboard refresh metadata table exists" in workflow
+    assert "Record successful dashboard refresh timestamp" in workflow
+    assert "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC TIMESTAMP_TZ" in workflow
+    assert "ADD COLUMN IF NOT EXISTS LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC" in workflow
+    assert "TORONTO.RAW.TORONTO_SNAPSHOT_LEDGER" in workflow
+    assert "EXTRACTION_COMPLETED_AT_UTC" in workflow
+    assert "COUNT_IF(LOWER(STATUS) = 'succeeded') = 2" in workflow
+    assert "LAST_SUCCESSFUL_SOURCE_EXTRACTION_UTC" in workflow

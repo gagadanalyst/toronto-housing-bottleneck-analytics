@@ -211,32 +211,30 @@ def test_snapshot_replay_is_mode2_only_and_matches_promotion_gate():
         encoding="utf-8"
     )
 
-    assert "name: Snapshot Loader (Full-History Rebuild and Parity)" in workflow
-    assert "  schedule:" not in workflow
-    assert "incremental" not in workflow.lower()
-    assert "REPLAY_MODE" not in workflow
-    assert "DRY_RUN" not in workflow
-    assert "TORONTO_SNAPSHOT_LOADER_ENABLED" not in workflow
-    assert "TORONTO_CANONICAL_REPLAY" not in workflow
-    assert "has_pending_archives" not in workflow
-    assert "deploy-dbt-docs" not in workflow
-    assert workflow.count("--mode rebuild") == 2
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    assert "name: Snapshot Loader (DuckDB Full-History Rebuild)" in active
+    assert "  schedule:" not in active
+    assert "incremental" not in active.lower()
+    assert "REPLAY_MODE" not in active
+    assert "DRY_RUN" not in active
+    assert "TORONTO_SNAPSHOT_LOADER_ENABLED" not in active
+    assert "TORONTO_CANONICAL_REPLAY" not in active
+    assert "has_pending_archives" not in active
+    assert "deploy-dbt-docs" not in active
+    assert active.count("--mode rebuild") == 1
 
+    assert "name: Load DuckDB (rebuild)" in active
     for marker in (
-        "name: Load DuckDB (rebuild)",
         "name: Load Snowflake (rebuild)",
         "Validate and compare rebuilt SCD2 histories",
         "Revalidate saved Mode 2 evidence",
     ):
-        assert marker in workflow
+        assert marker not in active
 
     promotion = (root / ".github/workflows/promote-snapshot-rebuild.yml").read_text(
         encoding="utf-8"
-    )
-    assert (
-        'run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"'
-        in promotion
-    )
+    ).split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    assert '"Snapshot Loader (DuckDB Full-History Rebuild)"' in promotion
 
 
 def test_quality_gate_uses_source_specific_baselines_and_skips_loaded_observations():

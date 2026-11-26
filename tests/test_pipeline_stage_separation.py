@@ -21,8 +21,9 @@ def test_loading_is_independent_from_transformations():
     assert "Dispatch the Snowflake serving-schema refresh" not in workflow
 
 
-def test_transformation_owns_duckdb_and_snowflake_serving():
+def test_transformation_owns_duckdb_serving_and_snowflake_is_archived():
     workflow = (ROOT / ".github/workflows/transformation-dbt-serving.yml").read_text()
+    archived = ROOT / "docs/retired-workflows/snowflake-serving-schema.yml"
     assert "loading-latest" in workflow
     assert 'bin/dbt" build --profiles-dir .' in workflow
     assert "warehouse-latest" in workflow
@@ -31,7 +32,17 @@ def test_transformation_owns_duckdb_and_snowflake_serving():
     assert workflow.index(
         "Publish the four verified DuckDB production assets"
     ) < workflow.index("Preserve the immutable DuckDB serving recovery checkpoint")
-    assert "gh workflow run snowflake-serving-schema.yml" in workflow
+    active_lines = [
+        line for line in workflow.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any(
+        "gh workflow run snowflake-serving-schema.yml" in line
+        for line in active_lines
+    )
+    assert not (ROOT / ".github/workflows/snowflake-serving-schema.yml").exists()
+    assert archived.is_file()
+    assert "BEGIN RETIRED HISTORICAL WORKFLOW" in archived.read_text()
 
 
 def test_complete_pipeline_schedule_uses_toronto_timezone():
@@ -54,12 +65,20 @@ def test_mode2_promotion_updates_loading_baseline_not_dashboard_warehouse():
     assert "publish_release_assets.py" not in workflow
     assert "publish_duckdb_recovery.py" not in workflow
     assert "dbt build" not in workflow
-    assert "gh workflow run snowflake-serving-schema.yml" not in workflow
+    active_lines = [
+        line for line in workflow.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any(
+        "gh workflow run snowflake-serving-schema.yml" in line
+        for line in active_lines
+    )
     assert "rebootstrap-loading-duckdb:" in workflow
-    assert "rebootstrap-loading-snowflake:" in workflow
-    assert "rebootstrap_from_mode2=true" in workflow
-    assert "loading_published:" in workflow
-    assert "raw_promoted:" in workflow
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    assert "rebootstrap-loading-snowflake:" not in active
+    assert "rebootstrap_from_mode2=true" in active
+    assert "loading_published:" in active
+    assert "raw_promoted:" not in active
 
 
 def test_mode2_replay_captures_loading_baseline_not_serving_baseline():
@@ -67,8 +86,9 @@ def test_mode2_replay_captures_loading_baseline_not_serving_baseline():
     assert "--release-tag loading-latest" in workflow
     assert "--database-asset toronto-loading.duckdb" in workflow
 
-    seed_job = workflow.split("  seed-loading-baseline:", 1)[1].split("  duckdb:", 1)[0]
-    duckdb_job = workflow.split("  duckdb:", 1)[1].split("  snowflake:", 1)[0]
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    seed_job = active.split("  seed-loading-baseline:", 1)[1].split("  duckdb:", 1)[0]
+    duckdb_job = active.split("  duckdb:", 1)[1]
 
     assert "contents: write" in seed_job
     assert "scripts.seed_loading_release" in seed_job
@@ -83,8 +103,9 @@ def test_mode2_replay_captures_loading_baseline_not_serving_baseline():
 def test_mode2_duckdb_replay_seeds_loading_baseline_before_capture():
     workflow = (ROOT / ".github/workflows/snapshot-replay.yml").read_text()
 
-    seed_job = workflow.split("  seed-loading-baseline:", 1)[1].split("  duckdb:", 1)[0]
-    duckdb_job = workflow.split("  duckdb:", 1)[1].split("  snowflake:", 1)[0]
+    active = workflow.split("# BEGIN RETIRED HISTORICAL WORKFLOW", 1)[0]
+    seed_job = active.split("  seed-loading-baseline:", 1)[1].split("  duckdb:", 1)[0]
+    duckdb_job = active.split("  duckdb:", 1)[1]
 
     assert "Seed or verify loading-latest before Mode 2 reconstruction" in seed_job
     assert workflow.index("  seed-loading-baseline:") < workflow.index("  duckdb:")
@@ -121,18 +142,26 @@ def test_loading_rollback_backup_is_preserved_on_failure_or_cancellation():
         assert "if-no-files-found: ignore" in workflow
 
 
-def test_snowflake_serving_no_longer_accepts_direct_mode2_promotion():
+def test_snowflake_serving_workflow_is_archived_and_not_executable():
     transformation = (
         ROOT / ".github/workflows/transformation-dbt-serving.yml"
     ).read_text()
-    serving = (ROOT / ".github/workflows/snowflake-serving-schema.yml").read_text()
+    active_serving = ROOT / ".github/workflows/snowflake-serving-schema.yml"
+    archived_serving = ROOT / "docs/retired-workflows/snowflake-serving-schema.yml"
 
+    assert not active_serving.exists()
+    assert archived_serving.is_file()
+    assert "BEGIN RETIRED HISTORICAL WORKFLOW" in archived_serving.read_text()
     assert "snapshot_rebuild_promotion_run_id" not in transformation
-    assert "snapshot_rebuild_promotion_run_id" not in serving
     assert "Promote validated full-history SCD2 rebuild" not in transformation
-    assert "snapshot_loader_run_id" in transformation
-    assert "snapshot_loader_run_id" in serving
-    assert "confirm_serving_schema:" in serving
+    active_lines = [
+        line for line in transformation.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not any(
+        "gh workflow run snowflake-serving-schema.yml" in line
+        for line in active_lines
+    )
 
 
 def test_transformation_routes_loading_changes_before_serving():
@@ -155,7 +184,9 @@ def test_transformation_routes_loading_changes_before_serving():
     push_paths = workflow.split("    paths:\n", 1)[1].split("  workflow_dispatch:", 1)[
         0
     ]
-    assert "- scripts/promote_snowflake_serving_candidate.py" in push_paths
+    assert "- scripts/promote_snowflake_serving_candidate.py" not in push_paths
+    assert "- scripts/prepare_snowflake_serving_candidate.py" not in push_paths
+    assert "- .github/workflows/snowflake-serving-schema.yml" not in push_paths
 
 
 def test_complete_pipeline_uses_repository_scoped_dispatch_token():
