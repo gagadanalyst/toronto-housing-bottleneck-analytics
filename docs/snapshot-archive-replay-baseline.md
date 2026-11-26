@@ -1,6 +1,7 @@
 # Snapshot archives, Loading, Transformation, and Mode 2 recovery
 
-> **Current operating status (November 2026):** Current GitHub Actions publication, Mode 1 loading, Mode 2 replay/promotion, and Transformation use DuckDB only. Snowflake-specific workflows and jobs were retired in November 2026 after the trial expired. The Snowflake procedures, dual-backend replay design, parity checks, and commands below are retained as historical implementation and validation evidence; they are not executable through the current workflows.
+**Current operating status (November 2026):** Snowflake operations have been retired following the end of the Snowflake trial. The Snowflake-specific GitHub Actions workflows have been archived under `docs/retired-workflows/`. DuckDB is the active backend for automated production workflows. The Snowflake backend, integration, configuration, and operational procedures remain documented in this repository.
+
 
 This runbook describes the current separation between immutable source extraction,
 incremental production loading, full-history reconstruction, and explicit
