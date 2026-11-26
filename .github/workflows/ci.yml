@@ -9,10 +9,8 @@ on:
       - 'dashboard/**'
       - 'tests/**'
       - '.github/workflows/ci.yml'
-      - '.github/workflows/snowflake-serving-schema.yml'
       - 'dbt/models/exposures.yml'
       - 'infra/**'
-      - 'scripts/promote_snowflake_serving_candidate.py'
       - '.gitignore'
       - 'LICENSE'
   pull_request:
@@ -209,3 +207,219 @@ jobs:
 
       - name: Check dependency consistency
         run: python -m pip check
+
+# BEGIN RETIRED HISTORICAL WORKFLOW — .github/workflows/ci.yml
+# Complete pre-retirement workflow preserved for historical reference.
+# This block is commented out and cannot be executed by GitHub Actions.
+# name: CI
+#
+# on:
+#   push:
+#     branches: [main]
+#     paths-ignore:
+#       - '**/*.md'
+#       - 'docs/**'
+#       - 'dashboard/**'
+#       - 'tests/**'
+#       - '.github/workflows/ci.yml'
+#       - '.github/workflows/snowflake-serving-schema.yml'
+#       - 'dbt/models/exposures.yml'
+#       - 'infra/**'
+#       - 'scripts/promote_snowflake_serving_candidate.py'
+#       - '.gitignore'
+#       - 'LICENSE'
+#   pull_request:
+#   workflow_dispatch:
+#   schedule:
+#     - cron: "0 23 * * *"
+#       timezone: "America/Toronto"
+#
+# permissions:
+#   contents: read
+#
+# concurrency:
+#   group: toronto-housing-ingestion
+#   cancel-in-progress: false
+#
+# jobs:
+#   test:
+#     name: Test and build
+#     env:
+#       RUNTIME__DLTHUB_TELEMETRY: "false"
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 20
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Upgrade pip to a patched release
+#         run: python -m pip install --upgrade "pip>=26.2.1,<27"
+#
+#       - run: python -m pip install -e ".[dev]"
+#       - run: ruff check .
+#       - run: ruff format --check .
+#
+#       - name: Run unit and non-snapshot tests
+#         run: >
+#           pytest -q
+#           --cov=toronto_housing_ingestion
+#           --cov-report=term-missing
+#           --ignore=tests/integration
+#           --ignore=tests/test_warehouse_load.py
+#           --ignore=tests/test_live_fallbacks.py
+#           --ignore=tests/test_local_setup.py
+#
+#       - name: Run SCD2 integration tests
+#         run: >-
+#           python -m pytest -s
+#           tests/test_dlt_integration.py
+#           tests/integration/test_dlt_scd2_row_hash.py
+#
+#       - name: Audit root environment dependencies
+#         run: pip-audit
+#
+#       - name: Audit dashboard dependency requirements
+#         run: pip-audit -r dashboard/requirements.txt
+#
+#       - name: Audit dbt dependency requirements
+#         run: pip-audit -r dbt/requirements.txt
+#
+#       - run: python -m build
+#
+#   dbt-validation:
+#     name: Validate dbt against published warehouse
+#     if: github.event_name == 'pull_request'
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 20
+#     env:
+#       DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+#       DO_NOT_TRACK: "1"
+#       DBT_DUCKDB_PATH: ${{ github.workspace }}/data/warehouse/dbt-ci/toronto.duckdb
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Create isolated dbt environment
+#         run: |
+#           python -m venv "$RUNNER_TEMP/dbt-venv"
+#           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install --upgrade "pip>=26.2.1,<27"
+#           "$RUNNER_TEMP/dbt-venv/bin/python" -m pip install -r dbt/requirements.txt
+#
+#       - name: Download published warehouse snapshot
+#         run: |
+#           set -euo pipefail
+#           mkdir -p data/warehouse/dbt-ci
+#           curl -fL --retry 3 --retry-delay 2 \
+#             "https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/download/warehouse-latest/toronto.duckdb" \
+#             -o data/warehouse/dbt-ci/toronto.duckdb
+#           test -s data/warehouse/dbt-ci/toronto.duckdb
+#           sha256sum data/warehouse/dbt-ci/toronto.duckdb
+#
+#       - name: Configure dbt profile
+#         working-directory: dbt
+#         run: cp profiles.yml.example profiles.yml
+#
+#       - name: Install dbt package dependencies
+#         working-directory: dbt
+#         run: $RUNNER_TEMP/dbt-venv/bin/dbt deps --profiles-dir .
+#
+#       - name: Check connection and parse project
+#         working-directory: dbt
+#         run: |
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" debug --profiles-dir .
+#           "$RUNNER_TEMP/dbt-venv/bin/dbt" parse --profiles-dir .
+#
+#       - name: Build models and run tests
+#         working-directory: dbt
+#         run: $RUNNER_TEMP/dbt-venv/bin/dbt build --profiles-dir .
+#
+#       - name: Generate dbt documentation site for validation
+#         working-directory: dbt
+#         run: $RUNNER_TEMP/dbt-venv/bin/dbt docs generate --profiles-dir . --output-dir docs-site
+#
+#       - name: Validate GitHub Pages artifact packaging
+#         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+#         with:
+#           name: dbt-docs-pages-check
+#           path: dbt/docs-site
+#
+#       - name: Package and validate dbt documentation archive (PR check)
+#         run: |
+#           set -euo pipefail
+#           test -s dbt/docs-site/index.html
+#           mkdir -p data-assets/dbt-docs
+#           cp -R dbt/docs-site/. data-assets/dbt-docs/
+#           cat > data-assets/dbt-docs/README.txt <<'EOF'
+#           Toronto Housing Analytics — dbt documentation
+#
+#           This archive contains the complete static dbt documentation site, including its assets and generated index files.
+#
+#           1. Extract toronto-dbt-docs.zip into a directory.
+#           2. Open a terminal in that extracted directory.
+#           3. Run: python3 -m http.server 8000
+#           4. Open http://localhost:8000/ in your browser.
+#           EOF
+#           python - <<'PYZIP'
+#           from pathlib import Path
+#           from zipfile import ZIP_DEFLATED, ZipFile
+#
+#           source = Path("data-assets/dbt-docs")
+#           archive = Path("data-assets/toronto-dbt-docs.zip")
+#           files = sorted(path for path in source.rglob("*") if path.is_file())
+#           if not any(path.name == "index.html" for path in files):
+#               raise SystemExit("Documentation site is missing index.html")
+#           with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zipped:
+#               for path in files:
+#                   zipped.write(path, path.relative_to(source).as_posix())
+#           with ZipFile(archive) as zipped:
+#               names = zipped.namelist()
+#               if "index.html" not in names or "README.txt" not in names:
+#                   raise SystemExit("Documentation archive is missing required root files")
+#               if zipped.testzip() is not None:
+#                   raise SystemExit("Documentation archive failed its integrity check")
+#               print(f"Validated {len(names)} documentation archive files")
+#           PYZIP
+#           test -s data-assets/toronto-dbt-docs.zip
+#
+#       - name: Upload dbt logs on failure
+#         if: failure()
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: dbt-pr-logs-${{ github.run_id }}
+#           path: dbt/logs/
+#           if-no-files-found: warn
+#           retention-days: 7
+#
+#   dashboard-dependencies:
+#     name: Validate dashboard dependencies
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 15
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#           cache-dependency-path: dashboard/requirements.txt
+#
+#       - name: Validate dashboard Python syntax
+#         run: python -m compileall -q dashboard
+#
+#       - name: Upgrade pip to a patched release
+#         run: python -m pip install --upgrade "pip>=26.2.1,<27"
+#
+#       - name: Install dashboard dependencies
+#         run: python -m pip install -r dashboard/requirements.txt
+#
+#       - name: Check dependency consistency
+#         run: python -m pip check
+# END RETIRED HISTORICAL WORKFLOW

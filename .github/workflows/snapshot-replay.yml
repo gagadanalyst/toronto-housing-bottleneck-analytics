@@ -1,4 +1,4 @@
-name: Snapshot Loader (Full-History Rebuild and Parity)
+name: Snapshot Loader (DuckDB Full-History Rebuild)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
         description: Backends to run
         required: true
         type: choice
-        options: [both, duckdb, snowflake]
-        default: both
+        options: [duckdb]
+        default: duckdb
       from_date:
         description: Rebuild only archives extracted on/after this UTC date (YYYY-MM-DD)
         required: false
@@ -24,16 +24,6 @@ on:
         required: false
         type: string
         default: ""
-      compare_run_id:
-        description: Revalidate a completed Mode 2 run from its saved artifacts without replaying archives
-        required: false
-        type: string
-        default: ""
-      compare_run_attempt:
-        description: Attempt number for the saved Mode 2 run
-        required: false
-        type: string
-        default: "1"
 
 permissions:
   contents: read
@@ -50,8 +40,7 @@ jobs:
   seed-loading-baseline:
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      inputs.compare_run_id == '' &&
-      (inputs.backends == 'both' || inputs.backends == 'duckdb')
+      inputs.backends == 'duckdb'
     name: Seed or verify the canonical DuckDB Loading baseline
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -78,8 +67,7 @@ jobs:
     needs: seed-loading-baseline
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      inputs.compare_run_id == '' &&
-      (inputs.backends == 'both' || inputs.backends == 'duckdb')
+      inputs.backends == 'duckdb'
     name: Load DuckDB (rebuild)
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -184,300 +172,490 @@ jobs:
           compression-level: 0
           retention-days: 30
 
-  snowflake:
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.compare_run_id == '' &&
-      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
-      (inputs.backends == 'both' || inputs.backends == 'snowflake')
-    name: Load Snowflake (rebuild)
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      RUNTIME__DLTHUB_TELEMETRY: "false"
-      DO_NOT_TRACK: "1"
-      REPLAY_FROM_DATE: ${{ inputs.from_date }}
-      REPLAY_TO_DATE: ${{ inputs.to_date }}
-      REPLAY_LIMIT: ${{ inputs.limit }}
-      SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
-
-    steps:
-      - name: Require Snowflake operations to be enabled
-        run: |
-          if [ "$SNOWFLAKE_OPERATIONS_ENABLED" != "true" ]; then
-            echo "Snowflake loading was requested, but SNOWFLAKE_OPERATIONS_ENABLED is not true." >&2
-            exit 1
-          fi
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-          cache: pip
-
-      - name: Install Snowflake-enabled ingestion dependencies
-        run: python -m pip install -e ".[snowflake,dev]"
-
-      - name: Restore previous Mode 2 ledger and export state on retry
-        run: |
-          for attempt in $(seq $((GITHUB_RUN_ATTEMPT - 1)) -1 1); do
-            temp="$(mktemp -d)"
-            if gh run download "$GITHUB_RUN_ID" \
-              --name "snapshot-loader-snowflake-${GITHUB_RUN_ID}-${attempt}" \
-              --dir "$temp"; then
-              if test -s "$temp/state.tar.gz"; then
-                mkdir -p data/recovery/snapshot-replay
-                tar -xzf "$temp/state.tar.gz" -C data/recovery/snapshot-replay
-                echo "Restored Snowflake rebuild evidence from attempt ${attempt}."
-                rm -rf "$temp"
-                break
-              fi
-            fi
-            rm -rf "$temp"
-          done
-
-      - name: Select the Mode 2 isolated Snowflake rebuild schema
-        run: |
-          mkdir -p data/recovery/snapshot-replay/snowflake
-          echo "REPLAY_SCHEMA=TORONTO_SNAPSHOT_REPLAY_${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
-          echo "REPLAY_LEDGER=data/recovery/snapshot-replay/snowflake-ledger.sqlite" >> "$GITHUB_ENV"
-          echo "REPLAY_STAGING_DIR=data/recovery/snapshot-replay/snowflake/staging" >> "$GITHUB_ENV"
-          echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/snowflake-summary.json" >> "$GITHUB_ENV"
-
-      - name: Capture the current Snowflake RAW baseline before Mode 2 reconstruction
-        run: |
-          mkdir -p data/recovery/snapshot-replay
-          baseline=data/recovery/snapshot-replay/snowflake-production-baseline.json
-          if [ ! -s "$baseline" ]; then
-            python -m scripts.snapshot_replay_baseline \
-              --backend snowflake \
-              --output "$baseline"
-          else
-            echo "Reusing the original Snowflake RAW baseline from the prior retry attempt."
-          fi
-
-      - name: Discover and load archived snapshots
-        id: replay
-        run: |
-          command=(python -m scripts.replay_snapshots \
-            --mode rebuild \
-            --backend snowflake \
-            --schema "$REPLAY_SCHEMA" \
-            --ledger "$REPLAY_LEDGER" \
-            --archive-dir data/recovery/snapshot-replay/snowflake-archives \
-            --staging-dir "$REPLAY_STAGING_DIR" \
-            --output "$REPLAY_OUTPUT")
-          [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
-          [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
-          [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
-          "${command[@]}"
-
-      - name: Preserve Mode 2 Snowflake evidence for retries
-        if: always()
-        run: |
-          mkdir -p data/recovery/snapshot-replay
-          tar -czf "$RUNNER_TEMP/state.tar.gz" \
-            -C data/recovery/snapshot-replay \
-            snowflake snowflake-ledger.sqlite snowflake-summary.json snowflake-production-baseline.json 2>/dev/null || true
-
-      - name: Upload Snowflake loader evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: snapshot-loader-snowflake-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/state.tar.gz
-            data/recovery/snapshot-replay/snowflake-summary.json
-          if-no-files-found: warn
-          compression-level: 0
-          retention-days: 30
-
-  compare:
-    needs: [duckdb, snowflake]
-    if: >-
-      always() &&
-      needs.duckdb.result == 'success' &&
-      needs.snowflake.result == 'success' &&
-      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
-      github.event_name == 'workflow_dispatch' &&
-      inputs.backends == 'both' &&
-      inputs.compare_run_id == ''
-    name: Validate and compare rebuilt SCD2 histories
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-          cache: pip
-      - run: python -m pip install -e ".[snowflake,dev]"
-
-      - name: Restore candidate evidence from successful backend jobs
-        run: |
-          for backend in duckdb snowflake; do
-            temp="$(mktemp -d)"
-            if ! gh run download "$GITHUB_RUN_ID" \
-              --name "snapshot-loader-${backend}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-              --dir "$temp"; then
-              echo "Could not download ${backend} candidate evidence." >&2
-              exit 1
-            fi
-            mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
-            if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
-              echo "${backend} candidate evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
-              exit 1
-            fi
-            mkdir -p data/recovery/snapshot-replay
-            tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
-            rm -rf "$temp"
-          done
-
-      - name: Validate archive provenance, ledger completeness and SCD2 integrity
-        run: |
-          python -m scripts.validate_snapshot_replay \
-            --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
-            --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
-            --output data/recovery/snapshot-replay/joint-validation.json
-
-      - name: Compare exact SCD2 history multisets
-        run: |
-          python scripts/compare_scd2_replay_histories.py \
-            --database "data/recovery/snapshot-replay/duckdb/toronto-replay-${GITHUB_RUN_ID}.duckdb" \
-            --dataset raw \
-            --evidence-dir data/recovery/snapshot-replay/snowflake/exports
-
-      - name: Upload joint validation evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: snapshot-loader-joint-validation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: data/recovery/snapshot-replay/joint-validation.json
-          if-no-files-found: warn
-          retention-days: 30
-
-
-  compare-existing:
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.compare_run_id != ''
-    name: Revalidate saved Mode 2 evidence
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: read
-      actions: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SOURCE_RUN_ID: ${{ inputs.compare_run_id }}
-      SOURCE_RUN_ATTEMPT: ${{ inputs.compare_run_attempt }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-          cache: pip
-      - name: Install comparison dependencies
-        run: python -m pip install -e ".[dev]"
-
-      - name: Verify source run and successful backend jobs
-        run: |
-          case "$SOURCE_RUN_ID" in
-            ''|*[!0-9]*|0) echo "compare_run_id must be a positive numeric workflow run ID." >&2; exit 1 ;;
-          esac
-          case "$SOURCE_RUN_ATTEMPT" in
-            ''|*[!0-9]*|0) echo "compare_run_attempt must be a positive integer." >&2; exit 1 ;;
-          esac
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
-            > "$RUNNER_TEMP/source-run.json"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs?per_page=100" \
-            > "$RUNNER_TEMP/source-jobs.json"
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          run = json.loads(Path(os.environ["RUNNER_TEMP"], "source-run.json").read_text())
-          jobs = json.loads(Path(os.environ["RUNNER_TEMP"], "source-jobs.json").read_text())
-          if (
-              run.get("path") != ".github/workflows/snapshot-replay.yml"
-              or run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
-          ):
-              raise SystemExit("The selected run is not a Mode 2 full-history replay.")
-          if run.get("event") != "workflow_dispatch" or run.get("status") != "completed":
-              raise SystemExit("The selected source run must be a completed manual dispatch.")
-          required = {"Load DuckDB (rebuild)", "Load Snowflake (rebuild)"}
-          observed = {
-              job.get("name"): job.get("conclusion")
-              for job in jobs.get("jobs", [])
-          }
-          failures = {name: observed.get(name) for name in required if observed.get(name) != "success"}
-          if failures:
-              raise SystemExit(f"Source run backend jobs did not both succeed: {failures}")
-          print("Source Mode 2 run and both successful backend jobs verified.")
-          PY
-
-      - name: Restore saved DuckDB and Snowflake candidates
-        run: |
-          mkdir -p data/recovery/snapshot-replay
-          for backend in duckdb snowflake; do
-            temp="$(mktemp -d)"
-            gh run download "$SOURCE_RUN_ID" \
-              --repo "$GITHUB_REPOSITORY" \
-              --name "snapshot-loader-${backend}-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
-              --dir "$temp"
-            mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
-            if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
-              echo "${backend} evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
-              exit 1
-            fi
-            tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
-            rm -rf "$temp"
-          done
-          test -s data/recovery/snapshot-replay/duckdb-summary.json
-          test -s data/recovery/snapshot-replay/snowflake-summary.json
-          test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
-          test -s data/recovery/snapshot-replay/snowflake/exports/raw_active_permits_history.csv.gz
-          test -s data/recovery/snapshot-replay/snowflake/exports/raw_cleared_permits_history.csv.gz
-
-      - name: Validate archive provenance, ledger completeness and SCD2 integrity
-        run: |
-          python -m scripts.validate_snapshot_replay \
-            --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
-            --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
-            --output data/recovery/snapshot-replay/joint-validation.json
-
-      - name: Compare exact SCD2 history multisets
-        run: |
-          python scripts/compare_scd2_replay_histories.py \
-            --database "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
-            --dataset raw \
-            --evidence-dir data/recovery/snapshot-replay/snowflake/exports
-
-      - name: Summarize existing-run validation
-        if: always()
-        run: |
-          echo "## Existing Mode 2 evidence validation" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source run: ${SOURCE_RUN_ID}, attempt ${SOURCE_RUN_ATTEMPT}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Both backend jobs were checked before candidate evidence was restored." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload joint validation evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: snapshot-loader-joint-validation-existing-${{ inputs.compare_run_id }}-${{ inputs.compare_run_attempt }}
-          path: data/recovery/snapshot-replay/joint-validation.json
-          if-no-files-found: warn
-          retention-days: 30
+# BEGIN RETIRED HISTORICAL WORKFLOW — .github/workflows/snapshot-replay.yml
+# Complete pre-retirement workflow preserved for historical reference.
+# This block is commented out and cannot be executed by GitHub Actions.
+# name: Snapshot Loader (Full-History Rebuild and Parity)
+#
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       backends:
+#         description: Backends to run
+#         required: true
+#         type: choice
+#         options: [both, duckdb, snowflake]
+#         default: both
+#       from_date:
+#         description: Rebuild only archives extracted on/after this UTC date (YYYY-MM-DD)
+#         required: false
+#         type: string
+#         default: ""
+#       to_date:
+#         description: Rebuild only archives extracted on/before this UTC date (YYYY-MM-DD)
+#         required: false
+#         type: string
+#         default: ""
+#       limit:
+#         description: Rebuild the most recent N archives in the selected range, oldest-first (optional)
+#         required: false
+#         type: string
+#         default: ""
+#       compare_run_id:
+#         description: Revalidate a completed Mode 2 run from its saved artifacts without replaying archives
+#         required: false
+#         type: string
+#         default: ""
+#       compare_run_attempt:
+#         description: Attempt number for the saved Mode 2 run
+#         required: false
+#         type: string
+#         default: "1"
+#
+# permissions:
+#   contents: read
+#   actions: read
+#
+# # Mode 2 reconstruction is isolated. The explicit promotion workflow acquires
+# # the shared publication lock and rechecks canonical baselines before promotion.
+# concurrency:
+#   group: toronto-historical-scd2-replay-and-parity
+#   cancel-in-progress: false
+#   queue: max
+#
+# jobs:
+#   seed-loading-baseline:
+#     if: >-
+#       github.event_name == 'workflow_dispatch' &&
+#       inputs.compare_run_id == '' &&
+#       (inputs.backends == 'both' || inputs.backends == 'duckdb')
+#     name: Seed or verify the canonical DuckDB Loading baseline
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 20
+#     concurrency:
+#       group: toronto-housing-data-publication
+#       cancel-in-progress: false
+#       queue: max
+#     permissions:
+#       contents: write
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#       - name: Install Loading baseline validation dependencies
+#         run: python -m pip install -e ".[dev]"
+#       - name: Seed or verify loading-latest before Mode 2 reconstruction
+#         run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY" --backup-dir "$RUNNER_TEMP/loading-seed-backup-${GITHUB_RUN_ID}"
+#
+#   duckdb:
+#     needs: seed-loading-baseline
+#     if: >-
+#       github.event_name == 'workflow_dispatch' &&
+#       inputs.compare_run_id == '' &&
+#       (inputs.backends == 'both' || inputs.backends == 'duckdb')
+#     name: Load DuckDB (rebuild)
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 360
+#     permissions:
+#       contents: read
+#       actions: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       RUNTIME__DLTHUB_TELEMETRY: "false"
+#       DO_NOT_TRACK: "1"
+#       REPLAY_FROM_DATE: ${{ inputs.from_date }}
+#       REPLAY_TO_DATE: ${{ inputs.to_date }}
+#       REPLAY_LIMIT: ${{ inputs.limit }}
+#
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Install ingestion dependencies
+#         run: python -m pip install -e ".[dev]"
+#
+#       - name: Restore previous rebuild candidate on workflow retry
+#         run: |
+#           for attempt in $(seq $((GITHUB_RUN_ATTEMPT - 1)) -1 1); do
+#             temp="$(mktemp -d)"
+#             if gh run download "$GITHUB_RUN_ID" \
+#               --name "snapshot-loader-duckdb-${GITHUB_RUN_ID}-${attempt}" \
+#               --dir "$temp"; then
+#               if test -s "$temp/state.tar.gz"; then
+#                 mkdir -p data/recovery/snapshot-replay
+#                 tar -xzf "$temp/state.tar.gz" -C data/recovery/snapshot-replay
+#                 echo "Restored DuckDB rebuild state from attempt ${attempt}."
+#                 rm -rf "$temp"
+#                 break
+#               fi
+#             fi
+#             rm -rf "$temp"
+#           done
+#
+#       - name: Select the Mode 2 isolated DuckDB rebuild target
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay/duckdb
+#           echo "REPLAY_DATABASE=data/recovery/snapshot-replay/duckdb/toronto-replay-${GITHUB_RUN_ID}.duckdb" >> "$GITHUB_ENV"
+#           echo "REPLAY_LEDGER=data/recovery/snapshot-replay/duckdb-ledger.sqlite" >> "$GITHUB_ENV"
+#           echo "REPLAY_STAGING_DIR=data/recovery/snapshot-replay/duckdb/staging" >> "$GITHUB_ENV"
+#           echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/duckdb-summary.json" >> "$GITHUB_ENV"
+#
+#       - name: Capture the authoritative DuckDB baseline before Mode 2 reconstruction
+#         run: |
+#           mkdir -p data/warehouse data/recovery/snapshot-replay
+#           baseline=data/recovery/snapshot-replay/duckdb-production-baseline.json
+#           if [ ! -s "$baseline" ]; then
+#             python -m scripts.restore_duckdb_production \
+#               --release-tag loading-latest \
+#               --database-asset toronto-loading.duckdb \
+#               --output data/warehouse/toronto.duckdb
+#             python -m scripts.snapshot_replay_baseline \
+#               --backend duckdb \
+#               --database data/warehouse/toronto.duckdb \
+#               --output "$baseline"
+#           else
+#             echo "Reusing the original production baseline from the prior retry attempt."
+#           fi
+#
+#       - name: Discover and load archived snapshots
+#         id: replay
+#         run: |
+#           command=(python -m scripts.replay_snapshots \
+#             --mode rebuild \
+#             --backend duckdb \
+#             --ledger "$REPLAY_LEDGER" \
+#             --database "$REPLAY_DATABASE" \
+#             --archive-dir data/recovery/snapshot-replay/archives \
+#             --staging-dir "$REPLAY_STAGING_DIR" \
+#             --output "$REPLAY_OUTPUT")
+#           [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
+#           [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
+#           [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
+#           "${command[@]}"
+#
+#       - name: Preserve Mode 2 rebuild state for retries
+#         if: always()
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           tar -czf "$RUNNER_TEMP/state.tar.gz" \
+#             -C data/recovery/snapshot-replay \
+#             duckdb duckdb-ledger.sqlite duckdb-summary.json duckdb-production-baseline.json 2>/dev/null || true
+#
+#       - name: Upload DuckDB loader evidence
+#         if: always()
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-loader-duckdb-${{ github.run_id }}-${{ github.run_attempt }}
+#           path: |
+#             ${{ runner.temp }}/state.tar.gz
+#             data/recovery/snapshot-replay/duckdb-summary.json
+#           if-no-files-found: warn
+#           compression-level: 0
+#           retention-days: 30
+#
+#   snowflake:
+#     if: >-
+#       github.event_name == 'workflow_dispatch' &&
+#       inputs.compare_run_id == '' &&
+#       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+#       (inputs.backends == 'both' || inputs.backends == 'snowflake')
+#     name: Load Snowflake (rebuild)
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 360
+#     permissions:
+#       contents: read
+#       actions: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+#       RUNTIME__DLTHUB_TELEMETRY: "false"
+#       DO_NOT_TRACK: "1"
+#       REPLAY_FROM_DATE: ${{ inputs.from_date }}
+#       REPLAY_TO_DATE: ${{ inputs.to_date }}
+#       REPLAY_LIMIT: ${{ inputs.limit }}
+#       SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
+#
+#     steps:
+#       - name: Require Snowflake operations to be enabled
+#         run: |
+#           if [ "$SNOWFLAKE_OPERATIONS_ENABLED" != "true" ]; then
+#             echo "Snowflake loading was requested, but SNOWFLAKE_OPERATIONS_ENABLED is not true." >&2
+#             exit 1
+#           fi
+#
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Install Snowflake-enabled ingestion dependencies
+#         run: python -m pip install -e ".[snowflake,dev]"
+#
+#       - name: Restore previous Mode 2 ledger and export state on retry
+#         run: |
+#           for attempt in $(seq $((GITHUB_RUN_ATTEMPT - 1)) -1 1); do
+#             temp="$(mktemp -d)"
+#             if gh run download "$GITHUB_RUN_ID" \
+#               --name "snapshot-loader-snowflake-${GITHUB_RUN_ID}-${attempt}" \
+#               --dir "$temp"; then
+#               if test -s "$temp/state.tar.gz"; then
+#                 mkdir -p data/recovery/snapshot-replay
+#                 tar -xzf "$temp/state.tar.gz" -C data/recovery/snapshot-replay
+#                 echo "Restored Snowflake rebuild evidence from attempt ${attempt}."
+#                 rm -rf "$temp"
+#                 break
+#               fi
+#             fi
+#             rm -rf "$temp"
+#           done
+#
+#       - name: Select the Mode 2 isolated Snowflake rebuild schema
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay/snowflake
+#           echo "REPLAY_SCHEMA=TORONTO_SNAPSHOT_REPLAY_${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+#           echo "REPLAY_LEDGER=data/recovery/snapshot-replay/snowflake-ledger.sqlite" >> "$GITHUB_ENV"
+#           echo "REPLAY_STAGING_DIR=data/recovery/snapshot-replay/snowflake/staging" >> "$GITHUB_ENV"
+#           echo "REPLAY_OUTPUT=data/recovery/snapshot-replay/snowflake-summary.json" >> "$GITHUB_ENV"
+#
+#       - name: Capture the current Snowflake RAW baseline before Mode 2 reconstruction
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           baseline=data/recovery/snapshot-replay/snowflake-production-baseline.json
+#           if [ ! -s "$baseline" ]; then
+#             python -m scripts.snapshot_replay_baseline \
+#               --backend snowflake \
+#               --output "$baseline"
+#           else
+#             echo "Reusing the original Snowflake RAW baseline from the prior retry attempt."
+#           fi
+#
+#       - name: Discover and load archived snapshots
+#         id: replay
+#         run: |
+#           command=(python -m scripts.replay_snapshots \
+#             --mode rebuild \
+#             --backend snowflake \
+#             --schema "$REPLAY_SCHEMA" \
+#             --ledger "$REPLAY_LEDGER" \
+#             --archive-dir data/recovery/snapshot-replay/snowflake-archives \
+#             --staging-dir "$REPLAY_STAGING_DIR" \
+#             --output "$REPLAY_OUTPUT")
+#           [ -z "$REPLAY_FROM_DATE" ] || command+=(--from-date "$REPLAY_FROM_DATE")
+#           [ -z "$REPLAY_TO_DATE" ] || command+=(--to-date "$REPLAY_TO_DATE")
+#           [ -z "$REPLAY_LIMIT" ] || command+=(--limit "$REPLAY_LIMIT")
+#           "${command[@]}"
+#
+#       - name: Preserve Mode 2 Snowflake evidence for retries
+#         if: always()
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           tar -czf "$RUNNER_TEMP/state.tar.gz" \
+#             -C data/recovery/snapshot-replay \
+#             snowflake snowflake-ledger.sqlite snowflake-summary.json snowflake-production-baseline.json 2>/dev/null || true
+#
+#       - name: Upload Snowflake loader evidence
+#         if: always()
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-loader-snowflake-${{ github.run_id }}-${{ github.run_attempt }}
+#           path: |
+#             ${{ runner.temp }}/state.tar.gz
+#             data/recovery/snapshot-replay/snowflake-summary.json
+#           if-no-files-found: warn
+#           compression-level: 0
+#           retention-days: 30
+#
+#   compare:
+#     needs: [duckdb, snowflake]
+#     if: >-
+#       always() &&
+#       needs.duckdb.result == 'success' &&
+#       needs.snowflake.result == 'success' &&
+#       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true' &&
+#       github.event_name == 'workflow_dispatch' &&
+#       inputs.backends == 'both' &&
+#       inputs.compare_run_id == ''
+#     name: Validate and compare rebuilt SCD2 histories
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 120
+#     permissions:
+#       contents: read
+#       actions: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#       - run: python -m pip install -e ".[snowflake,dev]"
+#
+#       - name: Restore candidate evidence from successful backend jobs
+#         run: |
+#           for backend in duckdb snowflake; do
+#             temp="$(mktemp -d)"
+#             if ! gh run download "$GITHUB_RUN_ID" \
+#               --name "snapshot-loader-${backend}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+#               --dir "$temp"; then
+#               echo "Could not download ${backend} candidate evidence." >&2
+#               exit 1
+#             fi
+#             mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
+#             if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+#               echo "${backend} candidate evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+#               exit 1
+#             fi
+#             mkdir -p data/recovery/snapshot-replay
+#             tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
+#             rm -rf "$temp"
+#           done
+#
+#       - name: Validate archive provenance, ledger completeness and SCD2 integrity
+#         run: |
+#           python -m scripts.validate_snapshot_replay \
+#             --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
+#             --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
+#             --output data/recovery/snapshot-replay/joint-validation.json
+#
+#       - name: Compare exact SCD2 history multisets
+#         run: |
+#           python scripts/compare_scd2_replay_histories.py \
+#             --database "data/recovery/snapshot-replay/duckdb/toronto-replay-${GITHUB_RUN_ID}.duckdb" \
+#             --dataset raw \
+#             --evidence-dir data/recovery/snapshot-replay/snowflake/exports
+#
+#       - name: Upload joint validation evidence
+#         if: always()
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-loader-joint-validation-${{ github.run_id }}-${{ github.run_attempt }}
+#           path: data/recovery/snapshot-replay/joint-validation.json
+#           if-no-files-found: warn
+#           retention-days: 30
+#
+#
+#   compare-existing:
+#     if: >-
+#       github.event_name == 'workflow_dispatch' &&
+#       inputs.compare_run_id != ''
+#     name: Revalidate saved Mode 2 evidence
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 120
+#     permissions:
+#       contents: read
+#       actions: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SOURCE_RUN_ID: ${{ inputs.compare_run_id }}
+#       SOURCE_RUN_ATTEMPT: ${{ inputs.compare_run_attempt }}
+#
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#       - name: Install comparison dependencies
+#         run: python -m pip install -e ".[dev]"
+#
+#       - name: Verify source run and successful backend jobs
+#         run: |
+#           case "$SOURCE_RUN_ID" in
+#             ''|*[!0-9]*|0) echo "compare_run_id must be a positive numeric workflow run ID." >&2; exit 1 ;;
+#           esac
+#           case "$SOURCE_RUN_ATTEMPT" in
+#             ''|*[!0-9]*|0) echo "compare_run_attempt must be a positive integer." >&2; exit 1 ;;
+#           esac
+#           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+#             > "$RUNNER_TEMP/source-run.json"
+#           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs?per_page=100" \
+#             > "$RUNNER_TEMP/source-jobs.json"
+#           python - <<'PY'
+#           import json
+#           import os
+#           from pathlib import Path
+#
+#           run = json.loads(Path(os.environ["RUNNER_TEMP"], "source-run.json").read_text())
+#           jobs = json.loads(Path(os.environ["RUNNER_TEMP"], "source-jobs.json").read_text())
+#           if (
+#               run.get("path") != ".github/workflows/snapshot-replay.yml"
+#               or run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
+#           ):
+#               raise SystemExit("The selected run is not a Mode 2 full-history replay.")
+#           if run.get("event") != "workflow_dispatch" or run.get("status") != "completed":
+#               raise SystemExit("The selected source run must be a completed manual dispatch.")
+#           required = {"Load DuckDB (rebuild)", "Load Snowflake (rebuild)"}
+#           observed = {
+#               job.get("name"): job.get("conclusion")
+#               for job in jobs.get("jobs", [])
+#           }
+#           failures = {name: observed.get(name) for name in required if observed.get(name) != "success"}
+#           if failures:
+#               raise SystemExit(f"Source run backend jobs did not both succeed: {failures}")
+#           print("Source Mode 2 run and both successful backend jobs verified.")
+#           PY
+#
+#       - name: Restore saved DuckDB and Snowflake candidates
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           for backend in duckdb snowflake; do
+#             temp="$(mktemp -d)"
+#             gh run download "$SOURCE_RUN_ID" \
+#               --repo "$GITHUB_REPOSITORY" \
+#               --name "snapshot-loader-${backend}-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
+#               --dir "$temp"
+#             mapfile -t state_archives < <(find "$temp" -type f -name state.tar.gz -print)
+#             if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+#               echo "${backend} evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+#               exit 1
+#             fi
+#             tar -xzf "${state_archives[0]}" -C data/recovery/snapshot-replay
+#             rm -rf "$temp"
+#           done
+#           test -s data/recovery/snapshot-replay/duckdb-summary.json
+#           test -s data/recovery/snapshot-replay/snowflake-summary.json
+#           test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
+#           test -s data/recovery/snapshot-replay/snowflake/exports/raw_active_permits_history.csv.gz
+#           test -s data/recovery/snapshot-replay/snowflake/exports/raw_cleared_permits_history.csv.gz
+#
+#       - name: Validate archive provenance, ledger completeness and SCD2 integrity
+#         run: |
+#           python -m scripts.validate_snapshot_replay \
+#             --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
+#             --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json \
+#             --output data/recovery/snapshot-replay/joint-validation.json
+#
+#       - name: Compare exact SCD2 history multisets
+#         run: |
+#           python scripts/compare_scd2_replay_histories.py \
+#             --database "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
+#             --dataset raw \
+#             --evidence-dir data/recovery/snapshot-replay/snowflake/exports
+#
+#       - name: Summarize existing-run validation
+#         if: always()
+#         run: |
+#           echo "## Existing Mode 2 evidence validation" >> "$GITHUB_STEP_SUMMARY"
+#           echo "Source run: ${SOURCE_RUN_ID}, attempt ${SOURCE_RUN_ATTEMPT}" >> "$GITHUB_STEP_SUMMARY"
+#           echo "Both backend jobs were checked before candidate evidence was restored." >> "$GITHUB_STEP_SUMMARY"
+#
+#       - name: Upload joint validation evidence
+#         if: always()
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-loader-joint-validation-existing-${{ inputs.compare_run_id }}-${{ inputs.compare_run_attempt }}
+#           path: data/recovery/snapshot-replay/joint-validation.json
+#           if-no-files-found: warn
+#           retention-days: 30
+# END RETIRED HISTORICAL WORKFLOW

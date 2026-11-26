@@ -61,7 +61,7 @@ jobs:
             else
               echo "Scheduled Extraction is disabled; starting Loading so previously approved archives can still be processed."
               gh workflow run mode1-incremental-loader.yml --repo "$GITHUB_REPOSITORY" --ref main \
-                -f backends=both
+                -f backends=duckdb
             fi
           else
             if [ "$EXTRACTION_ENABLED" != "true" ] || [ "$LOADING_ENABLED" != "true" ]; then
@@ -72,3 +72,82 @@ jobs:
               -f confirm_publish=true -f pipeline_schedule=false
             echo "Extraction dispatched. Loading follows its completion even after failure or no-change."
           fi
+
+# BEGIN RETIRED HISTORICAL WORKFLOW — .github/workflows/complete-pipeline.yml
+# Complete pre-retirement workflow preserved for historical reference.
+# This block is commented out and cannot be executed by GitHub Actions.
+# name: Complete Pipeline / Extraction + Loading + Transformation
+#
+# on:
+#   schedule:
+#     - cron: "15 22 * * *"
+#       timezone: "America/Toronto"
+#   workflow_dispatch:
+#     inputs:
+#       confirm_pipeline:
+#         description: Confirm the complete Extraction, Loading and Transformation pipeline
+#         required: true
+#         type: boolean
+#         default: false
+#   push:
+#     branches: [main]
+#     paths:
+#       - .github/workflows/v2-snapshot-archive.yml
+#       - extraction/**
+#       - scripts/snapshot_inventory.py
+#
+# permissions: {}
+#
+# concurrency:
+#   group: toronto-complete-pipeline-dispatch
+#   cancel-in-progress: false
+#   queue: max
+#
+# jobs:
+#   reject_unconfirmed_manual_dispatch:
+#     if: github.event_name == 'workflow_dispatch' && (inputs.confirm_pipeline != true || github.ref != 'refs/heads/main')
+#     name: Require main-branch confirmation
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: |
+#           echo "Dispatch Complete Pipeline from main with confirm_pipeline=true." >&2
+#           exit 1
+#
+#   dispatch_extraction:
+#     if: github.event_name != 'workflow_dispatch' || (inputs.confirm_pipeline == true && github.ref == 'refs/heads/main')
+#     name: Start Extraction / V2 Snapshot Archive
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Check the stage automation gates and dispatch the first required stage
+#         env:
+#           GH_TOKEN: ${{ secrets.TORONTO_PIPELINE_DISPATCH_TOKEN }}
+#           EVENT_NAME: ${{ github.event_name }}
+#           EXTRACTION_ENABLED: ${{ vars.TORONTO_EXTRACTION_ENABLED }}
+#           EXTRACTION_SCHEDULE_ENABLED: ${{ vars.TORONTO_EXTRACTION_SCHEDULE_ENABLED }}
+#           LOADING_ENABLED: ${{ vars.TORONTO_MODE1_ENABLED }}
+#           LOADING_SCHEDULE_ENABLED: ${{ vars.TORONTO_MODE1_SCHEDULE_ENABLED }}
+#         run: |
+#           if [ "$EVENT_NAME" = "schedule" ]; then
+#             if [ "$LOADING_ENABLED" != "true" ] || [ "$LOADING_SCHEDULE_ENABLED" != "true" ]; then
+#               echo "Scheduled Loading requires TORONTO_MODE1_ENABLED=true and TORONTO_MODE1_SCHEDULE_ENABLED=true." >&2
+#               exit 1
+#             fi
+#             if [ "$EXTRACTION_SCHEDULE_ENABLED" = "true" ]; then
+#               gh workflow run v2-snapshot-archive.yml --repo "$GITHUB_REPOSITORY" --ref main \
+#                 -f confirm_publish=true -f pipeline_schedule=true
+#               echo "Scheduled Extraction dispatched. Loading follows its completion even after failure or no-change."
+#             else
+#               echo "Scheduled Extraction is disabled; starting Loading so previously approved archives can still be processed."
+#               gh workflow run mode1-incremental-loader.yml --repo "$GITHUB_REPOSITORY" --ref main \
+#                 -f backends=both
+#             fi
+#           else
+#             if [ "$EXTRACTION_ENABLED" != "true" ] || [ "$LOADING_ENABLED" != "true" ]; then
+#               echo "Manual or extraction-code-triggered Complete Pipeline requires TORONTO_EXTRACTION_ENABLED=true and TORONTO_MODE1_ENABLED=true." >&2
+#               exit 1
+#             fi
+#             gh workflow run v2-snapshot-archive.yml --repo "$GITHUB_REPOSITORY" --ref main \
+#               -f confirm_publish=true -f pipeline_schedule=false
+#             echo "Extraction dispatched. Loading follows its completion even after failure or no-change."
+#           fi
+# END RETIRED HISTORICAL WORKFLOW

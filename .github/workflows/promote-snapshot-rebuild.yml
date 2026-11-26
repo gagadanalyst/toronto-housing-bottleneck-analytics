@@ -11,18 +11,8 @@ on:
         description: Successful Snapshot Loader workflow attempt
         required: true
         type: string
-      validation_run_id:
-        description: Successful saved-evidence validation run ID (required when the source comparison job failed)
-        required: false
-        type: string
-        default: ""
-      validation_run_attempt:
-        description: Attempt number for the saved-evidence validation run
-        required: false
-        type: string
-        default: "1"
       confirm_full_history_promotion:
-        description: Explicitly approve replacing canonical DuckDB history; Snowflake RAW is included only when enabled
+        description: Explicitly approve replacing canonical DuckDB history
         required: true
         type: boolean
         default: false
@@ -47,19 +37,14 @@ jobs:
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
-      SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
       CONFIRM_FULL_HISTORY: ${{ inputs.confirm_full_history_promotion }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
-      VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
-      VALIDATION_RUN_ATTEMPT: ${{ inputs.validation_run_attempt }}
     outputs:
       snapshot_count: ${{ steps.evidence.outputs.snapshot_count }}
-      snowflake_schema: ${{ steps.evidence.outputs.snowflake_schema }}
-      snowflake_enabled: ${{ steps.policy.outputs.snowflake_enabled }}
       backend_policy: ${{ steps.policy.outputs.backend_policy }}
     steps:
-      - name: Require main branch and resolve current backend policy
+      - name: Require main branch and set DuckDB-only backend policy
         id: policy
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -67,15 +52,8 @@ jobs:
             exit 1
           fi
 
-          if [ "$SNOWFLAKE_OPERATIONS_ENABLED" = "true" ]; then
-            echo "snowflake_enabled=true" >> "$GITHUB_OUTPUT"
-            echo "backend_policy=both" >> "$GITHUB_OUTPUT"
-            echo "Backend policy: DuckDB and Snowflake."
-          else
-            echo "snowflake_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "backend_policy=duckdb-only" >> "$GITHUB_OUTPUT"
-            echo "Backend policy: DuckDB only; Snowflake operations are disabled."
-          fi
+          echo "backend_policy=duckdb-only" >> "$GITHUB_OUTPUT"
+          echo "Backend policy: DuckDB only."
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -87,13 +65,7 @@ jobs:
       - name: Install replay validation dependencies
         run: python -m pip install -e ".[dev]"
 
-      - name: Install Snowflake validation dependencies
-        if: steps.policy.outputs.snowflake_enabled == 'true'
-        run: python -m pip install -e ".[snowflake]"
-
-      - name: Require explicit full-history approval and verify source workflow run
-        env:
-          SNOWFLAKE_ENABLED: ${{ steps.policy.outputs.snowflake_enabled }}
+      - name: Require explicit full-history approval and verify successful DuckDB source run
         run: |
           python - <<'PY'
           import json
@@ -103,15 +75,13 @@ jobs:
 
           run_id = os.environ["SOURCE_RUN_ID"]
           attempt = os.environ["SOURCE_RUN_ATTEMPT"]
-          snowflake_enabled = os.environ["SNOWFLAKE_ENABLED"] == "true"
-          validation_run_id = os.environ["VALIDATION_RUN_ID"]
-          validation_attempt = os.environ["VALIDATION_RUN_ATTEMPT"]
 
           if os.environ["CONFIRM_FULL_HISTORY"] != "true":
               raise SystemExit(
                   "Full-history promotion requires "
                   "confirm_full_history_promotion=true."
               )
+
           if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
               raise SystemExit("Source run ID and attempt must contain digits only.")
 
@@ -131,133 +101,41 @@ jobs:
               raise SystemExit(
                   "The selected source workflow attempt does not match its evidence artifact."
               )
+
           if (
-              run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
+              run.get("name") not in {
+                  "Snapshot Loader (DuckDB Full-History Rebuild)",
+                  "Snapshot Loader (Full-History Rebuild and Parity)",
+              }
               or run.get("status") != "completed"
+              or run.get("conclusion") != "success"
               or run.get("headBranch") != "main"
               or run.get("event") != "workflow_dispatch"
           ):
               raise SystemExit(
-                  "Source run is not a completed main-branch manual Snapshot Loader run."
+                  "Source must be a successful, completed, main-branch manual "
+                  "Snapshot Loader run."
               )
 
           jobs = {
               job.get("name"): job.get("conclusion")
               for job in run.get("jobs", [])
           }
-
-          required_source_jobs = {
+          required_jobs = {
               "Seed or verify the canonical DuckDB Loading baseline": "success",
               "Load DuckDB (rebuild)": "success",
           }
-          if snowflake_enabled:
-              required_source_jobs["Load Snowflake (rebuild)"] = "success"
-
           failures = {
               name: jobs.get(name)
-              for name, expected in required_source_jobs.items()
+              for name, expected in required_jobs.items()
               if jobs.get(name) != expected
           }
           if failures:
               raise SystemExit(
-                  f"Source backend rebuild requirements failed: {failures}"
+                  f"Required DuckDB source jobs did not succeed: {failures}"
               )
 
-          if snowflake_enabled:
-              comparison_name = "Validate and compare rebuilt SCD2 histories"
-              comparison_conclusion = jobs.get(comparison_name)
-
-              if run.get("conclusion") == "success":
-                  if comparison_conclusion != "success":
-                      raise SystemExit(
-                          "A successful source run must have a successful "
-                          "cross-backend comparison job."
-                      )
-                  if validation_run_id:
-                      raise SystemExit(
-                          "Do not supply validation_run_id when the original "
-                          "source run already passed its comparison."
-                      )
-                  print("Source evidence policy: both backends and parity passed.")
-
-              elif (
-                  run.get("conclusion") == "failure"
-                  and comparison_conclusion == "failure"
-              ):
-                  if (
-                      not re.fullmatch(r"[0-9]+", validation_run_id)
-                      or int(validation_run_id) <= 0
-                      or not re.fullmatch(r"[0-9]+", validation_attempt)
-                      or int(validation_attempt) <= 0
-                      or validation_run_id == run_id
-                  ):
-                      raise SystemExit(
-                          "A failed source comparison requires a separate "
-                          "positive validation_run_id and validation_run_attempt."
-                      )
-
-                  validation_result = subprocess.run(
-                      [
-                          "gh", "run", "view", validation_run_id,
-                          "--attempt", validation_attempt,
-                          "--repo", os.environ["GITHUB_REPOSITORY"],
-                          "--json", "attempt,name,status,conclusion,headBranch,event,jobs",
-                      ],
-                      check=True,
-                      capture_output=True,
-                      text=True,
-                  )
-                  validation_run = json.loads(validation_result.stdout)
-
-                  if (
-                      int(validation_run.get("attempt", 0)) != int(validation_attempt)
-                      or validation_run.get("name")
-                      != "Snapshot Loader (Full-History Rebuild and Parity)"
-                      or validation_run.get("status") != "completed"
-                      or validation_run.get("conclusion") != "success"
-                      or validation_run.get("headBranch") != "main"
-                      or validation_run.get("event") != "workflow_dispatch"
-                  ):
-                      raise SystemExit(
-                          "The saved-evidence validation run must be a successful "
-                          "manual Snapshot Loader run on main."
-                      )
-
-                  validation_jobs = {
-                      job.get("name"): job.get("conclusion")
-                      for job in validation_run.get("jobs", [])
-                  }
-                  if (
-                      validation_jobs.get("Revalidate saved Mode 2 evidence")
-                      != "success"
-                  ):
-                      raise SystemExit(
-                          "The saved-evidence revalidation job did not succeed."
-                      )
-
-                  print(
-                      "Original backend rebuilds passed; separate saved-evidence "
-                      "validation also passed."
-                  )
-
-              else:
-                  raise SystemExit(
-                      "With Snowflake enabled, the source run must either pass "
-                      "comparison or fail only at comparison with a separately "
-                      "successful saved-evidence validation run."
-                  )
-
-          else:
-              if run.get("conclusion") != "success":
-                  raise SystemExit(
-                      "DuckDB-only promotion requires a fully successful source run."
-                  )
-              if validation_run_id:
-                  raise SystemExit(
-                      "validation_run_id is not used for DuckDB-only promotion."
-                  )
-              print("Source evidence policy: DuckDB only; full run passed.")
-
+          print("Source evidence policy: DuckDB only; full run passed.")
           print(
               f"Verified full-history Mode 2 source workflow {run_id}, "
               f"attempt {attempt}."
@@ -285,50 +163,6 @@ jobs:
           test -s "$root/duckdb-production-baseline.json"
           test -s "$root/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
 
-      - name: Download Snowflake and joint-validation evidence
-        if: steps.policy.outputs.snowflake_enabled == 'true'
-        run: |
-          root=data/recovery/snapshot-replay
-          snowflake_dir="$root/source-artifacts/snowflake"
-          joint_dir="$root/source-artifacts/joint"
-          mkdir -p "$snowflake_dir" "$joint_dir" "$root"
-
-          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-snowflake-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$snowflake_dir"
-
-          if [ -n "$VALIDATION_RUN_ID" ]; then
-            artifact_run_id="$VALIDATION_RUN_ID"
-            artifact_name="snapshot-loader-joint-validation-existing-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
-          else
-            artifact_run_id="$SOURCE_RUN_ID"
-            artifact_name="snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
-          fi
-
-          gh run download "$artifact_run_id" --repo "$GITHUB_REPOSITORY" \
-            --name "$artifact_name" --dir "$joint_dir"
-
-          mapfile -t state_archives < <(find "$snowflake_dir" -type f -name state.tar.gz -print)
-          if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
-            echo "Snowflake evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
-            exit 1
-          fi
-
-          tar -tzf "${state_archives[0]}" >/dev/null
-          tar -xzf "${state_archives[0]}" -C "$root"
-
-          mapfile -t joint_reports < <(find "$joint_dir" -type f -name joint-validation.json -print)
-          if [ "${#joint_reports[@]}" -ne 1 ] || ! test -s "${joint_reports[0]:-}"; then
-            echo "Joint-validation evidence must contain exactly one non-empty joint-validation.json; found ${#joint_reports[@]}." >&2
-            exit 1
-          fi
-
-          cp "${joint_reports[0]}" "$root/joint-validation.json"
-
-          test -s "$root/snowflake-summary.json"
-          test -s "$root/snowflake-production-baseline.json"
-          test -s "$root/snowflake/exports/raw_active_permits_history.csv.gz"
-          test -s "$root/snowflake/exports/raw_cleared_permits_history.csv.gz"
-          test -s "$root/joint-validation.json"
-
       - name: Seed or verify loading-latest before full-history promotion checks
         env:
           GH_TOKEN: ${{ github.token }}
@@ -346,43 +180,16 @@ jobs:
             --database data/warehouse/toronto.duckdb \
             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
 
-      - name: Verify unchanged Snowflake production baseline
-        if: steps.policy.outputs.snowflake_enabled == 'true'
-        env:
-          SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
-          SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+      - name: Revalidate DuckDB full-history provenance and unchanged archive set
         run: |
-          python -m scripts.snapshot_replay_baseline \
-            --backend snowflake \
-            --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
-
-      - name: Revalidate full-history provenance and unchanged archive set
-        env:
-          BACKEND_POLICY: ${{ steps.policy.outputs.backend_policy }}
-        run: |
-          args=(
-            --policy "$BACKEND_POLICY"
-            --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json
-            --check-current-archives
+          python -m scripts.validate_full_rebuild_promotion \
+            --policy duckdb-only \
+            --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json \
+            --check-current-archives \
             --output data/recovery/snapshot-replay/promotion-authorized.json
-          )
 
-          if [ "$BACKEND_POLICY" = "both" ]; then
-            args+=(
-              --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json
-              --joint-validation data/recovery/snapshot-replay/joint-validation.json
-            )
-          elif [ "$BACKEND_POLICY" != "duckdb-only" ]; then
-            echo "Unexpected backend policy: $BACKEND_POLICY" >&2
-            exit 1
-          fi
-
-          python -m scripts.validate_full_rebuild_promotion "${args[@]}"
-
-      - name: Publish read-only promotion evidence for the backend jobs
+      - name: Publish read-only DuckDB promotion evidence
         id: evidence
-        env:
-          BACKEND_POLICY: ${{ steps.policy.outputs.backend_policy }}
         run: |
           python - <<'PY'
           import json
@@ -390,25 +197,19 @@ jobs:
           from pathlib import Path
 
           root = Path("data/recovery/snapshot-replay")
-          policy = os.environ["BACKEND_POLICY"]
-          promotion = json.loads((root / "promotion-authorized.json").read_text())
-          duck = json.loads((root / "duckdb-summary.json").read_text())
-
-          if policy not in {"both", "duckdb-only"}:
-              raise SystemExit(f"Unexpected backend policy: {policy!r}")
-
-          expected_backends = (
-              ["duckdb", "snowflake"] if policy == "both" else ["duckdb"]
+          promotion = json.loads(
+              (root / "promotion-authorized.json").read_text()
           )
-          expected_parity = "passed" if policy == "both" else "not_applicable"
-          expected_coverage = "identical" if policy == "both" else "not_applicable"
+          duck = json.loads(
+              (root / "duckdb-summary.json").read_text()
+          )
 
           required = {
               "status": "passed",
-              "backend_validation_policy": policy,
-              "validated_backends": expected_backends,
-              "cross_backend_parity": expected_parity,
-              "backend_snapshot_coverage": expected_coverage,
+              "backend_validation_policy": "duckdb-only",
+              "validated_backends": ["duckdb"],
+              "cross_backend_parity": "not_applicable",
+              "backend_snapshot_coverage": "not_applicable",
               "mode": "rebuild",
               "history_scope": "full",
               "full_history": True,
@@ -419,6 +220,7 @@ jobs:
               "promotion_authorized_by_evidence": True,
               "promotion_performed": False,
           }
+
           for field, expected in required.items():
               if promotion.get(field) != expected:
                   raise SystemExit(
@@ -438,25 +240,10 @@ jobs:
                   "entries per selected snapshot."
               )
 
-          schema = ""
-          if policy == "both":
-              snow = json.loads((root / "snowflake-summary.json").read_text())
-              candidate = str(snow.get("candidate", ""))
-              if not candidate.startswith("TORONTO.TORONTO_SNAPSHOT_REPLAY_"):
-                  raise SystemExit(
-                      f"Unexpected Snowflake rebuild schema in summary: {candidate!r}"
-                  )
-              if count != int(snow["snapshot_count_selected"]):
-                  raise SystemExit(
-                      "DuckDB/Snowflake full-history snapshot counts differ."
-                  )
-              schema = candidate.split(".", 1)[1]
-
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
               stream.write(f"snapshot_count={count}\n")
-              stream.write(f"snowflake_schema={schema}\n")
 
-          print(f"Promotion evidence verified under policy: {policy}")
+          print(f"DuckDB promotion evidence verified for {count} snapshots.")
           PY
           tar -czf "$RUNNER_TEMP/snapshot-rebuild-promotion-evidence.tar.gz" \
             -C data/recovery/snapshot-replay .
@@ -638,60 +425,6 @@ jobs:
           compression-level: 0
           retention-days: 30
 
-  promote-snowflake:
-    name: Promote Snowflake full-history candidate
-    needs: verify
-    outputs:
-      raw_promoted: ${{ steps.promote_snowflake_raw.outcome == 'success' }}
-    if: >-
-      needs.verify.result == 'success' &&
-      needs.verify.outputs.backend_policy == 'both' &&
-      needs.verify.outputs.snowflake_enabled == 'true' &&
-      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      actions: read
-      contents: read
-    env:
-      SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
-      SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-          cache: pip
-      - name: Install Snowflake promotion dependencies
-        run: python -m pip install -e ".[snowflake,dev]"
-      - name: Restore full-history evidence
-        run: |
-          mkdir -p data/recovery/snapshot-replay
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name "snapshot-rebuild-promotion-evidence-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}" \
-            --dir "$RUNNER_TEMP/promotion-evidence"
-          tar -xzf "$RUNNER_TEMP/promotion-evidence/snapshot-rebuild-promotion-evidence.tar.gz" \
-            -C data/recovery/snapshot-replay
-      - name: Recheck the canonical Snowflake RAW baseline before promotion
-        run: |
-          python -m scripts.snapshot_replay_baseline \
-            --backend snowflake \
-            --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
-      - name: Promote the fully validated Snowflake RAW history
-        id: promote_snowflake_raw
-        run: |
-          python -m scripts.promote_snowflake_snapshot_rebuild \
-            --source-schema "${{ needs.verify.outputs.snowflake_schema }}" \
-            --source-run-id "${{ inputs.source_run_id }}" \
-            --expected-snapshots "${{ needs.verify.outputs.snapshot_count }}" \
-            --summary data/recovery/snapshot-replay/snowflake-summary.json \
-            --source-policy source_replay_policy.json \
-            --confirm-full-history
-      - name: Record the independent backend promotion boundary
-        run: |
-          echo "Snowflake RAW full-history promotion passed. The independent Loading rebootstrap and Transformation stages own subsequent serving refresh." >> "$GITHUB_STEP_SUMMARY"
-
   rebootstrap-loading-duckdb:
     name: Rebootstrap DuckDB Loading state from promoted Mode 2 history
     needs: [verify, promote-duckdb]
@@ -713,24 +446,743 @@ jobs:
         run: |
           gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=duckdb             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
 
-  rebootstrap-loading-snowflake:
-    name: Rebootstrap Snowflake Loading state from promoted Mode 2 history
-    needs: [verify, promote-snowflake]
-    if: >-
-      always() &&
-      needs.verify.result == 'success' &&
-      needs.promote-snowflake.outputs.raw_promoted == 'true' &&
-      vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      actions: write
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
-    steps:
-      - name: Rebootstrap persistent Snowflake Mode 1 state from the promoted full history
-        run: |
-          gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=snowflake             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
+# BEGIN RETIRED HISTORICAL WORKFLOW — .github/workflows/promote-snapshot-rebuild.yml
+# Complete pre-retirement workflow preserved for historical reference.
+# This block is commented out and cannot be executed by GitHub Actions.
+# name: Promote validated full-history SCD2 rebuild
+#
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       source_run_id:
+#         description: Successful full-history Snapshot Loader workflow run ID (Mode 2)
+#         required: true
+#         type: string
+#       source_run_attempt:
+#         description: Successful Snapshot Loader workflow attempt
+#         required: true
+#         type: string
+#       validation_run_id:
+#         description: Successful saved-evidence validation run ID (required when the source comparison job failed)
+#         required: false
+#         type: string
+#         default: ""
+#       validation_run_attempt:
+#         description: Attempt number for the saved-evidence validation run
+#         required: false
+#         type: string
+#         default: "1"
+#       confirm_full_history_promotion:
+#         description: Explicitly approve replacing canonical DuckDB history; Snowflake RAW is included only when enabled
+#         required: true
+#         type: boolean
+#         default: false
+#
+# permissions:
+#   actions: write
+#   contents: write
+#
+# # The complete validation and promotion hold the shared publication lock.
+# concurrency:
+#   group: toronto-housing-data-publication
+#   cancel-in-progress: false
+#   queue: max
+#
+# jobs:
+#   verify:
+#     name: Verify full-history evidence and production baselines
+#     runs-on: ubuntu-latest
+#     permissions:
+#       actions: read
+#       contents: write
+#     timeout-minutes: 120
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
+#       CONFIRM_FULL_HISTORY: ${{ inputs.confirm_full_history_promotion }}
+#       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+#       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+#       VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+#       VALIDATION_RUN_ATTEMPT: ${{ inputs.validation_run_attempt }}
+#     outputs:
+#       snapshot_count: ${{ steps.evidence.outputs.snapshot_count }}
+#       snowflake_schema: ${{ steps.evidence.outputs.snowflake_schema }}
+#       snowflake_enabled: ${{ steps.policy.outputs.snowflake_enabled }}
+#       backend_policy: ${{ steps.policy.outputs.backend_policy }}
+#     steps:
+#       - name: Require main branch and resolve current backend policy
+#         id: policy
+#         run: |
+#           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+#             echo "Full-history production promotion must be dispatched from main." >&2
+#             exit 1
+#           fi
+#
+#           if [ "$SNOWFLAKE_OPERATIONS_ENABLED" = "true" ]; then
+#             echo "snowflake_enabled=true" >> "$GITHUB_OUTPUT"
+#             echo "backend_policy=both" >> "$GITHUB_OUTPUT"
+#             echo "Backend policy: DuckDB and Snowflake."
+#           else
+#             echo "snowflake_enabled=false" >> "$GITHUB_OUTPUT"
+#             echo "backend_policy=duckdb-only" >> "$GITHUB_OUTPUT"
+#             echo "Backend policy: DuckDB only; Snowflake operations are disabled."
+#           fi
+#
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#
+#       - name: Install replay validation dependencies
+#         run: python -m pip install -e ".[dev]"
+#
+#       - name: Install Snowflake validation dependencies
+#         if: steps.policy.outputs.snowflake_enabled == 'true'
+#         run: python -m pip install -e ".[snowflake]"
+#
+#       - name: Require explicit full-history approval and verify source workflow run
+#         env:
+#           SNOWFLAKE_ENABLED: ${{ steps.policy.outputs.snowflake_enabled }}
+#         run: |
+#           python - <<'PY'
+#           import json
+#           import os
+#           import re
+#           import subprocess
+#
+#           run_id = os.environ["SOURCE_RUN_ID"]
+#           attempt = os.environ["SOURCE_RUN_ATTEMPT"]
+#           snowflake_enabled = os.environ["SNOWFLAKE_ENABLED"] == "true"
+#           validation_run_id = os.environ["VALIDATION_RUN_ID"]
+#           validation_attempt = os.environ["VALIDATION_RUN_ATTEMPT"]
+#
+#           if os.environ["CONFIRM_FULL_HISTORY"] != "true":
+#               raise SystemExit(
+#                   "Full-history promotion requires "
+#                   "confirm_full_history_promotion=true."
+#               )
+#           if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
+#               raise SystemExit("Source run ID and attempt must contain digits only.")
+#
+#           result = subprocess.run(
+#               [
+#                   "gh", "run", "view", run_id, "--attempt", attempt,
+#                   "--repo", os.environ["GITHUB_REPOSITORY"],
+#                   "--json", "attempt,name,status,conclusion,headBranch,event,jobs",
+#               ],
+#               check=True,
+#               capture_output=True,
+#               text=True,
+#           )
+#           run = json.loads(result.stdout)
+#
+#           if int(run.get("attempt", 0)) != int(attempt):
+#               raise SystemExit(
+#                   "The selected source workflow attempt does not match its evidence artifact."
+#               )
+#           if (
+#               run.get("name") != "Snapshot Loader (Full-History Rebuild and Parity)"
+#               or run.get("status") != "completed"
+#               or run.get("headBranch") != "main"
+#               or run.get("event") != "workflow_dispatch"
+#           ):
+#               raise SystemExit(
+#                   "Source run is not a completed main-branch manual Snapshot Loader run."
+#               )
+#
+#           jobs = {
+#               job.get("name"): job.get("conclusion")
+#               for job in run.get("jobs", [])
+#           }
+#
+#           required_source_jobs = {
+#               "Seed or verify the canonical DuckDB Loading baseline": "success",
+#               "Load DuckDB (rebuild)": "success",
+#           }
+#           if snowflake_enabled:
+#               required_source_jobs["Load Snowflake (rebuild)"] = "success"
+#
+#           failures = {
+#               name: jobs.get(name)
+#               for name, expected in required_source_jobs.items()
+#               if jobs.get(name) != expected
+#           }
+#           if failures:
+#               raise SystemExit(
+#                   f"Source backend rebuild requirements failed: {failures}"
+#               )
+#
+#           if snowflake_enabled:
+#               comparison_name = "Validate and compare rebuilt SCD2 histories"
+#               comparison_conclusion = jobs.get(comparison_name)
+#
+#               if run.get("conclusion") == "success":
+#                   if comparison_conclusion != "success":
+#                       raise SystemExit(
+#                           "A successful source run must have a successful "
+#                           "cross-backend comparison job."
+#                       )
+#                   if validation_run_id:
+#                       raise SystemExit(
+#                           "Do not supply validation_run_id when the original "
+#                           "source run already passed its comparison."
+#                       )
+#                   print("Source evidence policy: both backends and parity passed.")
+#
+#               elif (
+#                   run.get("conclusion") == "failure"
+#                   and comparison_conclusion == "failure"
+#               ):
+#                   if (
+#                       not re.fullmatch(r"[0-9]+", validation_run_id)
+#                       or int(validation_run_id) <= 0
+#                       or not re.fullmatch(r"[0-9]+", validation_attempt)
+#                       or int(validation_attempt) <= 0
+#                       or validation_run_id == run_id
+#                   ):
+#                       raise SystemExit(
+#                           "A failed source comparison requires a separate "
+#                           "positive validation_run_id and validation_run_attempt."
+#                       )
+#
+#                   validation_result = subprocess.run(
+#                       [
+#                           "gh", "run", "view", validation_run_id,
+#                           "--attempt", validation_attempt,
+#                           "--repo", os.environ["GITHUB_REPOSITORY"],
+#                           "--json", "attempt,name,status,conclusion,headBranch,event,jobs",
+#                       ],
+#                       check=True,
+#                       capture_output=True,
+#                       text=True,
+#                   )
+#                   validation_run = json.loads(validation_result.stdout)
+#
+#                   if (
+#                       int(validation_run.get("attempt", 0)) != int(validation_attempt)
+#                       or validation_run.get("name")
+#                       != "Snapshot Loader (Full-History Rebuild and Parity)"
+#                       or validation_run.get("status") != "completed"
+#                       or validation_run.get("conclusion") != "success"
+#                       or validation_run.get("headBranch") != "main"
+#                       or validation_run.get("event") != "workflow_dispatch"
+#                   ):
+#                       raise SystemExit(
+#                           "The saved-evidence validation run must be a successful "
+#                           "manual Snapshot Loader run on main."
+#                       )
+#
+#                   validation_jobs = {
+#                       job.get("name"): job.get("conclusion")
+#                       for job in validation_run.get("jobs", [])
+#                   }
+#                   if (
+#                       validation_jobs.get("Revalidate saved Mode 2 evidence")
+#                       != "success"
+#                   ):
+#                       raise SystemExit(
+#                           "The saved-evidence revalidation job did not succeed."
+#                       )
+#
+#                   print(
+#                       "Original backend rebuilds passed; separate saved-evidence "
+#                       "validation also passed."
+#                   )
+#
+#               else:
+#                   raise SystemExit(
+#                       "With Snowflake enabled, the source run must either pass "
+#                       "comparison or fail only at comparison with a separately "
+#                       "successful saved-evidence validation run."
+#                   )
+#
+#           else:
+#               if run.get("conclusion") != "success":
+#                   raise SystemExit(
+#                       "DuckDB-only promotion requires a fully successful source run."
+#                   )
+#               if validation_run_id:
+#                   raise SystemExit(
+#                       "validation_run_id is not used for DuckDB-only promotion."
+#                   )
+#               print("Source evidence policy: DuckDB only; full run passed.")
+#
+#           print(
+#               f"Verified full-history Mode 2 source workflow {run_id}, "
+#               f"attempt {attempt}."
+#           )
+#           PY
+#
+#       - name: Download DuckDB full-history evidence
+#         run: |
+#           root=data/recovery/snapshot-replay
+#           artifact_dir="$root/source-artifacts/duckdb"
+#           mkdir -p "$artifact_dir"
+#
+#           gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-duckdb-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$artifact_dir"
+#
+#           mapfile -t state_archives < <(find "$artifact_dir" -type f -name state.tar.gz -print)
+#           if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+#             echo "DuckDB evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+#             exit 1
+#           fi
+#
+#           tar -tzf "${state_archives[0]}" >/dev/null
+#           tar -xzf "${state_archives[0]}" -C "$root"
+#
+#           test -s "$root/duckdb-summary.json"
+#           test -s "$root/duckdb-production-baseline.json"
+#           test -s "$root/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
+#
+#       - name: Download Snowflake and joint-validation evidence
+#         if: steps.policy.outputs.snowflake_enabled == 'true'
+#         run: |
+#           root=data/recovery/snapshot-replay
+#           snowflake_dir="$root/source-artifacts/snowflake"
+#           joint_dir="$root/source-artifacts/joint"
+#           mkdir -p "$snowflake_dir" "$joint_dir" "$root"
+#
+#           gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "snapshot-loader-snowflake-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" --dir "$snowflake_dir"
+#
+#           if [ -n "$VALIDATION_RUN_ID" ]; then
+#             artifact_run_id="$VALIDATION_RUN_ID"
+#             artifact_name="snapshot-loader-joint-validation-existing-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+#           else
+#             artifact_run_id="$SOURCE_RUN_ID"
+#             artifact_name="snapshot-loader-joint-validation-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+#           fi
+#
+#           gh run download "$artifact_run_id" --repo "$GITHUB_REPOSITORY" \
+#             --name "$artifact_name" --dir "$joint_dir"
+#
+#           mapfile -t state_archives < <(find "$snowflake_dir" -type f -name state.tar.gz -print)
+#           if [ "${#state_archives[@]}" -ne 1 ] || ! test -s "${state_archives[0]:-}"; then
+#             echo "Snowflake evidence must contain exactly one non-empty state.tar.gz; found ${#state_archives[@]}." >&2
+#             exit 1
+#           fi
+#
+#           tar -tzf "${state_archives[0]}" >/dev/null
+#           tar -xzf "${state_archives[0]}" -C "$root"
+#
+#           mapfile -t joint_reports < <(find "$joint_dir" -type f -name joint-validation.json -print)
+#           if [ "${#joint_reports[@]}" -ne 1 ] || ! test -s "${joint_reports[0]:-}"; then
+#             echo "Joint-validation evidence must contain exactly one non-empty joint-validation.json; found ${#joint_reports[@]}." >&2
+#             exit 1
+#           fi
+#
+#           cp "${joint_reports[0]}" "$root/joint-validation.json"
+#
+#           test -s "$root/snowflake-summary.json"
+#           test -s "$root/snowflake-production-baseline.json"
+#           test -s "$root/snowflake/exports/raw_active_permits_history.csv.gz"
+#           test -s "$root/snowflake/exports/raw_cleared_permits_history.csv.gz"
+#           test -s "$root/joint-validation.json"
+#
+#       - name: Seed or verify loading-latest before full-history promotion checks
+#         env:
+#           GH_TOKEN: ${{ github.token }}
+#         run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY"
+#
+#       - name: Verify the authoritative DuckDB production baseline has not changed since reconstruction began
+#         run: |
+#           mkdir -p data/warehouse
+#           python -m scripts.restore_duckdb_production \
+#             --release-tag loading-latest \
+#             --database-asset toronto-loading.duckdb \
+#             --output data/warehouse/toronto.duckdb
+#           python -m scripts.snapshot_replay_baseline \
+#             --backend duckdb \
+#             --database data/warehouse/toronto.duckdb \
+#             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
+#
+#       - name: Verify unchanged Snowflake production baseline
+#         if: steps.policy.outputs.snowflake_enabled == 'true'
+#         env:
+#           SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
+#           SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+#         run: |
+#           python -m scripts.snapshot_replay_baseline \
+#             --backend snowflake \
+#             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
+#
+#       - name: Revalidate full-history provenance and unchanged archive set
+#         env:
+#           BACKEND_POLICY: ${{ steps.policy.outputs.backend_policy }}
+#         run: |
+#           args=(
+#             --policy "$BACKEND_POLICY"
+#             --duckdb-summary data/recovery/snapshot-replay/duckdb-summary.json
+#             --check-current-archives
+#             --output data/recovery/snapshot-replay/promotion-authorized.json
+#           )
+#
+#           if [ "$BACKEND_POLICY" = "both" ]; then
+#             args+=(
+#               --snowflake-summary data/recovery/snapshot-replay/snowflake-summary.json
+#               --joint-validation data/recovery/snapshot-replay/joint-validation.json
+#             )
+#           elif [ "$BACKEND_POLICY" != "duckdb-only" ]; then
+#             echo "Unexpected backend policy: $BACKEND_POLICY" >&2
+#             exit 1
+#           fi
+#
+#           python -m scripts.validate_full_rebuild_promotion "${args[@]}"
+#
+#       - name: Publish read-only promotion evidence for the backend jobs
+#         id: evidence
+#         env:
+#           BACKEND_POLICY: ${{ steps.policy.outputs.backend_policy }}
+#         run: |
+#           python - <<'PY'
+#           import json
+#           import os
+#           from pathlib import Path
+#
+#           root = Path("data/recovery/snapshot-replay")
+#           policy = os.environ["BACKEND_POLICY"]
+#           promotion = json.loads((root / "promotion-authorized.json").read_text())
+#           duck = json.loads((root / "duckdb-summary.json").read_text())
+#
+#           if policy not in {"both", "duckdb-only"}:
+#               raise SystemExit(f"Unexpected backend policy: {policy!r}")
+#
+#           expected_backends = (
+#               ["duckdb", "snowflake"] if policy == "both" else ["duckdb"]
+#           )
+#           expected_parity = "passed" if policy == "both" else "not_applicable"
+#           expected_coverage = "identical" if policy == "both" else "not_applicable"
+#
+#           required = {
+#               "status": "passed",
+#               "backend_validation_policy": policy,
+#               "validated_backends": expected_backends,
+#               "cross_backend_parity": expected_parity,
+#               "backend_snapshot_coverage": expected_coverage,
+#               "mode": "rebuild",
+#               "history_scope": "full",
+#               "full_history": True,
+#               "archive_provenance": "passed",
+#               "scd2_integrity": "passed",
+#               "explicit_promotion_required": True,
+#               "current_archive_set_verified": True,
+#               "promotion_authorized_by_evidence": True,
+#               "promotion_performed": False,
+#           }
+#           for field, expected in required.items():
+#               if promotion.get(field) != expected:
+#                   raise SystemExit(
+#                       f"Promotion evidence {field!r} must be {expected!r}; "
+#                       f"observed={promotion.get(field)!r}."
+#                   )
+#
+#           count = int(duck["snapshot_count_selected"])
+#           if count <= 0 or promotion.get("snapshot_count") != count:
+#               raise SystemExit(
+#                   "DuckDB snapshot count differs from validated promotion evidence."
+#               )
+#
+#           if promotion.get("source_ledger_entries") != count * 2:
+#               raise SystemExit(
+#                   "Promotion evidence does not contain exactly two source-ledger "
+#                   "entries per selected snapshot."
+#               )
+#
+#           schema = ""
+#           if policy == "both":
+#               snow = json.loads((root / "snowflake-summary.json").read_text())
+#               candidate = str(snow.get("candidate", ""))
+#               if not candidate.startswith("TORONTO.TORONTO_SNAPSHOT_REPLAY_"):
+#                   raise SystemExit(
+#                       f"Unexpected Snowflake rebuild schema in summary: {candidate!r}"
+#                   )
+#               if count != int(snow["snapshot_count_selected"]):
+#                   raise SystemExit(
+#                       "DuckDB/Snowflake full-history snapshot counts differ."
+#                   )
+#               schema = candidate.split(".", 1)[1]
+#
+#           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+#               stream.write(f"snapshot_count={count}\n")
+#               stream.write(f"snowflake_schema={schema}\n")
+#
+#           print(f"Promotion evidence verified under policy: {policy}")
+#           PY
+#           tar -czf "$RUNNER_TEMP/snapshot-rebuild-promotion-evidence.tar.gz" \
+#             -C data/recovery/snapshot-replay .
+#
+#       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-rebuild-promotion-evidence-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}
+#           path: ${{ runner.temp }}/snapshot-rebuild-promotion-evidence.tar.gz
+#           if-no-files-found: error
+#           compression-level: 0
+#           retention-days: 30
+#
+#   promote-duckdb:
+#     name: Promote DuckDB full-history candidate
+#     needs: verify
+#     outputs:
+#       loading_published: ${{ steps.publish_loading_assets.outcome == 'success' }}
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 120
+#     permissions:
+#       contents: write
+#       actions: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+#       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+#       CONFIRM_FULL_HISTORY: ${{ inputs.confirm_full_history_promotion }}
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#       - name: Install DuckDB full-history validation dependencies
+#         run: |
+#           python -m pip install -e ".[dev]"
+#       - name: Restore full-history candidate and promotion evidence
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+#             --name "snapshot-rebuild-promotion-evidence-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}" \
+#             --dir "$RUNNER_TEMP/promotion-evidence"
+#           tar -xzf "$RUNNER_TEMP/promotion-evidence/snapshot-rebuild-promotion-evidence.tar.gz" \
+#             -C data/recovery/snapshot-replay
+#           test -s data/recovery/snapshot-replay/promotion-authorized.json
+#           test -s "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb"
+#       - name: Seed or verify loading-latest before DuckDB full-history promotion
+#         env:
+#           GH_TOKEN: ${{ github.token }}
+#         run: python -m scripts.seed_loading_release --repository "$GITHUB_REPOSITORY"
+#       - name: Restore and recheck the authoritative DuckDB production baseline
+#         run: |
+#           mkdir -p data/warehouse
+#           python -m scripts.restore_duckdb_production \
+#             --release-tag loading-latest \
+#             --database-asset toronto-loading.duckdb \
+#             --output data/warehouse/toronto.duckdb
+#           python -m scripts.snapshot_replay_baseline \
+#             --backend duckdb \
+#             --database data/warehouse/toronto.duckdb \
+#             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
+#
+#       - name: Prepare isolated DuckDB Loading candidate from the rebuilt history
+#         run: |
+#           mkdir -p data/warehouse/loading-candidate
+#           cp "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
+#             data/warehouse/loading-candidate/toronto.duckdb
+#       - name: Recheck DuckDB production baseline immediately before promotion
+#         run: |
+#           python -m scripts.snapshot_replay_baseline \
+#             --backend duckdb \
+#             --database data/warehouse/toronto.duckdb \
+#             --expected data/recovery/snapshot-replay/duckdb-production-baseline.json
+#       - name: Validate and stage the full-history DuckDB candidate for publication
+#         run: |
+#           python -m scripts.promote_duckdb_snapshot_rebuild \
+#             --source-candidate "data/recovery/snapshot-replay/duckdb/toronto-replay-${SOURCE_RUN_ID}.duckdb" \
+#             --candidate data/warehouse/loading-candidate/toronto.duckdb \
+#             --production data/warehouse/toronto.duckdb \
+#             --summary data/recovery/snapshot-replay/duckdb-summary.json \
+#             --source-policy source_replay_policy.json \
+#             --source-run-id "$SOURCE_RUN_ID" \
+#             --confirm-full-history
+#       - name: Recheck and materialize the authorized archive set before publication
+#         env:
+#           GH_TOKEN: ${{ github.token }}
+#         run: |
+#           python - <<'PY'
+#           import json
+#           from pathlib import Path
+#           from scripts.replay_snapshots import discover_archives
+#
+#           root = Path("data/recovery/snapshot-replay")
+#           evidence = json.loads(
+#               (root / "promotion-authorized.json").read_text(encoding="utf-8")
+#           )
+#
+#           if (
+#               evidence.get("status") != "passed"
+#               or evidence.get("current_archive_set_verified") is not True
+#               or evidence.get("promotion_authorized_by_evidence") is not True
+#               or evidence.get("promotion_performed") is not False
+#           ):
+#               raise SystemExit("Full-history promotion authorization is invalid.")
+#
+#           snapshots = evidence.get("snapshots")
+#           if not isinstance(snapshots, list) or not snapshots:
+#               raise SystemExit("Promotion evidence has no archive identities.")
+#
+#           fields = ("snapshot_id", "archive_sha256", "release_tag", "asset_name")
+#           for item in snapshots:
+#               if not isinstance(item, dict) or any(
+#                   not isinstance(item.get(field), str) or not item[field]
+#                   for field in fields
+#               ):
+#                   raise SystemExit("Promotion evidence contains an invalid archive identity.")
+#
+#           expected = {tuple(item[field] for field in fields) for item in snapshots}
+#           if (
+#               len(expected) != len(snapshots)
+#               or len(expected) != int(evidence.get("snapshot_count", 0))
+#           ):
+#               raise SystemExit("Promotion evidence has duplicate or incomplete archive identities.")
+#
+#           archives = discover_archives(
+#               "gagadanalyst/toronto-housing-bottleneck-analytics",
+#               root / "archives",
+#               exclude_snapshot_ids=set(),
+#           )
+#           actual = {
+#               (
+#                   item.snapshot_id,
+#                   item.archive_sha256,
+#                   item.release_tag,
+#                   item.asset_name,
+#               )
+#               for item in archives
+#           }
+#
+#           if actual != expected:
+#               raise SystemExit(
+#                   "The immutable archive set changed after validation; "
+#                   "refusing publication. "
+#                   f"added_or_changed={sorted(actual - expected)}, "
+#                   f"missing_or_changed={sorted(expected - actual)}."
+#               )
+#
+#           print(f"Revalidated and materialized all {len(archives)} authorized archives.")
+#           PY
+#           python -m scripts.extract_latest_snapshot_assets \
+#             --summary data/recovery/snapshot-replay/duckdb-summary.json \
+#             --archive-dir data/recovery/snapshot-replay/archives \
+#             --output-dir data-assets
+#
+#       - name: Publish validated DuckDB loading assets
+#         id: publish_loading_assets
+#         run: |
+#           cp data/warehouse/toronto.duckdb data/warehouse/toronto-loading.duckdb
+#           python -m scripts.publish_loading_assets \
+#             --repository "$GITHUB_REPOSITORY" \
+#             --database data/warehouse/toronto-loading.duckdb \
+#             --active-parquet data-assets/toronto-active-permits.parquet \
+#             --cleared-parquet data-assets/toronto-cleared-permits.parquet \
+#             --backup-dir "$RUNNER_TEMP/loading-latest-backup-${GITHUB_RUN_ID}"
+#       - name: Preserve the last-known-good Loading baseline on failure
+#         if: always() && (steps.publish_loading_assets.outcome == 'failure' || steps.publish_loading_assets.outcome == 'cancelled')
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: loading-latest-recovery-mode2-${{ github.run_id }}-${{ github.run_attempt }}
+#           path: ${{ runner.temp }}/loading-latest-backup-${{ github.run_id }}/
+#           if-no-files-found: ignore
+#           retention-days: 30
+#
+#       - name: Upload DuckDB promotion result
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+#         with:
+#           name: snapshot-rebuild-duckdb-promotion-${{ inputs.source_run_id }}
+#           path: data/warehouse/toronto.duckdb
+#           compression-level: 0
+#           retention-days: 30
+#
+#   promote-snowflake:
+#     name: Promote Snowflake full-history candidate
+#     needs: verify
+#     outputs:
+#       raw_promoted: ${{ steps.promote_snowflake_raw.outcome == 'success' }}
+#     if: >-
+#       needs.verify.result == 'success' &&
+#       needs.verify.outputs.backend_policy == 'both' &&
+#       needs.verify.outputs.snowflake_enabled == 'true' &&
+#       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 90
+#     permissions:
+#       actions: read
+#       contents: read
+#     env:
+#       SNOWFLAKE_OPERATIONS_ENABLED: ${{ vars.SNOWFLAKE_OPERATIONS_ENABLED }}
+#       SNOWFLAKE_DLT_CONNECTION: ${{ secrets.SNOWFLAKE_DLT_CONNECTION }}
+#       GH_TOKEN: ${{ github.token }}
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.14"
+#           cache: pip
+#       - name: Install Snowflake promotion dependencies
+#         run: python -m pip install -e ".[snowflake,dev]"
+#       - name: Restore full-history evidence
+#         run: |
+#           mkdir -p data/recovery/snapshot-replay
+#           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+#             --name "snapshot-rebuild-promotion-evidence-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}" \
+#             --dir "$RUNNER_TEMP/promotion-evidence"
+#           tar -xzf "$RUNNER_TEMP/promotion-evidence/snapshot-rebuild-promotion-evidence.tar.gz" \
+#             -C data/recovery/snapshot-replay
+#       - name: Recheck the canonical Snowflake RAW baseline before promotion
+#         run: |
+#           python -m scripts.snapshot_replay_baseline \
+#             --backend snowflake \
+#             --expected data/recovery/snapshot-replay/snowflake-production-baseline.json
+#       - name: Promote the fully validated Snowflake RAW history
+#         id: promote_snowflake_raw
+#         run: |
+#           python -m scripts.promote_snowflake_snapshot_rebuild \
+#             --source-schema "${{ needs.verify.outputs.snowflake_schema }}" \
+#             --source-run-id "${{ inputs.source_run_id }}" \
+#             --expected-snapshots "${{ needs.verify.outputs.snapshot_count }}" \
+#             --summary data/recovery/snapshot-replay/snowflake-summary.json \
+#             --source-policy source_replay_policy.json \
+#             --confirm-full-history
+#       - name: Record the independent backend promotion boundary
+#         run: |
+#           echo "Snowflake RAW full-history promotion passed. The independent Loading rebootstrap and Transformation stages own subsequent serving refresh." >> "$GITHUB_STEP_SUMMARY"
+#
+#   rebootstrap-loading-duckdb:
+#     name: Rebootstrap DuckDB Loading state from promoted Mode 2 history
+#     needs: [verify, promote-duckdb]
+#     if: >-
+#       always() &&
+#       needs.verify.result == 'success' &&
+#       needs.promote-duckdb.outputs.loading_published == 'true'
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 10
+#     permissions:
+#       actions: write
+#       contents: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+#       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+#     steps:
+#       - name: Rebootstrap persistent DuckDB Mode 1 state from the promoted full history
+#         run: |
+#           gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=duckdb             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
+#
+#   rebootstrap-loading-snowflake:
+#     name: Rebootstrap Snowflake Loading state from promoted Mode 2 history
+#     needs: [verify, promote-snowflake]
+#     if: >-
+#       always() &&
+#       needs.verify.result == 'success' &&
+#       needs.promote-snowflake.outputs.raw_promoted == 'true' &&
+#       vars.SNOWFLAKE_OPERATIONS_ENABLED == 'true'
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 10
+#     permissions:
+#       actions: write
+#       contents: read
+#     env:
+#       GH_TOKEN: ${{ github.token }}
+#       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+#       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+#     steps:
+#       - name: Rebootstrap persistent Snowflake Mode 1 state from the promoted full history
+#         run: |
+#           gh workflow run mode1-incremental-loader.yml             --repo "$GITHUB_REPOSITORY" --ref main             -f backends=snowflake             -f baseline_run_id="$SOURCE_RUN_ID"             -f baseline_attempt="$SOURCE_RUN_ATTEMPT"             -f rebootstrap_from_mode2=true
+# END RETIRED HISTORICAL WORKFLOW

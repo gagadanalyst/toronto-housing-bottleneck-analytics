@@ -1,6 +1,6 @@
 # Toronto Housing Bottleneck Analytics — Snowflake + DuckDB
 
-An end-to-end Analytics Engineering project built on City of Toronto building-permit data. It combines a validated Python extraction pipeline, immutable source archives, isolated incremental and historical warehouse-loading paths, a shared dbt analytics layer, and a deployed Streamlit data product. **DuckDB and Snowflake are supported warehouse backends.** A separate, pinned MetricFlow workflow validates dbt v2 semantic definitions and publishes precomputed Active and Cleared metrics from the published DuckDB warehouse for the dashboard's fifth page; MetricFlow is not a public-dashboard runtime dependency.
+An end-to-end Analytics Engineering project built on City of Toronto building-permit data. It combines a validated Python extraction pipeline, immutable source archives, isolated incremental and historical warehouse-loading paths, a shared dbt analytics layer, and a deployed Streamlit data product. **DuckDB is the active production warehouse and the only backend used by GitHub Actions publication and recovery workflows. Snowflake-specific GitHub Actions workflows and jobs were retired in November 2026. Snowflake application/backend support and historical operational documentation are retained separately.** A separate, pinned MetricFlow workflow validates dbt v2 semantic definitions and publishes precomputed Active and Cleared metrics from the published DuckDB warehouse for the dashboard's fifth page; MetricFlow is not a public-dashboard runtime dependency.
 
 **[Live dashboard](https://toronto-housing-bottleneck.streamlit.app/)** · **[dbt documentation](https://gagadanalyst.github.io/toronto-housing-bottleneck-analytics/)** · **[MetricFlow implementation guide](metricflow/README.md)** · **[Snowflake operations guide](infra/snowflake/README.md)** · **[Published DuckDB and snapshots](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/releases/tag/warehouse-latest)**
 
@@ -29,9 +29,9 @@ Using current logical Active permit revisions and records marked `Closed`, the d
 | Area | What is implemented |
 |---|---|
 | Extraction and provenance | A standalone Python extraction application, Toronto CKAN API checks, source typing, completeness validation, Parquet snapshot bundles, immutable Releases, and a maintained snapshot inventory. |
-| Incremental production loading | Loading SCD2 / Mode 1 replays only unprocessed approved archives into isolated DuckDB and optional Snowflake RAW candidates, validates each candidate, checks its production baseline, and promotes to the separate loading baseline. |
-| Transformation | The independent dbt workflow builds/tests serving models from the promoted Loading baseline and publishes the dashboard-ready DuckDB warehouse and Snowflake ANALYTICS candidate. |
-| Historical reconstruction | Mode 2 is a separate manual-only full-history replay and parity path. It produces isolated reconstruction evidence; a different workflow performs explicitly authorized production promotion. |
+| Incremental production loading | Loading SCD2 / Mode 1 replays only unprocessed approved archives into an isolated DuckDB RAW candidate, validates each candidate, checks its production baseline, and promotes to the separate loading baseline. |
+| Transformation | The independent dbt workflow builds/tests serving models from the promoted Loading baseline and publishes the dashboard-ready DuckDB warehouse. |
+| Historical reconstruction | Mode 2 is a separate manual-only DuckDB full-history replay path. It produces isolated reconstruction evidence; a different workflow performs explicitly authorized production promotion. |
 | Warehouse history | SCD Type 2 tracking for source changes observed between retained snapshots. This is observed history, not a complete real-world event ledger. |
 | Analytics engineering | One dbt project for DuckDB and Snowflake, with staging models, revision-level facts, dimensions, marts, contracts, tests, and documentation. |
 | Semantic metrics | dbt v2 model-embedded semantic definitions for Active and Cleared permit revisions, queried by an isolated MetricFlow workflow and published as six reusable result groups. |
@@ -51,8 +51,6 @@ flowchart TB
     LBASE["loading-latest / DuckDB RAW + SCD2"]
     TRANS["Transformation / dbt Serving Refresh"]
     WH["warehouse-latest / dashboard-ready DuckDB + dbt docs"]
-    SFRAW["TORONTO.RAW (optional)"]
-    SFAN["TORONTO.ANALYTICS"]
     MF["MetricFlow / metrics-latest"]
     APP["Streamlit dashboard"]
     M2["Mode 2 full-history replay / manual"]
@@ -60,16 +58,14 @@ flowchart TB
 
     SRC --> EXT --> ARCH --> LOAD
     LOAD --> LBASE --> TRANS --> WH --> APP
-    LOAD --> SFRAW --> TRANS --> SFAN --> APP
     WH --> MF --> APP
     ARCH --> M2 --> PROM --> LBASE
-    PROM --> SFRAW
 ```
 
 
-Extraction / V2 Snapshot Archive is the immutable-evidence boundary. It publishes validated source bundles and updates `snapshot_inventory.json`; it does not load either warehouse. Loading SCD2 / Mode 1 consumes approved, unprocessed archives and promotes isolated DuckDB and optional Snowflake RAW candidates. DuckDB Loading publishes a separate `loading-latest` baseline; its first publication is seeded once from the verified existing `warehouse-latest`, and later runs restore only `loading-latest`. Loading performs source, ledger, DLT, SCD2, quarantine and production-baseline validation, but no dbt execution.
+Extraction / V2 Snapshot Archive is the immutable-evidence boundary. It publishes validated source bundles and updates `snapshot_inventory.json`; it does not load a warehouse. Loading SCD2 / Mode 1 consumes approved, unprocessed archives and promotes an isolated DuckDB RAW candidate. DuckDB Loading publishes a separate `loading-latest` baseline; its first publication is seeded once from the verified existing `warehouse-latest`, and later runs restore only `loading-latest`. Loading performs source, ledger, DLT, SCD2, quarantine and production-baseline validation, but no dbt execution.
 
-Transformation / dbt Serving Refresh restores the exact `loading-latest` baseline, builds and tests dbt, validates dashboard relations, records refresh metadata, and publishes the four-asset `warehouse-latest` release. A dbt-only code change starts Transformation without Extraction or Loading. Snowflake RAW and ANALYTICS remain separate promotion boundaries; Transformation dispatches the isolated serving-schema build after successful RAW promotion. An explicitly approved Mode 2 full-history promotion also updates `loading-latest` and then dispatches Loading with `rebootstrap_from_mode2=true` and the exact source run/attempt, so the persistent Mode 1 archive ledger is reset to that promoted generation before Transformation.
+Transformation / dbt Serving Refresh restores the exact `loading-latest` baseline, builds and tests dbt, validates dashboard relations, records refresh metadata, and publishes the four-asset `warehouse-latest` release. A dbt-only code change starts Transformation without Extraction or Loading. Snowflake RAW and ANALYTICS promotion boundaries are retained as historical implementation details; their GitHub Actions workflows are retired. An explicitly approved Mode 2 full-history promotion also updates `loading-latest` and then dispatches Loading with `rebootstrap_from_mode2=true` and the exact source run/attempt, so the persistent Mode 1 archive ledger is reset to that promoted generation before Transformation.
 
 Complete Pipeline / Extraction + Loading + Transformation runs at 11 PM `America/Toronto` or on explicit manual dispatch. It starts Extraction; Loading follows Extraction completion even if extraction failed or found no changes, so older unprocessed archives are still considered. Loading-specific code changes start Loading; Transformation follows a successful, validated Loading handoff, including applicable initial-baseline persistence and Mode 2 rebootstrap paths. dbt-only changes start Transformation only. MetricFlow follows successful DuckDB serving publication by Transformation.
 
@@ -78,7 +74,7 @@ The archive history is bounded by the snapshots actually retained. Reconstructin
 
 MetricFlow is a separate semantic-metrics publication path, not another warehouse loader. After Transformation explicitly dispatches it following a successful DuckDB publication, its workflow validates the dbt v2 semantic definitions, executes the configured metric queries against the published DuckDB warehouse, and publishes a versioned JSON package in the `metrics-latest` GitHub Release. Pull-request validation uses a disposable restored database and does not publish results; manual backfill can target an already successful Transformation DuckDB publication. The MetricFlow environment is isolated from the production dbt and Streamlit dependencies.
 
-`SNOWFLAKE_OPERATIONS_ENABLED` controls Snowflake workflow operations; it does not choose the dashboard backend. `DASHBOARD_BACKEND` chooses which warehouse the same dashboard reads. The app defaults to DuckDB when the setting is omitted, and a connection failure is shown rather than silently substituting results from the other warehouse.
+Snowflake-specific GitHub Actions workflows and jobs were retired in November 2026. `SNOWFLAKE_OPERATIONS_ENABLED` no longer controls an active workflow execution path. `DASHBOARD_BACKEND` chooses which warehouse the same dashboard reads. The app defaults to DuckDB when the setting is omitted, and a connection failure is shown rather than silently substituting results from the other warehouse.
 
 ## Source scope and analytical design
 
@@ -121,8 +117,8 @@ The project encountered both CKAN service instability and source-data conditions
 - **SCD2 versions should represent meaningful changes.** The logical revision key is `permit_num` + `revision_num` + `permit_type`. The tracked-row hash excludes CKAN's `_id` and normalizes selected numeric fields to avoid false versions caused by source identity or representation. Regression checks cover unchanged replay and a controlled tracked-attribute change ([SCD2 test PR](https://github.com/gagadanalyst/toronto-housing-bottleneck-analytics/pull/76)).
 - **Mode 2 reconstructs the retained archive history.** The accepted historical reconstruction used 28 retained source snapshots, with isolated DuckDB/Snowflake replay, ledger and DLT checks, and history parity before the separate promotion. The fixed historical archive boundary is provenance, not a moving daily counter. Snapshots still do not reveal transitions that occurred between captures.
 - **Mode 1 is the routine incremental production path.** Its backend jobs use isolated candidates and persistent working state. Source completeness, business-key and duplicate checks, SCD2 integrity, quarantine reconciliation, and production-baseline verification precede promotion. A failed candidate does not become the next production baseline.
-- **Backend promotion is independent.** DuckDB and Snowflake do not share a distributed transaction. The Snowflake job is separately gated; disabling Snowflake does not disable the DuckDB Mode 1 path or immutable source archive publication.
-- **The dashboard and workflow gates are separate controls.** `DASHBOARD_BACKEND` selects the dashboard's data source. `SNOWFLAKE_OPERATIONS_ENABLED` controls whether Snowflake workflow jobs may run. Switching the dashboard to DuckDB alone does not disable GitHub Actions compute.
+- **Retained Snowflake backend.** Snowflake connection, dbt compatibility, and dashboard-reader support remain in the application. Snowflake workflow automation has been retired; current GitHub Actions publication and recovery use DuckDB.
+- **Dashboard selection is separate from workflow automation.** `DASHBOARD_BACKEND` selects the dashboard's data source. Snowflake workflow automation has been retired, so `SNOWFLAKE_OPERATIONS_ENABLED` no longer enables or disables an active workflow path.
 
 ## Data-quality snapshot
 
@@ -189,18 +185,18 @@ flowchart TB
 
 - **CI** validates code changes through linting, formatting, tests, dependency/security checks, and packaging. It is not the production extraction or warehouse-loading workflow.
 - **Extraction / V2 Snapshot Archive** runs as the first stage of Complete Pipeline at 11 PM `America/Toronto`, or on explicit manual dispatch. It validates and publishes paired Active/Cleared bundles to immutable Releases and updates `snapshot_inventory.json`; it does not load or transform either warehouse.
-- **Loading SCD2 / Mode 1** follows Extraction completion even when extraction failed or found no changes. It can also be dispatched manually and starts on Loading-specific code changes. It consumes approved unprocessed archives, restores the independent `loading-latest` DuckDB baseline, validates and promotes each backend independently, and keeps retryable state under `toronto-mode1-working-state`. A first-run seed copies the existing verified warehouse into `loading-latest` exactly once.
+- **Loading SCD2 / Mode 1** follows Extraction completion even when extraction failed or found no changes. It can also be dispatched manually and starts on Loading-specific code changes. It consumes approved unprocessed archives, restores the independent `loading-latest` DuckDB baseline, validates and promotes the isolated DuckDB RAW candidate, and keeps retryable state under `toronto-mode1-working-state`. A first-run seed copies the existing verified warehouse into `loading-latest` exactly once.
 - **Transformation / dbt Serving Refresh** starts after a successful, validated Loading handoff (including applicable initial-baseline persistence and Mode 2 rebootstrap paths), on dbt-specific code changes, or on manual dispatch. It restores `loading-latest`, builds and tests dbt, validates dashboard relations and refresh metadata, and publishes the four-asset `warehouse-latest` serving release plus GitHub Pages documentation. A failed refresh leaves the previous dashboard-serving release unchanged.
-- **Snowflake RAW and serving** are separate promotion boundaries. Loading promotes its isolated RAW candidate to `TORONTO.RAW`; Transformation dispatches the isolated serving workflow after a successful RAW promotion, builds/tests dbt in a candidate schema, verifies dashboard relations, metadata and grants, then promotes to `TORONTO.ANALYTICS`.
+- **Retained Snowflake backend support.** The repository retains Snowflake connection, dbt compatibility, and dashboard-reader implementation. Its former RAW and serving promotion procedures are historical; GitHub Actions no longer runs them.
 
-- **Mode 2 full-history reconstruction** is the manual-only `snapshot-replay.yml` workflow, named `Snapshot Loader (Full-History Rebuild and Parity)`. It replays the selected retained archive history into isolated targets, preserves retry/evidence artifacts, and compares histories when both backends are selected and available. It does not perform production promotion or routine daily loading.
-- **Explicit Mode 2 promotion** is handled by `promote-snapshot-rebuild.yml`. It verifies the source replay run, required job/evidence artifacts, and the `loading-latest` SCD2 baseline, then requires `confirm_full_history_promotion=true`. The DuckDB promotion updates `loading-latest`, not `warehouse-latest`. After promotion it dispatches Loading with `rebootstrap_from_mode2=true` and the exact source run/attempt; Transformation then rebuilds the dashboard warehouse and optional Snowflake serving.
-- **Snowflake operational gate.** The exact repository variable value `SNOWFLAKE_OPERATIONS_ENABLED=true` enables the guarded Snowflake operations. It applies to the Mode 1 Snowflake job, Snowflake serving, the Snowflake side of Mode 2 replay/comparison and promotion, and the remaining manual, non-production Snowflake smoke workflow (`snowflake.yml`). If false or unset, Snowflake jobs skip before connecting. The gate does not disable source archive extraction or the DuckDB Mode 1 job, and it does not cancel a Snowflake job already running.
+- **Mode 2 full-history reconstruction** is the manual-only `snapshot-replay.yml` workflow, named `Snapshot Loader (DuckDB Full-History Rebuild)`. It replays the selected retained archive history into an isolated DuckDB target and preserves retry/evidence artifacts. Current runs validate DuckDB history only; cross-backend parity belongs to the historical reconstruction evidence. It does not perform production promotion or routine daily loading.
+- **Explicit Mode 2 promotion** is handled by `promote-snapshot-rebuild.yml`. It verifies the source replay run, required job/evidence artifacts, and the `loading-latest` SCD2 baseline, then requires `confirm_full_history_promotion=true`. The DuckDB promotion updates `loading-latest`, not `warehouse-latest`. After promotion it dispatches Loading with `rebootstrap_from_mode2=true` and the exact source run/attempt; Transformation then rebuilds the dashboard warehouse.
+- **Snowflake workflow retirement.** Snowflake-specific GitHub Actions workflows and jobs were removed from active workflow automation in November 2026. Changing `SNOWFLAKE_OPERATIONS_ENABLED` cannot reactivate them. The retained Snowflake application/backend code is separate from GitHub Actions execution.
 - **Legacy loader safety guard.** The Mode 1 workflow refuses to proceed if the retired `TORONTO_SNAPSHOT_LOADER_ENABLED` variable is `true`. Keep that legacy variable false or unset; it is not the switch that enables the current Mode 1 workflow.
-- **Independent backend boundary.** DuckDB and Snowflake promote independently; there is no distributed transaction across the engines. A failure in one backend does not roll back a successful promotion in the other. A Snowflake RAW promotion can succeed while its separate serving build fails; in that case retry serving, not the already successful RAW load.
+- **Historical backend boundary.** Earlier Snowflake and DuckDB promotion paths had independent transaction and recovery boundaries. Those Snowflake workflow procedures are historical; current automated publication and recovery are DuckDB-only.
 - **Dashboard backend.** `DASHBOARD_BACKEND` chooses `duckdb` or `snowflake` independently of `SNOWFLAKE_OPERATIONS_ENABLED`. The app defaults to DuckDB when the setting is omitted. A connection/query error is shown rather than silently substituting data from the other backend.
 
-For a planned Snowflake shutdown, set `SNOWFLAKE_OPERATIONS_ENABLED` to `false` or remove it, separately set the deployed Streamlit `DASHBOARD_BACKEND` to `duckdb`, check for already-running Snowflake jobs, and verify a successful DuckDB Mode 1 publication and dashboard read. Archive extraction and DuckDB loading remain independent. Trial expiry and resource monitors are not substitutes for disabling the workflow gate.
+Snowflake workflow execution was retired after the trial expired in November 2026. Snowflake-specific workflow files and jobs have been removed from active GitHub Actions automation. The optional dashboard reader and Snowflake application/backend support are retained separately.
 
 ## Repository security and local credentials
 
@@ -293,9 +289,8 @@ The local dashboard downloads the published DuckDB asset and therefore needs net
 | `.github/workflows/v2-snapshot-archive.yml` | Extraction / V2 Snapshot Archive: dispatched by Complete Pipeline or on demand. |
 | `snapshot_inventory.json` | Inventory of approved source snapshot archives. |
 | `.github/workflows/mode1-incremental-loader.yml` | Loading SCD2 / Mode 1: isolated SCD2 loading, validation, promotion and `loading-latest` publication. |
-| `.github/workflows/snapshot-replay.yml` | Manual-only Mode 2 full-history replay and parity evidence. |
+| `.github/workflows/snapshot-replay.yml` | Manual-only DuckDB Mode 2 full-history replay and evidence. |
 | `.github/workflows/promote-snapshot-rebuild.yml` | Separate, explicitly authorized Mode 2 production promotion. |
-| `.github/workflows/snowflake-serving-schema.yml` | Isolated Snowflake serving build and promotion, dispatched by Transformation. |
 | `.github/workflows/metricflow-metrics.yml` | PR validation and publication of precomputed MetricFlow results after Transformation publishes DuckDB. |
 | `metricflow/` | Isolated MetricFlow dependencies, semantic-metric query runner, and implementation guide. |
 | `.github/workflows/ci.yml`, `.github/workflows/secret-scan.yml` | Code-quality CI and Gitleaks checks. |
