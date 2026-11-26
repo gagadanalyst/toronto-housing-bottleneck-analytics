@@ -835,6 +835,60 @@
       "sequence": 58,
       "snapshot_id": "3a984056aac445f1b9f0c4a318ec22f8",
       "source_commit": "2ed50f3c5b8d074cb5c31fd97099e56a55527f28"
+    },
+    {
+      "archive_sha256": "58e5bc8ecedd6762cd5f88528e7801892372c6580d27189dea4d446ad86a30a6",
+      "archive_size_bytes": 63631538,
+      "asset_name": "toronto-raw-snapshot-v2-bundle-e63bcf0537b44c6e9b0d6e50ae267ee4.zip",
+      "extracted_at_utc": "2026-11-24T04:52:18.161780Z",
+      "format_version": 2,
+      "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+      "replay_contract": {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "sha256": "cd22d256271b1905588020ab3e5055c3f9b4f893c5f17ae2d46aa6098ea95037"
+      },
+      "run_attempt": 1,
+      "run_id": "45329288760",
+      "sequence": 59,
+      "snapshot_id": "e63bcf0537b44c6e9b0d6e50ae267ee4",
+      "source_commit": "270ca030367f7fbdc10ea8b2c6750dbfe5689fe3"
+    },
+    {
+      "archive_sha256": "8c1eca1ba44a733e9a2979b389bd2785b9c0cabdbbeab2654798bb005175f043",
+      "archive_size_bytes": 63635071,
+      "asset_name": "toronto-raw-snapshot-v2-bundle-68194d9e57fd4b1fae7ea3ce84787f2d.zip",
+      "extracted_at_utc": "2026-11-24T13:40:12.753449Z",
+      "format_version": 2,
+      "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+      "replay_contract": {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "sha256": "7ca7be4da387ac5a0a7c13e86d2e45fecf3ad7dc7bc6402ffca9159a7d408f2b"
+      },
+      "run_attempt": 1,
+      "run_id": "45405725992",
+      "sequence": 60,
+      "snapshot_id": "68194d9e57fd4b1fae7ea3ce84787f2d",
+      "source_commit": "849714329e703efee12f976f3bccc06d4b628ea8"
+    },
+    {
+      "archive_sha256": "a1ebfb916101649c08809d14b8822eaa93d9b5b31de8d4d1a812bd06b513ca52",
+      "archive_size_bytes": 63673427,
+      "asset_name": "toronto-raw-snapshot-v2-bundle-cebf074735b747118b94475f49cdedee.zip",
+      "extracted_at_utc": "2026-11-25T12:48:57.791565Z",
+      "format_version": 2,
+      "release_tag": "toronto-raw-snapshot-v2-archive-2026-11",
+      "replay_contract": {
+        "contract_id": "toronto-housing-snapshot-replay",
+        "contract_version": 1,
+        "sha256": "2a241fca559af0e7d91d97f760c01d573fd25ac2994f359faa2dda8af281bf50"
+      },
+      "run_attempt": 1,
+      "run_id": "45617300292",
+      "sequence": 61,
+      "snapshot_id": "cebf074735b747118b94475f49cdedee",
+      "source_commit": "3efbaf0fc32d8cc4834e01a5b274ff3b14775d69"
     }
   ],
   "inventory_version": 1,
