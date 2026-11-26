@@ -3,8 +3,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from dashboard.snowflake_backend import REQUIRED_RELATIONS as DASHBOARD_RELATIONS
-
 ROOT = Path(__file__).resolve().parents[1]
 RETIRED_WORKFLOW_PATH = ROOT / "docs/retired-workflows/snowflake-serving-schema.yml"
 PROMOTION_PATH = ROOT / "scripts/promote_snowflake_serving_candidate.py"

@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
-import yaml
 
 from dashboard.refresh_metadata import latest_source_extraction_timestamp
 
